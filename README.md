@@ -1,12 +1,10 @@
 # CS 2810 — Humanoid Robot Soccer
 
-A perception-guided humanoid soccer shooting and intercepting project for Unitree G1, using
-reinforcement learning with motion tracking on MuJoCo physics.  Built on the
-[unitree_rl_mjlab](https://github.com/unitreerobotics/unitree_rl_mjlab) framework.
+A perception-guided humanoid soccer shooting and intercepting project for Unitree G1, using reinforcement learning with motion tracking on MuJoCo physics.  Built on the [unitree_rl_mjlab](https://github.com/unitreerobotics/unitree_rl_mjlab) framework.
 
 ## Overview
 
-- **Task**: G1 humanoid shoots a stationary ball or intercept the ball
+- **Task**: G1 humanoid shoots a stationary ball or intercept the moving ball
 - **Physics**: MuJoCo with fluid air-drag on the ball, 50 Hz control
 - **Robot**: Unitree G1, 29-DoF PD position control, armature-based stiffness
 
@@ -20,11 +18,17 @@ See [doc/setup_en.md](doc/setup_en.md) for environment installation.
 # List all registered tasks
 python scripts/list_envs.py
 
-# Visualize the shooter scene (zero-agent, robot holds default pose)
-python scripts/play.py Unitree-G1-Naive-Shooter --agent=zero
+# Visualize the shooter scene (zero-agent)
+python scripts/eval_naive_shooter.py
 
-# Headless batch evaluation with metrics
-python scripts/eval_naive_shooter.py --headless --num-trials=50
+# Visualize the goalkeeper scene (zero-agent)
+python scripts/eval_naive_goalkeeper.py
+
+# Shooter headless batch evaluation with metrics
+python scripts/eval_naive_shooter.py --num-trials=50 --headless
+
+# Goalkeeper headless batch evaluation with metrics
+python scripts/eval_naive_goalkeeper.py --num-trials=50 --headless
 
 # Load a trained checkpoint
 python scripts/eval_naive_shooter.py \
@@ -34,9 +38,12 @@ python scripts/eval_naive_shooter.py \
 
 # Record a video
 python scripts/eval_naive_shooter.py --video --video-length=500
+python scripts/eval_naive_goalkeeper.py --video --video-length=150
 ```
 
-## Observation Space (Eval)
+## Observation Space
+
+### Shooter (Eval)
 
 ```
  o_t = (o^prop_t,  o^ref_t,  o^soc_t)
@@ -48,28 +55,56 @@ python scripts/eval_naive_shooter.py --video --video-length=500
  o^soc  : soccer perception — ball_in_robot_frame (3) + goal_in_robot_frame (3)   =   6 D
  ─────────────────────────────────────────────────────────────────────────────────────────
  Actor total                                                                        160 D
- Critic total (actor + base_lin_vel)                                                163 D
 ```
+
+### Goalkeeper (Eval)
+
+Single-frame actor terms (matching paper's actor inputs):
+
+| Term | Dim | Paper notation |
+|------|-----|----------------|
+| base_ang_vel (IMU) | 3 | ωbase |
+| projected_gravity | 3 | gbase |
+| joint_pos (relative) | 29 | q |
+| joint_vel (relative) | 29 | q̇ |
+| last_action | 29 | alast |
+| **ball_pos_local** | 3 | Oball ∈ R³ |
+| **Total (single frame)** | **96** | |
+
+Actor observation: 96 D × **T = 10** history frames = **960 D** (matching paper's HIMPPO history encoder input).
+
 
 ## Evaluation Protocol
 
-Ball position is fixed at the penalty spot (4 m from goal).  The robot root pose
-is randomized each episode (±0.5 m xy, ±0.5 rad yaw).
+### Shooter
+
+Ball position is fixed at the penalty spot (4 m from goal). The robot root pose is randomized each episode (±0.5 m xy, ±0.5 rad yaw).
 
 **Metrics** (matching HumanoidSoccer Section IV‑B):
 - Success Rate — fraction of episodes where the ball enters the goal
 - Kick Accuracy — cosine similarity between ball velocity direction and the
   ball-to-goal-center vector
 
+### Goalkeeper
+
+Ball uses a **6-region parabolic trajectory model** matching the paper's `assign_ball_states`. Each episode randomly selects one of 6 landing regions and computes the launch velocity to hit the target point.
+
+**Metrics** (matching Humanoid-Goalkeeper Section IV):
+- Block Rate (Esucc) — fraction of episodes where ball velocity drops > 2 m/s
+  when behind the robot (intercepted)
+- Min ball-robot distance — closest approach in xy-plane
+- Ball speed at robot crossing
+
 ```bash
-# Interactive viewer
-python scripts/eval_naive_shooter.py
-
-# Batch evaluation (N trials, no viewer)
+# Shooter eval
+python scripts/eval_naive_shooter.py # Interactive viewer
 python scripts/eval_naive_shooter.py --headless --num-trials=100
-
-# With a trained policy
 python scripts/eval_naive_shooter.py --headless --num-trials=100 --checkpoint <path>
+
+# Goalkeeper eval
+python scripts/eval_naive_goalkeeper.py # Interactive viewer
+python scripts/eval_naive_goalkeeper.py --headless --num-trials=100
+python scripts/eval_naive_goalkeeper.py --headless --num-trials=100 --checkpoint <path>
 ```
 
 ## Project Structure
@@ -87,14 +122,14 @@ src/
     config/
       settings.yaml                    # Single source of truth for soccer parameters
       soccer_settings.py               # Typed settings loader (dataclass-backed)
-      g1/env_cfgs.py                   # G1 shooter & goalkeeper training configs
+      g1/env_cfgs.py                   # G1 shooter & goalkeeper configs
       g1/rl_cfg.py                     # PPO config
-      eval/eval_shooter_cfg.py         # Shooter eval config (paper observation space + DR)
-      eval/eval_goalkeeper_cfg.py      # Goalkeeper eval config
+      eval/eval_shooter_cfg.py         # Shooter eval config (paper obs + motion ref + DR)
+      eval/eval_goalkeeper_cfg.py      # Goalkeeper eval config (T=10 history, 6-region ball)
 scripts/
   play.py                              # Task-agnostic scene viewer
-  eval_naive_shooter.py                # Shooter eval (headless stats or interactive viewer)
-  eval_naive_goalkeeper.py             # Goalkeeper eval
+  eval_naive_shooter.py                # Shooter eval (headless stats or interactive)
+  eval_naive_goalkeeper.py             # Goalkeeper eval (headless stats or interactive)
 ```
 
 ## Acknowledgements

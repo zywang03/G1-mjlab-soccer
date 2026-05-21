@@ -39,16 +39,33 @@ ground:
   solimp: [0.9, 0.95, 0.001, 0.5, 2]
   friction: [1.0, 1.0] # static, dynamic — matches shooter reference
 
-# Goalkeeper ball launch velocity randomization.
-# Yaw spread and pitch range are auto-computed from goal geometry and
-# goal_margin — see soccer_settings.py load_settings().
-#   yaw_spread  = atan((goal_width/2 - goal_margin) / penalty_distance)
-#   pitch_min   = atan((goal_margin - ball_radius) / penalty_distance)
-#   pitch_max   = atan((goal_height - goal_margin - ball_radius) / penalty_distance)
-goalkeeper_ball_vel:
-  speed_min: 3.0 # m/s
-  speed_max: 5.0 # m/s
-  goal_margin: 0.2 # m — keep ball at least this far inside frame (posts + crossbar)
+# Goalkeeper ball landing regions (6 regions matching Humanoid-GK paper eval ranges).
+# Each region defines the ball's target landing position range in goal-relative frame
+# (y = width along goal line, z = height above ground). The parabolic trajectory
+# model computes launch velocity to hit a random point within the chosen region.
+# Regions: 0=Right-Mid, 1=Left-Mid, 2=Right-Up, 3=Left-Up, 4=Right-Low, 5=Left-Low.
+goalkeeper_regions:
+  - height: [0.3, 1.5]
+    width:  [0.0, 1.5]
+  - height: [0.3, 1.5]
+    width:  [-1.5, 0.0]
+  - height: [1.2, 1.5]
+    width:  [0.0, 1.5]
+  - height: [1.2, 1.5]
+    width:  [-1.5, 0.0]
+  - height: [0.1, 0.3]
+    width:  [0.0, 1.5]
+  - height: [0.1, 0.3]
+    width:  [-1.5, 0.0]
+
+# Ball start position randomization (parabolic trajectory model).
+# Values are magnitudes — the sign is applied in code based on robot orientation:
+#   start_x is negative (in front of robot, facing direction)
+#   end_x is positive (behind robot, toward goal)
+ball_trajectory:
+  ball_start_distance: [3.0, 5.0] # m — ball starts distance in front of robot
+  ball_end_distance: [0.1, 0.6] # m — ball lands 0.1~0.6m behind robot
+  t_flight: [0.6, 1.0] # s — flight time
 
 # Shooter ball velocity (for moving-ball kick scenarios).
 shooter_ball_vel:

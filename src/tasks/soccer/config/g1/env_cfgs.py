@@ -19,8 +19,8 @@ from mjlab.sensor import ContactMatch, ContactSensorCfg
 from src.tasks.soccer.soccer_env_cfg import make_soccer_env_cfg
 from src.tasks.soccer.config.soccer_settings import SETTINGS
 from src.tasks.soccer.mdp import (
-  GoalkeeperBallVelCfg,
-  reset_ball_with_goal_velocity,
+  RegionBallVelCfg,
+  reset_ball_with_parabolic_trajectory,
 )
 
 import math
@@ -102,9 +102,10 @@ def unitree_g1_shooter_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 def unitree_g1_goalkeeper_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Unitree G1 naive goalkeeper: robot at goal line facing incoming ball.
 
-  Ball velocity is randomized each reset.  Yaw spread is computed from
-  goal dimensions and ball distance so shots stay within the goal frame
-  (minus goal_margin on each side).
+  Ball trajectory uses a parabolic model with 6 landing regions, matching
+  the Humanoid-Goalkeeper paper's assign_ball_states approach. Each reset
+  picks a random region, samples start/end positions, and computes the
+  launch velocity to hit the target point.
   """
   cfg = make_soccer_env_cfg()
   cfg.episode_length_s = SETTINGS.goalkeeper_episode_length_s
@@ -113,24 +114,32 @@ def unitree_g1_goalkeeper_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.scene.entities["robot"] = _g1_robot_at(tuple(s.goalkeeper_pos), math.pi)
   cfg.scene.entities["ball"].init_state.pos = tuple(s.ball_pos)
 
-  gv = SETTINGS.goalkeeper_ball_vel
-  penalty_dist = abs(SETTINGS.scene.ball_pos[0])  # distance to goal line
+  # Build region list for parabolic trajectory.
+  # Compute init y/z ranges from the union of all region bounds.
+  regions_raw = SETTINGS.goalkeeper_regions
+  all_widths_lo = [r.width[0] for r in regions_raw]
+  all_widths_hi = [r.width[1] for r in regions_raw]
+  all_heights_lo = [r.height[0] for r in regions_raw]
+  all_heights_hi = [r.height[1] for r in regions_raw]
 
-  # Yaw spread: the ball direction should stay within the goal frame.
-  effective_half_width = SETTINGS.goal.width / 2 - gv.goal_margin
-  yaw_spread_deg = math.degrees(math.atan(effective_half_width / penalty_dist))
+  region_dicts = [
+    {"height": r.height, "width": r.width} for r in regions_raw
+  ]
+
+  vel_cfg = RegionBallVelCfg(
+    ball_start_x_range=tuple(SETTINGS.ball_trajectory.ball_start_distance),
+    ball_end_x_range=tuple(SETTINGS.ball_trajectory.ball_end_distance),
+    t_flight_range=tuple(SETTINGS.ball_trajectory.t_flight),
+    regions=region_dicts,
+    ball_start_y_range=(min(all_widths_lo), max(all_widths_hi)),
+    ball_start_z_range=(min(all_heights_lo), max(all_heights_hi)),
+  )
 
   cfg.events["reset_ball"] = EventTermCfg(
-    func=reset_ball_with_goal_velocity,
+    func=reset_ball_with_parabolic_trajectory,
     mode="reset",
     params={
-      "vel_cfg": GoalkeeperBallVelCfg(
-        speed_min=gv.speed_min,
-        speed_max=gv.speed_max,
-        yaw_spread_deg=yaw_spread_deg,
-        pitch_min_deg=gv.pitch_min_deg,
-        pitch_max_deg=gv.pitch_max_deg,
-      ),
+      "vel_cfg": vel_cfg,
       "ball_cfg": SceneEntityCfg("ball"),
     },
   )
