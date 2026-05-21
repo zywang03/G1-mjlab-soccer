@@ -34,7 +34,7 @@ python scripts/eval_naive_goalkeeper.py --num-trials=50 --headless
 python scripts/eval_naive_shooter.py \
     --headless \
     --num-trials=50 \
-    --checkpoint logs/rsl_rl/g1_soccer/model_5000.pt
+    --checkpoint <file-path>
 
 # Record a video
 python scripts/eval_naive_shooter.py --video --video-length=500
@@ -118,7 +118,14 @@ src/
     ball.py, goal.py, ground.py        # Entity config factories
     soccer_env_cfg.py                  # Base env-cfg factory
     motion_data.py                     # Motion dataset loading & playback
-    mdp/__init__.py                    # Observation, reward, termination, DR, reset functions
+    mdp/
+      __init__.py                      # Re-exports all MDP terms from sub-modules
+      observations.py                  # Proprioceptive, ball-local, motion-ref, soccer-perception
+      rewards.py                       # is_terminated
+      terminations.py                  # time_out, fell_over, motion-reference terminations
+      reset_events.py                  # reset_root_state_uniform, reset_joints_by_offset
+      domain_randomization.py          # push_robot_base, perturb_ball_velocity
+      soccer_reset.py                  # RegionBallVelCfg + 6-region parabolic trajectory reset
     config/
       settings.yaml                    # Single source of truth for soccer parameters
       soccer_settings.py               # Typed settings loader (dataclass-backed)
