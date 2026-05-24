@@ -41,14 +41,15 @@ python scripts/eval_naive_goalkeeper.py --headless --num-trials 50 --checkpoint 
 Two-stage PPO pipeline ported from HumanoidSoccer:
 
 ```
-Stage I: Motion Tracking           Stage II: Perception-Guided Kicking
-  adaptive sampling                  uniform sampling (frame 0)
-  154D actor / 292D critic           160D actor / 298D critic
-  8 reward terms (tracking only)     16 reward terms (+soccer kick)
-        ↓                                  ↓
-        └──── checkpoint transfer ────────┘
-                       ↓
-            eval_naive_shooter.py  (same obs order)
+Stage I: Motion Tracking (MLP)       Stage II: Perception-Guided Kicking (LSTM)
+  adaptive sampling                    uniform sampling (frame 0)
+  MLP [512,256,128] ELU                LSTM(2×128) + MLP [128,64,32] ELU
+  154D actor / 292D critic             160D actor / 298D critic
+  8 reward terms (tracking only)       17 reward terms (+soccer kick)
+        ↓                                      ↓
+        └──── checkpoint transfer (iteration counter only) ──┘
+                           ↓
+                eval_naive_shooter.py  (same obs order)
 ```
 
 **Observation space** (identical across Stage II and eval, 160D):
@@ -61,33 +62,39 @@ Critic adds privileged body poses (anchor pos/ori, 14 body pos/ori, base_lin_vel
 
 ### Stage I — Motion Tracking
 
-Robot learns 13 kick motion references without perception.
+Robot learns 10 standard kick motion references without perception.
 
 | Aspect | Config |
 |--------|--------|
+| Model | **MLP [512, 256, 128]** ELU |
 | Sampling | Adaptive (failure-histogram driven) |
-| Rewards | 6× motion tracking (anchor/body pos/ori/vel) + action_rate + joint_limit |
-| Terminations | timeout(10s) + fell_over(70°) + anchor_pos_z + anchor_ori + ee_body_pos |
+| Rewards (8) | 6× tracking (anchor/body pos/ori/vel, all weight=1.0) + action_rate(-0.1) + joint_limit(-10.0) |
+| Terminations | timeout(10s) + fell_over(70°) + anchor_pos_z(0.25m) + anchor_ori(0.8) + ee_body_pos(0.25m) |
 | DR | push_robot (interval 1-3s) |
+| Entropy coef | 0.005 |
 
 ### Stage II — Perception-Guided Kicking
 
-Builds on Stage I checkpoint.
+Builds on Stage I checkpoint. Model switches to LSTM for ball trajectory prediction.
 
 | Change | Detail |
 |--------|--------|
+| Model | LSTM(2×128) + MLP [128, 64, 32] ELU |
 | Sampling | Uniform (frame 0) |
 | Ball placement | Motion endpoint + arc offset (±0.25m, ±π/9) |
 | track_anchor_pos | **0.0** (robot free to pursue ball) |
+| track_anchor_ori | **1.0** (unchanged from Stage I) |
+| body tracking (pos/ori/vel) | **1.0** (unchanged, body pos/ori filtered — excludes ankles) |
+| foot_pos tracking | 1.0 (ankles only) |
 | Kick rewards | proximity(1), contact(50), sideways_kick(50), vel_align(30), speed(10) |
 | Stabilization | foot_distance(0.2), pelvis_orientation(-1), waist_action_rate(-0.25) |
 | Ball init vel | **Disabled** (stationary, penalty kick) |
 
 ### PPO Config
 
-- MLP: [512, 256, 128], ELU
+- Stage I: MLP [512, 256, 128], ELU; Stage II: LSTM(2×128) + MLP [128, 64, 32], ELU
 - Gaussian scalar std, init_std=1.0
-- Adaptive KL (desired=0.01), clip=0.2, lr=1e-3
+- Adaptive KL (desired=0.01), clip=0.2, lr=1e-3, entropy=0.005
 - 24 steps/env, 5 epochs, 4 mini-batches
 
 
@@ -95,10 +102,14 @@ Builds on Stage I checkpoint.
 
 ### Shooter
 
-Scene: goal at origin, ball at penalty spot (-4, 0, 0.11), G1 behind ball (motion frame 0 + global offset + random noise). The `settings.yaml` parameters `motion_origin_offset` and `motion_yaw_offset` map motion-local coordinates (~origin) to world coordinates (behind penalty spot, facing +x).
+Scene: G1 near origin facing -y (motion-local coords, identical to training/play).
+Goal placed at (0, -5, 0) rotated 90° to face G1, ball placed dynamically by
+the command system (same as Stage II training). No `motion_origin_offset` /
+`motion_yaw_offset` transform — eval uses the exact same coordinate system
+as training and play mode via `unitree_g1_stage2_env_cfg(play=True)`.
 
 **Metrics** (matching HumanoidSoccer §IV-B):
-- **Success Rate** — fraction of episodes where ball enters goal (x≥0, |y|≤1.5m, z≤1.8m)
+- **Success Rate** — fraction of episodes where ball crosses goal plane (y≤-5, |x|≤1.5m, z≤1.8m)
 - **Kick Accuracy** — cosine similarity between ball velocity direction and ball→goal-center vector
 - **Kick Speed** — ball speed when first > 1 m/s
 
@@ -137,7 +148,7 @@ src/
         training_env_cfgs.py           # G1 training configs (Stage I/II wrappers)
         rl_cfg.py                      # PPO config
       eval/
-        eval_shooter_cfg.py            # Eval shooter (training-compatible obs)
+        eval_shooter_cfg.py            # Eval shooter (reuses Stage II play config + goal)
         eval_goalkeeper_cfg.py         # Eval goalkeeper (T=10 history, 960D)
       training/
         stage1_env_cfg.py              # Stage I factory (motion tracking)
@@ -160,8 +171,10 @@ penalty_spot:      # distance_from_goal=4.0
 scene:
   goal_pos: [0,0,0]
   shooter_behind_ball: 1.0
-  motion_origin_offset: [-5.6, 0, 0]   # eval: shift G1 to behind penalty spot
-  motion_yaw_offset: 1.5708             # eval: rotate G1 from facing -y to +x
+  motion_origin_offset: [-5.6, 0, 0]    # training: not used; play/eval: default (0,0,0)
+  motion_yaw_offset: 1.5708             # training: not used; play/eval: default 0
+  eval_ball_pos: [0, -1.5, 0.11]       # eval ball position (motion-local coords)
+  eval_goal_pos: [0, -5.5, 0]          # eval goal position (motion-local coords)
 episode_length_s: 10.0                 # shooter
 goalkeeper_episode_length_s: 3.0       # goalkeeper
 ```

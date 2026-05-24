@@ -69,7 +69,19 @@ def _setup_g1_training(cfg: ManagerBasedRlEnvCfg) -> None:
     history_length=4,
   )
 
-  cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground, ball_robot)
+  # Full-body contact sensor for undesired_contacts penalty.
+  # Matches all robot-ground contacts for penalizing non-foot/non-wrist touches.
+  contact_forces = ContactSensorCfg(
+    name="contact_forces",
+    primary=ContactMatch(mode="subtree", pattern=r".*", entity="robot"),
+    secondary=ContactMatch(mode="subtree", pattern="ground", entity="ground"),
+    fields=("found", "force"),
+    reduce="none",
+    num_slots=2,
+    history_length=4,
+  )
+
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground, ball_robot, contact_forces)
 
   # Inject motion_dir into the command config at registration time.
   # The actual path is set by the training script via --motion-dir.

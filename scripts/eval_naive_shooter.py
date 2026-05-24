@@ -32,23 +32,22 @@ import torch
 import tyro
 
 from mjlab.envs import ManagerBasedRlEnv
-from mjlab.rl import (
-  MjlabOnPolicyRunner,
-  RslRlModelCfg,
-  RslRlOnPolicyRunnerCfg,
-  RslRlPpoAlgorithmCfg,
-  RslRlVecEnvWrapper,
-)
+from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
+from src.tasks.soccer.config.g1.rl_cfg import (
+  SoccerRecurrentRunner,
+  unitree_g1_soccer_recurrent_runner_cfg,
+)
 
-# Goal geometry.
-_GOAL_HALF_WIDTH = 1.5
-_GOAL_HEIGHT = 1.8
-_GOAL_X = 0.0
-_GOAL_CENTER = (0.0, 0.0, 0.9)
+# Goal geometry (motion-local coords: goal at (0, -5, 0), rotated 90° about Z
+# so opening faces ±y.  Posts along x-axis, crossbar at z=1.8.)
+_GOAL_HALF_WIDTH = 1.5   # m — half-width in x-direction
+_GOAL_HEIGHT = 1.8       # m — crossbar height
+_GOAL_Y = -5.0           # goal plane y-position
+_GOAL_CENTER = (0.0, -5.0, 0.9)  # center of goal opening
 _KICK_SPEED_THRESHOLD = 1.0  # m/s
 
 
@@ -68,30 +67,10 @@ class EvalConfig:
   task_id: str = "Eval-Naive-Shooter"
 
 
-def _make_agent_cfg():
-  return RslRlOnPolicyRunnerCfg(
-    actor=RslRlModelCfg(
-      hidden_dims=(512, 256, 128),
-      activation="elu",
-      obs_normalization=True,
-      distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
-    ),
-    critic=RslRlModelCfg(hidden_dims=(512, 256, 128), activation="elu", obs_normalization=True),
-    algorithm=RslRlPpoAlgorithmCfg(
-      value_loss_coef=1.0, use_clipped_value_loss=True, clip_param=0.2,
-      entropy_coef=0.01, num_learning_epochs=5, num_mini_batches=4,
-      learning_rate=1.0e-3, schedule="adaptive", gamma=0.99, lam=0.95,
-      desired_kl=0.01, max_grad_norm=1.0,
-    ),
-    experiment_name="g1_soccer_eval",
-    save_interval=100, num_steps_per_env=24, max_iterations=10001,
-  )
-
-
 def _load_policy(checkpoint_path: str, env, device: str):
   print(f"[INFO] Loading policy from: {checkpoint_path}")
-  agent_cfg = _make_agent_cfg()
-  runner = MjlabOnPolicyRunner(env, asdict(agent_cfg), log_dir=None, device=device)
+  agent_cfg = unitree_g1_soccer_recurrent_runner_cfg()
+  runner = SoccerRecurrentRunner(env, asdict(agent_cfg), log_dir=None, device=device)
   runner.load(checkpoint_path)
   policy = runner.get_inference_policy(device=env.unwrapped.device)
   print("[INFO] Policy loaded successfully.")
@@ -111,8 +90,9 @@ class ZeroPolicy:
 # -- Metrics ------------------------------------------------------------------
 
 def _is_goal(ball_pos: torch.Tensor) -> bool:
+  """Ball has crossed the goal plane (y=-5) inside the frame."""
   x, y, z = ball_pos[0].item(), ball_pos[1].item(), ball_pos[2].item()
-  return x >= _GOAL_X and abs(y) <= _GOAL_HALF_WIDTH and z <= _GOAL_HEIGHT
+  return y <= _GOAL_Y and abs(x) <= _GOAL_HALF_WIDTH and z <= _GOAL_HEIGHT
 
 
 def _kick_accuracy(ball_vel: torch.Tensor, ball_pos: torch.Tensor) -> float:
@@ -136,7 +116,7 @@ def run_trial(env, policy, max_steps: int = 500) -> dict:
   kick_speed = 0.0
   kick_accuracy_val = 0.0
   goal_scored = False
-  ball_final_x = -4.0
+  ball_final_y = 0.0
   steps = 0
 
   for _ in range(max_steps):
@@ -159,13 +139,13 @@ def run_trial(env, policy, max_steps: int = 500) -> dict:
     if _is_goal(ball_pos):
       goal_scored = True
 
-    ball_final_x = float(ball_pos[0])
+    ball_final_y = float(ball_pos[1])
     if terminated:
       break
 
   return {
     "goal": goal_scored, "kick_speed": kick_speed,
-    "kick_accuracy": kick_accuracy_val, "ball_final_x": ball_final_x,
+    "kick_accuracy": kick_accuracy_val, "ball_final_y": ball_final_y,
     "steps": steps, "terminated": terminated,
   }
 
@@ -202,7 +182,7 @@ def run_headless_eval(cfg: EvalConfig, env, policy):
   mean_acc = float(np.mean(accuracies)) if accuracies else 0.0
   std_acc = float(np.std(accuracies)) if accuracies else 0.0
   mean_speed = float(np.mean(kick_speeds)) if kick_speeds else 0.0
-  ball_past = sum(1 for r in results if r["ball_final_x"] >= _GOAL_X)
+  ball_past = sum(1 for r in results if r["ball_final_y"] <= _GOAL_Y)
 
   print(f"\n{'='*55}")
   print(f"  Eval Summary ({total} trials)")

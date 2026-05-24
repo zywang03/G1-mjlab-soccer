@@ -41,6 +41,9 @@ class SceneLayoutSettings:
   shooter_behind_ball: float = 0.5
   motion_origin_offset: list[float] = field(default_factory=lambda: [-5.0, 0.0, 0.0])
   motion_yaw_offset: float = 1.5708
+  # Eval positions in motion-local coords (G1 near origin, facing -y).
+  eval_ball_pos: list[float] = field(default_factory=lambda: [0.0, -1.5, 0.11])
+  eval_goal_pos: list[float] = field(default_factory=lambda: [0.0, -5.5, 0.0])
   # ball_pos and shooter_pos are computed in load_settings() from
   # penalty_spot.distance_from_goal and ball.radius — they are set as
   # plain instance attributes after dataclass construction.

@@ -95,7 +95,8 @@ def make_stage1_env_cfg() -> ManagerBasedRlEnvCfg:
   commands = {
     "motion": MultiMotionSoccerCommandCfg(
       motion_dir="",
-      anchor_body_name="pelvis",
+      motion_glob="soccer-standard-*.npz",
+      anchor_body_name="torso_link",
       body_names=TRACKING_BODY_NAMES,
       entity_name="robot",
       ball_entity_name="ball",

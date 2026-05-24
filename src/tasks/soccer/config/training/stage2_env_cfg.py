@@ -51,9 +51,10 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
   - Ball position randomization (arc offset from motion trajectory)
   - Soccer observations: ball + goal in robot pelvis frame
   - Anchor position tracking weight → 0.0 (allows ball pursuit)
+  - Body tracking filtered to exclude ankles (weights stay at 1.0, matching reference)
   - Soccer kick rewards: proximity, contact, sideways kick, ball vel/speed
   - Stabilization rewards: foot distance, pelvis orientation, waist smoothness
-  - Enables ball initial velocity for rolling ball scenarios
+  - Ball initial velocity disabled (stationary penalty kick)
   """
 
   cfg = make_stage1_env_cfg()
@@ -63,6 +64,7 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
   base_cmd = cfg.commands["motion"]
   cfg.commands["motion"] = MultiMotionSoccerCommandCfg(
     motion_dir="",
+    motion_glob="soccer-standard-*.npz",
     anchor_body_name=base_cmd.anchor_body_name,
     body_names=base_cmd.body_names,
     entity_name="robot",
@@ -104,7 +106,7 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
     params={"command_name": "motion"},
   )
 
-  # -- Rewards: override anchor position + add soccer terms -------------------
+  # -- Rewards: match reference G1FlatProximityEnvCfg weights ------------------
 
   # Disable global anchor position tracking (allows robot to pursue ball).
   cfg.rewards["track_anchor_pos"] = RewardTermCfg(
@@ -112,8 +114,11 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
     weight=0.0,
     params={"command_name": "motion", "std": 0.3},
   )
+  # Anchor orientation unchanged from Stage I (reference keeps 1.0, not 0.5).
+  # track_body_lin_vel / track_body_ang_vel: unchanged from Stage I (1.0).
 
-  # Use filtered body tracking (exclude ankles for positional generalization).
+  # Use filtered body tracking (exclude ankles for positional generalization,
+  # matching reference G1FlatProximityEnvCfg body_names subset).
   cfg.rewards["track_body_pos"] = RewardTermCfg(
     func=cfg.rewards["track_body_pos"].func,
     weight=1.0,
@@ -223,6 +228,17 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
     params={
       "entity_name": "robot",
       "joint_names": _waist_joints,
+    },
+  )
+
+  # Foot position tracking — matches reference G1FlatProximityEnvCfg.
+  cfg.rewards["track_foot_pos"] = RewardTermCfg(
+    func=cfg.rewards["track_body_pos"].func,
+    weight=1.0,
+    params={
+      "command_name": "motion",
+      "std": 0.3,
+      "body_names": _foot_names,
     },
   )
 

@@ -38,6 +38,13 @@ scene:
   motion_origin_offset: [-5.6, 0.0, 0.0]
   motion_yaw_offset: 1.5708  # +pi/2 rad
 
+  # Eval positions in motion-local coordinates (G1 near origin, facing -y).
+  # These replace the motion_origin_offset + motion_yaw_offset transform:
+  # the goal entity and ball are placed directly in front of the robot
+  # instead of shifting the robot to world coordinates.
+  eval_ball_pos: [0.0, -1.5, 0.11]    # 1.5m in front of G1 (-y direction)
+  eval_goal_pos: [0.0, -5.5, 0.0]      # goal 4m from ball (penalty distance)
+
 # Ground contact (shooter reference: restitution 0.8 via solref damping).
 ground:
   solref: [0.02, 0.07] # timeconst=0.02, dampratio=0.07 → e≈0.8
