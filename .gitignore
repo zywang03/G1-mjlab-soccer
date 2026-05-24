@@ -17,3 +17,10 @@ private
 .claude
 .codex
 temp
+.bbl
+.synctex.gz
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
