@@ -110,7 +110,12 @@ def _ball_entered_goal(ball_pos: torch.Tensor) -> bool:
 
 
 def run_trial(env, policy, max_steps: int = 150) -> dict:
-  """Run one eval episode and return whether the ball entered the goal."""
+  """Run one eval episode and return whether the ball entered the goal.
+
+  The environment is configured so that only time_out terminates the episode
+  (fell_over is disabled in eval mode). Outcome is determined solely by
+  whether the ball crosses the goal line before timeout.
+  """
   obs = env.reset()
   if isinstance(obs, tuple):
     obs = obs[0]
@@ -124,17 +129,17 @@ def run_trial(env, policy, max_steps: int = 150) -> dict:
       action = policy(obs)
     result = env.step(action)
     obs = result[0]
-    terminated = bool(result[2].item())
+    dones = result[2]
     steps += 1
 
     ball_pos = ball.data.root_link_pos_w[0].cpu()
     if _ball_entered_goal(ball_pos):
       ball_entered = True
 
-    if terminated:
+    if dones.item():
       break
 
-  return {"ball_entered_goal": ball_entered, "steps": steps, "terminated": terminated}
+  return {"ball_entered_goal": ball_entered, "steps": steps}
 
 
 # ----- Headless multi-trial eval -----
@@ -183,6 +188,12 @@ def run_eval(cfg: EvalConfig):
   env_cfg.scene.num_envs = 1
   env_cfg.viewer.height = cfg.video_height
   env_cfg.viewer.width = cfg.video_width
+
+  # Disable fell_over termination for eval: the goalkeeper may fall during a
+  # save attempt, but the outcome should be decided solely by whether the ball
+  # crosses the goal line before time_out.
+  if "fell_over" in env_cfg.terminations:
+    env_cfg.terminations["fell_over"] = None
 
   actor_terms = list(env_cfg.observations["actor"].terms.keys())
   critic_terms = list(env_cfg.observations["critic"].terms.keys())

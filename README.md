@@ -86,10 +86,11 @@ Scene: G1 at goal line (0, 0, 0.8), yaw=0 faces +x. Ball launched via 6-region p
 - Flight time: 0.6–1.0s
 - Parabolic velocity: v_xy = Δxy / t, v_z = (Δz + ½gt²) / t
 
-**Metrics** (matching Humanoid-Goalkeeper §IV):
-- **Block Rate (Esucc)** — fraction of episodes where ball velocity drops > 2 m/s when behind robot
-- **Min ball-robot xy distance** — closest approach during the episode
-- **Mean ball speed at robot** — ball speed when crossing the goal line
+**Metrics**:
+- **Block Rate** — fraction of episodes where the ball does NOT cross the goal plane
+  (x ≤ -0.5, |y| ≤ 1.5 m, z ≤ 1.8 m) before timeout. The ``fell_over`` termination is
+  disabled during eval so that the outcome is decided solely by whether the ball enters
+  the goal, not by whether the goalkeeper falls.
 
 ## Project Structure
 
@@ -185,7 +186,7 @@ goalkeeper_training:
 ball_trajectory:
   ball_start_distance: [3.0, 5.0]
   ball_end_distance: [0.1, 0.6]
-  t_flight: [0.5, 1.0]
+  t_flight: [0.6, 1.0]
 episode_length_s: 10.0                 # shooter
 goalkeeper_episode_length_s: 3.0       # goalkeeper
 ```
