@@ -92,6 +92,35 @@ Scene: G1 at goal line (0, 0, 0.8), yaw=0 faces +x. Ball launched via 6-region p
   disabled during eval so that the outcome is decided solely by whether the ball enters
   the goal, not by whether the goalkeeper falls.
 
+### Compete (Cross-Evaluation)
+
+Scene: two G1 robots in a shared MuJoCo simulation — shooter at (4, 0, 0.8) yaw=π
+faces -x toward the goal, goalkeeper at (0, 0, 0.8) yaw=0 faces +x.  Goal at
+(-0.5, 0, 0) behind the goalkeeper.  Ball at (3, 0, 0.1) in front of the shooter.
+Episode length: 10 s.
+
+``compete.py`` reads raw MuJoCo state (joint positions, root poses, ball pos/vel)
+and sends the same raw-state dict to each team's policy server via REST API.
+Teams compute their own observations from raw state — observation spaces are
+fully decoupled.
+
+**Win conditions** (mutually exclusive):
+- **Shooter wins** — ball crosses the goal plane (x ≤ -0.5, |y| ≤ 1.5 m, z ≤ 1.8 m)
+  at any point during the 10 s episode (trial ends immediately on goal).
+- **Goalkeeper wins** — the episode times out (10 s) without the ball ever
+  crossing the goal line.
+
+Falling over does **not** terminate the episode — the shooter may get back up
+and keep playing, and the goalkeeper is free to dive.  There is no speed-drop
+block detection; the goalkeeper's only job is to keep the ball out of the net
+until time expires.
+
+**Metrics**:
+- **Shooter win rate** — fraction of trials where the ball crosses the goal line
+- **Goalkeeper win rate** — fraction of trials ending in timeout without a goal
+- **Ball crossed goal line** — fraction of trials where ball_final_x ≤ -0.5
+  (sanity check; should equal shooter win rate)
+
 ## Project Structure
 
 ```
