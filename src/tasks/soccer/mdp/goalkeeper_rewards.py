@@ -69,29 +69,37 @@ def goalkeeper_ee_reach(
   ee_body_names: tuple[str, ...] = (
     "left_wrist_yaw_link",
     "right_wrist_yaw_link",
-    "left_ankle_roll_link",
-    "right_ankle_roll_link",
   ),
 ) -> torch.Tensor:
-  """End-effector reach reward: exponential distance to ball.
+  """Region-conditioned hand reach reward toward the interception target.
 
-  Paper's 'eereach' — encourages hands and feet to reach toward the ball.
-  Rewards proximity of 4 end-effectors (both hands + both feet) to the ball
-  using an exponential decay: sum_i exp(-||ee_i - ball||² / σ²).
+  Paper's 'eereach' uses the sampled end target and selected hand based on
+  the landing region. Regions 0/2/4 use the left hand; regions 1/3/5 use the
+  right hand. This avoids rewarding all end-effectors for chasing the current
+  ball position and instead trains the target-conditioned interception pose.
 
   Weight: 10.0 (matches paper).
   """
   ball: Entity = env.scene[ball_cfg.name]
   robot: Entity = env.scene[robot_cfg.name]
 
-  ball_pos = ball.data.root_link_pos_w  # (B, 3)
-  ee_indices = _resolve_ee_indices(robot, ee_body_names)
-  ee_pos = robot.data.body_link_pos_w[:, ee_indices]  # (B, N, 3)
+  end_target_w = getattr(env, "_gk_end_target_w", None)
+  if end_target_w is None or end_target_w.shape != ball.data.root_link_pos_w.shape:
+    end_target_w = ball.data.root_link_pos_w
 
-  delta = ee_pos - ball_pos.unsqueeze(1)  # (B, N, 3)
-  dist_sq = torch.sum(delta * delta, dim=-1)  # (B, N)
-  reward_per_ee = torch.exp(-dist_sq / (std * std))  # (B, N)
-  return reward_per_ee.sum(dim=-1)  # (B,)
+  region = getattr(env, "_gk_region", None)
+  if region is None or region.shape[0] != env.num_envs:
+    region = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+  ee_indices = _resolve_ee_indices(robot, ee_body_names)
+  hand_pos = robot.data.body_link_pos_w[:, ee_indices]  # (B, 2, 3)
+  left_hand = hand_pos[:, 0]
+  right_hand = hand_pos[:, 1]
+
+  use_left = (region.long() % 2) == 0
+  selected_hand = torch.where(use_left.unsqueeze(-1), left_hand, right_hand)
+  dist_sq = torch.sum((selected_hand - end_target_w) ** 2, dim=-1)
+  return torch.exp(-dist_sq / (std * std))
 
 
 def goalkeeper_stop_ball(
@@ -106,7 +114,8 @@ def goalkeeper_stop_ball(
   Paper's combined 'stopball' + 'success' — tracks per-environment max ball
   speed and awards 1.0 when:
     1. max_speed - current_speed > velocity_drop_threshold (2.0 m/s), AND
-    2. ball has passed behind the robot (ball_x > robot_x + threshold).
+    2. ball has passed behind the robot toward the goal
+       (ball_x < robot_x - threshold).
 
   The reward is awarded at most once per episode per environment.
 
@@ -129,7 +138,9 @@ def goalkeeper_stop_ball(
   setattr(env, "_gk_max_ball_speed", max_speed)
 
   speed_drop = (max_speed - current_speed) > velocity_drop_threshold
-  ball_behind = ball_pos[:, 0] > (robot_pos[:, 0] + behind_robot_x_threshold)
+  # In the goalkeeper setup, G1 faces +x and the goal is behind it at -x.
+  # Require the ball to pass the robot toward the goal before awarding a block.
+  ball_behind = ball_pos[:, 0] < (robot_pos[:, 0] - behind_robot_x_threshold)
   block_detected = speed_drop & ball_behind & (block_awarded < 0.5)
 
   reward = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
@@ -167,14 +178,14 @@ def goalkeeper_no_retreat(
   """Penalize retreating behind the goal line.
 
   Paper's 'noretreat' — discourages the robot from moving backward
-  (increasing x) past the goal line. In our coordinate system, the
-  robot faces -y with yaw=π; the ball comes from -x toward +x.
+  toward the goal. In this setup, the robot faces +x, the ball comes
+  from +x, and the goal is behind the robot at -x.
 
   Weight: -2.0 (matches paper).
   """
   robot: Entity = env.scene[robot_cfg.name]
   robot_x = robot.data.root_link_pos_w[:, 0]
-  retreat = torch.clamp(robot_x - goal_line_x, min=0.0)
+  retreat = torch.clamp(goal_line_x - robot_x, min=0.0)
   return retreat * retreat
 
 

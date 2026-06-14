@@ -81,7 +81,7 @@ ball_trajectory:
 goalkeeper_training:
   ee_reach_std: 0.3             # sigma for end-effector reach reward exp(-dist²/σ²)
   stop_ball_vel_drop: 2.0       # m/s velocity drop threshold for block detection
-  behind_robot_x: 0.0           # x threshold for "ball behind robot"
+  behind_robot_x: 0.0           # require ball_x < robot_x - threshold for "behind robot"
   episode_length_s: 3.0         # matches goalkeeper_episode_length_s
 
 # Shooter ball velocity (for moving-ball kick scenarios).

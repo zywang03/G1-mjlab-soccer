@@ -43,6 +43,12 @@ python scripts/play.py Unitree-G1-Goalkeeper --agent zero --viewer native
 python scripts/eval_naive_goalkeeper.py --headless --num-trials 50
 python scripts/eval_naive_goalkeeper.py --headless --num-trials 50 --checkpoint <path>
 
+# Debug goalkeeper failures
+python scripts/debug_goalkeeper_rollout.py --checkpoint <path> --num-trials 50
+
+# Train goalkeeper (Mac/CPU smoke test)
+python scripts/train.py Unitree-G1-Goalkeeper-Train --gpu-ids None --agent.max-iterations 0
+
 # --- Compete (Phase 2: cross-evaluation) ---
 
 # Start policy servers (one per robot)
@@ -132,15 +138,16 @@ src/
       eval/
         eval_shooter_cfg.py            # Shooter eval (reuses Stage II play config + goal)
         eval_goalkeeper_cfg.py         # Goalkeeper eval (T=10 history, 960D/113D)
-      training/                        # Reference training configs (unregistered)
+      training/                        # Reference training configs
         stage1_env_cfg.py              # Stage I: motion tracking, adaptive sampling
         stage2_env_cfg.py              # Stage II: perception-guided kicking
-        goalkeeper_env_cfg.py          # GK training: single-stage reactive
+        goalkeeper_env_cfg.py          # GK training: target-conditioned interception
 scripts/
   train.py                             # Training entrypoint
   play.py                              # Interactive visualization
   eval_naive_shooter.py                # Shooter eval (headless stats or viewer)
   eval_naive_goalkeeper.py             # Goalkeeper eval (headless stats or viewer)
+  debug_goalkeeper_rollout.py          # GK rollout diagnostics and failure analysis
   compete.py                           # Phase 2 cross-evaluation (two robots, two policies)
   api_server.py                        # Phase 2 REST API reference server
 ```
@@ -154,10 +161,14 @@ It provides:
   configurable scene layout, ball physics, and MuJoCo visualization.
 - **Eval scripts**: `eval_naive_shooter.py` and `eval_naive_goalkeeper.py` that load
   checkpoints, run headless batch trials, collect paper metrics, and record videos.
-- **Reference training configs**: The `config/training/` directory contains the
-  complete training environment designs (observations, rewards, terminations,
-  domain randomization) from both papers. These are provided as design reference
-  only — they are **not registered as tasks**.
+- **Reference training configs**: The `config/training/` directory contains
+  training environment designs (observations, rewards, terminations, domain
+  randomization) from both papers. The goalkeeper path is registered as
+  `Unitree-G1-Goalkeeper-Train`; shooter training task registration may vary by
+  branch.
+
+See [doc/goalkeeper_improvements.md](doc/goalkeeper_improvements.md) for the
+target-conditioned goalkeeper training path and diagnostic workflow.
 
 **You need to implement training yourself.** (*Jinxi's Note: actually you cannot get full 60% credit by just running the defined configs in this template, you need to understand the design and implement your own training pipeline.*)
 

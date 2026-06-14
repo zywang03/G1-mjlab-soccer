@@ -367,15 +367,19 @@ def goalkeeper_end_target_pos(
 ) -> torch.Tensor:
   """End target position in robot pelvis frame (3D privileged obs).
 
-  The end target is where the robot should aim its hands to intercept.
-  We use the ball's current position as a proxy.
+  The end target is where the robot should aim its hands to intercept. It is
+  sampled during the parabolic ball reset at the catch plane, matching the
+  Humanoid-Goalkeeper target-conditioned critic observation. If an older reset
+  path did not create the target, fall back to the current ball position.
   """
   ball: Entity = env.scene[ball_cfg.name]
   robot: Entity = env.scene[robot_cfg.name]
-  ball_pos_w = ball.data.root_link_pos_w
+  end_target_w = getattr(env, "_gk_end_target_w", None)
+  if end_target_w is None or end_target_w.shape != ball.data.root_link_pos_w.shape:
+    end_target_w = ball.data.root_link_pos_w
   robot_pos_w = robot.data.root_link_pos_w
   robot_quat_w = robot.data.root_link_quat_w
-  delta_w = ball_pos_w - robot_pos_w
+  delta_w = end_target_w - robot_pos_w
   return quat_apply_inverse(robot_quat_w, delta_w)  # (B, 3)
 
 

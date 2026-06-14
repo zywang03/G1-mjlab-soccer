@@ -81,7 +81,7 @@ def _load_policy(checkpoint_path: str, env, device: str):
     runner.alg.actor.load_state_dict(actor_state, strict=False)
     print("[INFO] Policy loaded successfully.")
   else:
-    runner.load(checkpoint_path, load_cfg={"actor": True})
+    runner.load(checkpoint_path, load_cfg={"actor": True}, map_location=device)
     print("[INFO] Policy loaded successfully.")
 
   policy = runner.get_inference_policy(device=env.unwrapped.device)

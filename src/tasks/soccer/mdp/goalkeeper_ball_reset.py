@@ -142,10 +142,11 @@ def reset_ball_with_parabolic_trajectory(
   1. Randomly pick a landing region (uniform among k=6).
   2. Sample a random ball start position in front of the robot.
   3. Sample a random ball end position within the chosen region (behind robot).
-  4. Compute launch velocity from the parabolic model:
+  4. Store the catch-plane target used by region-conditioned goalkeeper rewards.
+  5. Compute launch velocity from the parabolic model:
        v_xy = delta_xy / t_flight
        v_z  = (delta_z + 0.5 * g * t_flight²) / t_flight
-  5. Write position and velocity to sim.
+  6. Write position and velocity to sim.
   """
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
@@ -177,7 +178,7 @@ def reset_ball_with_parabolic_trajectory(
   )
   ball_start_local = torch.stack([start_x, start_y, start_z], dim=-1)
 
-  # Sample ball end within chosen region (behind robot, -y).
+  # Sample ball end within chosen region (behind robot, -x).
   region_height_low = torch.tensor(
     [vel_cfg.regions[i.item()]["height"][0] for i in region_idx],
     device=device, dtype=torch.float32,
@@ -236,6 +237,23 @@ def reset_ball_with_parabolic_trajectory(
     setattr(env, "_gk_region", t)
   t[env_ids] = region_idx.float()
   setattr(env, "_gk_region", t)
+
+  # Store a world-frame interception target at the reference catch plane.
+  # Humanoid-Goalkeeper uses x=0.1m in front of the robot as the task target,
+  # rather than asking the hands to chase the instantaneous ball position.
+  catch_x_local = torch.full((n, 1), 0.1, dtype=torch.float32, device=device)
+  catch_prop = (catch_x_local - ball_start_local[:, 0:1]) / (
+    ball_end_local[:, 0:1] - ball_start_local[:, 0:1]
+  )
+  catch_prop = torch.clamp(catch_prop, 0.0, 1.0)
+  end_target_w = ball_start_w + delta_pos * catch_prop
+
+  target = getattr(env, "_gk_end_target_w", None)
+  if target is None or target.shape != (env.num_envs, 3):
+    target = torch.zeros(env.num_envs, 3, dtype=torch.float32, device=device)
+    setattr(env, "_gk_end_target_w", target)
+  target[env_ids] = end_target_w
+  setattr(env, "_gk_end_target_w", target)
 
   # Ball orientation unchanged from default.
   asset: Entity = env.scene[ball_cfg.name]

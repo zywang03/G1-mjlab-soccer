@@ -71,7 +71,7 @@ def _load_policy(checkpoint_path: str, env, device: str):
   print(f"[INFO] Loading policy from: {checkpoint_path}")
   agent_cfg = unitree_g1_soccer_recurrent_runner_cfg()
   runner = SoccerRecurrentRunner(env, asdict(agent_cfg), log_dir=None, device=device)
-  runner.load(checkpoint_path)
+  runner.load(checkpoint_path, map_location=device)
   policy = runner.get_inference_policy(device=env.unwrapped.device)
   print("[INFO] Policy loaded successfully.")
   return policy

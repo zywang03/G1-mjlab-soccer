@@ -205,7 +205,7 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
             }
             runner.alg.actor.load_state_dict(actor_state, strict=False)
         else:
-            runner.load(checkpoint_path, load_cfg={"actor": True})
+            runner.load(checkpoint_path, load_cfg={"actor": True}, map_location=device)
     else:
         from src.tasks.soccer.config.g1.rl_cfg import (
             SoccerRecurrentRunner,
@@ -215,7 +215,7 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
         runner = SoccerRecurrentRunner(
             env, asdict(agent_cfg), log_dir=None, device=device,
         )
-        runner.load(checkpoint_path)
+        runner.load(checkpoint_path, map_location=device)
 
     policy = runner.get_inference_policy(device=device)
     print(f"[INFO] Policy loaded from: {checkpoint_path}")
