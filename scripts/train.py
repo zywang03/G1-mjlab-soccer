@@ -1,13 +1,66 @@
-"""Script to train RL agent with RSL-RL."""
+"""Train RL agents with PPO (RSL-RL) for G1 soccer skills.
+
+Algorithm: clipped PPO with GAE, adaptive learning rate (KL-constrained).
+  - clip_param=0.2, gamma=0.99, lam=0.95, entropy_coef=0.005
+  - num_learning_epochs=5, num_mini_batches=4, learning_rate=1e-3
+
+Task IDs:
+  Unitree-G1-Shooter          Playable shooter (zero-agent only, no training)
+  Unitree-G1-Goalkeeper       Playable goalkeeper (zero-agent only, no training)
+  Unitree-G1-Shooter-Stage1   Training: motion tracking (LSTM, 128-64-32 + 2x128)
+  Unitree-G1-Shooter-Stage2   Training: perception-guided kicking (same LSTM)
+  Unitree-G1-Shooter-Student  Training: motion-free student PPO (MLP, BC-initialized)
+
+The PAiD paper (arXiv:2602.05310) uses a two-stage training strategy.
+Both stages share the same LSTM architecture and observation space (160D),
+so Stage II resumes from Stage I via standard ``runner.load()`` with
+no special weight transfer needed.
+
+For the fully automated two-stage pipeline, see
+``scripts/train_pipeline.py``.
+
+Usage:
+  # ---- Stage I: motion tracking ----
+  python scripts/train.py Unitree-G1-Shooter-Stage1 \\
+      --motion-dir src/assets/soccer/motions/shooter
+
+  # Stage I + GPU selection
+  CUDA_VISIBLE_DEVICES=0,1 python scripts/train.py Unitree-G1-Shooter-Stage1 \\
+      --motion-dir src/assets/soccer/motions/shooter \\
+      --env.scene.num-envs 2048 --gpu-ids 0,1
+
+  # ---- Stage II: perception-guided kicking (transfer from Stage I) ----
+  python scripts/train.py Unitree-G1-Shooter-Stage2 \\
+      --motion-dir src/assets/soccer/motions/shooter \\
+      --env.scene.num-envs 2048 --gpu-ids 0,1 \\
+      --agent.resume True \\
+      --agent.load-run "2026-06-10_14-26-14" \\
+      --agent.load-checkpoint "model_10000.pt" \\
+      --agent.run-name shooter_stage2
+
+  # ---- Resume interrupted training (same stage) ----
+  python scripts/train.py Unitree-G1-Shooter-Stage2 \\
+      --motion-dir src/assets/soccer/motions/shooter \\
+      --env.scene.num-envs 2048 --gpu-ids 0,1 \\
+      --agent.resume True \\
+      --agent.load-run "2026-06-10_14-26-14" \\
+      --agent.load-checkpoint "model_6600.pt"
+
+  # ---- Initialize PPO actor from BC, with fresh critic/optimizer ----
+  python scripts/train.py <student-task-id> \\
+      --load-checkpoint-path logs/bc/shooter_student/<bc-run>/model_best.pt \\
+      --load-actor-only True
+"""
 
 import logging
 import os
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
 
+import torch
 import tyro
 
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
@@ -31,8 +84,11 @@ class TrainConfig:
   video_length: int = 200
   video_interval: int = 2000
   enable_nan_guard: bool = False
+  load_actor_only: bool = False
+  load_checkpoint_path: str | None = None
   torchrunx_log_dir: str | None = None
   gpu_ids: list[int] | Literal["all"] | None = field(default_factory=lambda: [0])
+  ball_speed_std: float | None = None
 
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
@@ -103,6 +159,14 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
       )
     print(f"[INFO] Using motion directory: {motion_cmd.motion_dir}")
 
+  # Override ball_speed std when --ball-speed-std is set (Stage 3 curriculum).
+  if cfg.ball_speed_std is not None and "ball_speed" in cfg.env.rewards:
+    cfg.env.rewards["ball_speed"] = replace(
+      cfg.env.rewards["ball_speed"],
+      params={**cfg.env.rewards["ball_speed"].params, "std": cfg.ball_speed_std},
+    )
+    print(f"[INFO] Overriding ball_speed std: {cfg.ball_speed_std}")
+
   # Enable NaN guard if requested.
   if cfg.enable_nan_guard:
     cfg.env.sim.nan_guard.enabled = True
@@ -118,11 +182,15 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   log_root_path = log_dir.parent  # Go up from specific run dir to experiment dir.
 
   resume_path: Path | None = None
-  if cfg.agent.resume:
-      # Load checkpoint from local filesystem.
-      resume_path = get_checkpoint_path(
-        log_root_path, cfg.agent.load_run, cfg.agent.load_checkpoint
-      )
+  if cfg.load_checkpoint_path is not None:
+    resume_path = Path(cfg.load_checkpoint_path).expanduser().resolve()
+    if not resume_path.exists():
+      raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
+  elif cfg.agent.resume:
+    # Load checkpoint from local filesystem.
+    resume_path = get_checkpoint_path(
+      log_root_path, cfg.agent.load_run, cfg.agent.load_checkpoint
+    )
 
   # Only record videos on rank 0 to avoid multiple workers writing to the same files.
   if cfg.video and rank == 0:
@@ -150,14 +218,13 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   runner.add_git_repo_to_log(__file__)
   if resume_path is not None:
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # Stage I→II transfer: architectures differ (MLP→LSTM, 154D→160D).
-    # Only restore iteration counter; skip actor/critic/normalizer weights.
-    is_soccer_stage2 = task_id == "Unitree-G1-Shooter-Stage2"
-    load_cfg = None
-    if is_soccer_stage2 and cfg.agent.resume:
-      print("[INFO] Stage II transfer: loading only iteration counter (MLP→LSTM).")
-      load_cfg = {"actor": False, "critic": False, "normalizer": False}
-    runner.load(str(resume_path), load_cfg=load_cfg)
+    if cfg.load_actor_only:
+      runner.load(
+        str(resume_path),
+        load_cfg={"actor": True, "critic": False, "optimizer": False, "iteration": False},
+      )
+    else:
+      runner.load(str(resume_path))
 
   # Only write config files from rank 0 to avoid race conditions.
   if rank == 0:

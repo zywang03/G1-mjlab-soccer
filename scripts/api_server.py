@@ -15,16 +15,20 @@ Usage:
   # Goalkeeper server
   python scripts/api_server.py --checkpoint goalkeeper.pt --port 8001 --task goalkeeper
 
+  # Custom host/port for remote access
+  python scripts/api_server.py --checkpoint model.pt --host 0.0.0.0 --port 8080 --task shooter
+
+  # CPU mode
+  python scripts/api_server.py --checkpoint model.pt --device cpu --task shooter
+
 Test with curl:
   curl -X POST http://localhost:8000/reset
   curl -X POST http://localhost:8000/act \\
        -H "Content-Type: application/json" \\
        -d '{"shooter":{"root_pos":[4,0,0.8],...},"goalkeeper":{...},"ball":{...}}'
 
--------------------------------------------------------------------------------
 CUSTOMIZATION GUIDE
--------------------------------------------------------------------------------
-
+-------------------
 Teams MUST customize ``compute_obs()`` to match their policy's observation
 space.  The default implementation computes a standard proprioception + ball
 observation.  If your policy uses different terms, scaling factors, reference

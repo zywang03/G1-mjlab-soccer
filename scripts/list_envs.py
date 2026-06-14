@@ -1,4 +1,13 @@
-"""Script to list mjlab environments."""
+"""List all registered mjlab tasks (use to discover trainable task IDs).
+
+Usage:
+  # All tasks
+  python scripts/list_envs.py
+
+  # Filter by keyword
+  python scripts/list_envs.py --keyword Shooter
+  python scripts/list_envs.py --keyword G1
+"""
 
 import tyro
 from prettytable import PrettyTable

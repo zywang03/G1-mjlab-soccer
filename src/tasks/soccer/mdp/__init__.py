@@ -19,3 +19,6 @@ from . import goalkeeper_obs  # noqa: F401
 from . import goalkeeper_rewards  # noqa: F401
 from . import shooter_obs  # noqa: F401
 from . import shooter_rewards  # noqa: F401
+from . import student_shooter_commands  # noqa: F401
+from . import student_shooter_obs  # noqa: F401
+from . import student_shooter_rewards  # noqa: F401
