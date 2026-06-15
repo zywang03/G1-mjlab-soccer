@@ -71,6 +71,21 @@ MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py
   --device cuda:0
 ```
 
+For a longer data-collection run, shard repair data for about six hours before
+distillation:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk_long.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_lyk_long.pt \
+  --num-envs 2048 \
+  --collect-hours 6 \
+  --collect-batches-per-shard 8 \
+  --epochs 60 \
+  --device cuda:0
+```
+
 Resume selected stages if needed:
 
 ```bash
