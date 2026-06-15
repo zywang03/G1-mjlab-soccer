@@ -23,11 +23,16 @@ Usage:
 """
 
 import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
 import tyro
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+  sys.path.insert(0, str(_REPO_ROOT))
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
@@ -297,6 +302,7 @@ def run_eval(cfg: EvalConfig):
 def main():
   import mjlab.tasks  # noqa: F401
   import src.tasks  # noqa: F401
+  import src.tasks.soccer.config.eval  # noqa: F401
 
   all_tasks = list_tasks()
   eval_tasks = [t for t in all_tasks if "Eval" in t]

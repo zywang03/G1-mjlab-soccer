@@ -36,10 +36,17 @@ from __future__ import annotations
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+from pathlib import Path
+import sys
 from typing import Any
 
 import torch
 import tyro
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -334,6 +341,7 @@ class ServerConfig:
 
 def main():
     import src.tasks  # noqa: F401  — register eval tasks
+    import src.tasks.soccer.config.eval  # noqa: F401
 
     args = tyro.cli(ServerConfig, prog="api_server")
 

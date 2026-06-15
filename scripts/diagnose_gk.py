@@ -12,13 +12,22 @@ near-miss distance and crossing point. This tells us whether failures are
 concentrated (a targeted fix works) or diffuse (need a repair oracle).
 """
 from __future__ import annotations
+import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 import torch, tyro
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+  sys.path.insert(0, str(_REPO_ROOT))
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper, MjlabOnPolicyRunner
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
+
+import mjlab.tasks  # noqa: F401
+import src.tasks.soccer.config.eval  # noqa: F401
 
 _REGION_NAMES = ["Right-Mid", "Left-Mid", "Right-Up", "Left-Up", "Right-Low", "Left-Low"]
 # Blocking links: hands/forearms/upper-arms, shins/feet, chest/pelvis.

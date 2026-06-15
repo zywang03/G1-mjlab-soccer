@@ -22,10 +22,17 @@ from dataclasses import dataclass
 from pathlib import Path
 import torch, tyro
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+  sys.path.insert(0, str(_REPO_ROOT))
+
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
+
+import mjlab.tasks  # noqa: F401
+import src.tasks.soccer.config.eval  # noqa: F401
 
 _REGION = ["Right-Mid", "Left-Mid", "Right-Up", "Left-Up", "Right-Low", "Left-Low"]
 _BLOCK_LINKS = (
@@ -154,12 +161,14 @@ def main(cfg: Cfg):
         obs_buf.append(obs["actor"][keep].to("cpu")); act_buf.append(a[keep].to("cpu"))
       res = env.step(a); obs = res[0]
       bp = ball.data.root_link_pos_w
-      entered |= (bp[:, 0] <= -0.5) & (bp[:, 1].abs() <= 1.5) & (bp[:, 2] <= 1.8)
+      bx = bp[:, 0] - env.unwrapped.scene.env_origins[:, 0]
+      by = bp[:, 1] - env.unwrapped.scene.env_origins[:, 1]
+      entered |= (bx <= -0.5) & (by.abs() <= 1.5) & (bp[:, 2] <= 1.8)
       body = robot.data.body_link_pos_w[:, blk]
       d = (body - bp.unsqueeze(1)).pow(2).sum(-1).min(1).values.sqrt()
       min_d = torch.minimum(min_d, d)
       # upright penalty only while ball is near the keeper plane (contact window)
-      near = bp[:, 0].abs() < 0.6
+      near = bx.abs() < 0.6
       gz = robot.data.projected_gravity_b[:, 2]   # ~ -1 upright
       upr_bad += near.float() * torch.clamp(gz + 0.3, min=0.0)
     cost = (cfg.w_goal * entered.float() + cfg.w_dist * min_d
