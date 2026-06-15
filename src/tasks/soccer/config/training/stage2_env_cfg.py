@@ -1,10 +1,9 @@
 """Stage II training config: perception-guided kicking on flat ground.
 
-Builds on Stage I by adding ball/goal perception observations and
-lightweight soccer kick rewards. The robot learns to approach and kick
-balls at randomized positions while maintaining motion style.
-
-Matches HumanoidSoccer's G1FlatKickEnvCfg.
+Builds on Stage I by overriding the motion command (uniform sampling,
+ball position randomization) and adjusting reward weights to match
+the original HumanoidSoccer code.  Both stages share the same 160D
+observation space (soc terms are already in Stage I).
 """
 
 from __future__ import annotations
@@ -21,18 +20,25 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
-from src.tasks.soccer.config.training.stage1_env_cfg import make_stage1_env_cfg
+from src.tasks.soccer.config.training.stage1_env_cfg import make_stage1_env_cfg, TRACKING_BODY_NAMES
 
-from src.tasks.soccer.mdp.shooter_obs import (
-  constant_target_point_pos,
-  target_destination_pos_local,
+# Original code Stage II excludes ankles from body tracking; feet are tracked
+# separately via track_foot_pos (matching G1FlatProximityEnvCfg).
+TRACKING_BODY_NAMES_NO_ANKLES = tuple(
+    name for name in TRACKING_BODY_NAMES
+    if name not in ("left_ankle_roll_link", "right_ankle_roll_link")
 )
 
 from src.tasks.soccer.mdp.shooter_rewards import (
   action_rate_l2_clip,
   ball_speed_reward,
   ball_velocity_direction_alignment,
+  ball_z_speed_penalty,
+  both_feet_ball_contact,
   foot_distance,
+  foot_lift_penalty,
+  foot_stomp_penalty,
+  nonfoot_ball_contact,
   pelvis_orientation,
   sideways_kick,
   target_point_contact,
@@ -40,7 +46,9 @@ from src.tasks.soccer.mdp.shooter_rewards import (
   waist_action_rate_l2_clip,
 )
 
-from src.tasks.soccer.mdp.shooter_commands import MultiMotionSoccerCommandCfg
+from src.tasks.soccer.mdp.shared_rewards import is_terminated
+
+from src.tasks.soccer.mdp.shooter_commands import CurveOffsetCfg, MultiMotionSoccerCommandCfg
 
 
 def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
@@ -51,9 +59,11 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
   - Ball position randomization (arc offset from motion trajectory)
   - Soccer observations: ball + goal in robot pelvis frame
   - Anchor position tracking weight → 0.0 (allows ball pursuit)
-  - Body tracking filtered to exclude ankles (weights stay at 1.0, matching reference)
+  - Motion tracking weights reduced per original HumanoidSoccer code:
+    anchor_ori stays at 1.0; body-pos/ori track 12 bodies (no ankles)
+    at 1.0; lin-vel/ang-vel tracking unchanged from Stage I (1.0).
+  - Feet tracked separately via track_foot_pos (weight=1.0).
   - Soccer kick rewards: proximity, contact, sideways kick, ball vel/speed
-  - Stabilization rewards: foot distance, pelvis orientation, waist smoothness
   - Ball initial velocity disabled (stationary penalty kick)
   """
 
@@ -75,38 +85,34 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
     velocity_range=base_cmd.velocity_range,
     joint_position_range=base_cmd.joint_position_range,
     sampling_mode="uniform",
-    curve_offset_range={
-      "radius": (-0.25, 0.25),
-      "arc_angle": math.pi / 9,
-      "height": 0.11,
-    },
+    curve_offset_range=CurveOffsetCfg(
+      radius=(-0.15, 0.15),
+      arc_angle=math.pi / 18,
+      height=0.11,
+    ),
     destination_center=(0.0, -5.0, 0.11),
     destination_length=1.0,
     destination_width=0.5,
     enable_soccer_ball_init_vel=False,
   )
 
-  # -- Observations: add soccer perception to actor and critic ----------------
-
-  cfg.observations["actor"].terms["target_point_pos"] = ObservationTermCfg(
-    func=constant_target_point_pos,
-    params={"command_name": "motion"},
-  )
-  cfg.observations["actor"].terms["target_destination_pos"] = ObservationTermCfg(
-    func=target_destination_pos_local,
-    params={"command_name": "motion"},
-  )
-
-  cfg.observations["critic"].terms["target_point_pos"] = ObservationTermCfg(
-    func=constant_target_point_pos,
-    params={"command_name": "motion"},
-  )
-  cfg.observations["critic"].terms["target_destination_pos"] = ObservationTermCfg(
-    func=target_destination_pos_local,
-    params={"command_name": "motion"},
+  # -- Terminations: relax ee_body_pos for Stage II ----------------------------
+  # Stage II kicking requires larger foot displacement than Stage I tracking.
+  # Relax from 0.25m to 0.35m so the policy can explore kicking without
+  # prematurely terminating.
+  cfg.terminations["ee_body_pos"] = TerminationTermCfg(
+    func=cfg.terminations["ee_body_pos"].func,
+    params={
+      "command_name": "motion",
+      "threshold": 0.35,
+      "body_names": (
+        "left_ankle_roll_link", "right_ankle_roll_link",
+        "left_wrist_yaw_link", "right_wrist_yaw_link",
+      ),
+    },
   )
 
-  # -- Rewards: match reference G1FlatProximityEnvCfg weights ------------------
+  # -- Rewards: match original HumanoidSoccer code (Stage II weights) --------
 
   # Disable global anchor position tracking (allows robot to pursue ball).
   cfg.rewards["track_anchor_pos"] = RewardTermCfg(
@@ -114,25 +120,21 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
     weight=0.0,
     params={"command_name": "motion", "std": 0.3},
   )
-  # Anchor orientation unchanged from Stage I (reference keeps 1.0, not 0.5).
-  # track_body_lin_vel / track_body_ang_vel: unchanged from Stage I (1.0).
-
-  # Use filtered body tracking (exclude ankles for positional generalization,
-  # matching reference G1FlatProximityEnvCfg body_names subset).
+  # Anchor orientation tracking kept at 1.0 (original code).
+  cfg.rewards["track_anchor_ori"] = RewardTermCfg(
+    func=cfg.rewards["track_anchor_ori"].func,
+    weight=1.0,
+    params={"command_name": "motion", "std": 0.4},
+  )
+  # Body tracking on 12 bodies (excluding ankles, which are tracked
+  # separately via track_foot_pos).  Weight stays at 1.0.
   cfg.rewards["track_body_pos"] = RewardTermCfg(
     func=cfg.rewards["track_body_pos"].func,
     weight=1.0,
     params={
       "command_name": "motion",
       "std": 0.3,
-      "body_names": (
-        "pelvis",
-        "left_hip_roll_link", "left_knee_link",
-        "right_hip_roll_link", "right_knee_link",
-        "torso_link",
-        "left_shoulder_roll_link", "left_elbow_link", "left_wrist_yaw_link",
-        "right_shoulder_roll_link", "right_elbow_link", "right_wrist_yaw_link",
-      ),
+      "body_names": TRACKING_BODY_NAMES_NO_ANKLES,
     },
   )
   cfg.rewards["track_body_ori"] = RewardTermCfg(
@@ -141,16 +143,10 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
     params={
       "command_name": "motion",
       "std": 0.4,
-      "body_names": (
-        "pelvis",
-        "left_hip_roll_link", "left_knee_link",
-        "right_hip_roll_link", "right_knee_link",
-        "torso_link",
-        "left_shoulder_roll_link", "left_elbow_link", "left_wrist_yaw_link",
-        "right_shoulder_roll_link", "right_elbow_link", "right_wrist_yaw_link",
-      ),
+      "body_names": TRACKING_BODY_NAMES_NO_ANKLES,
     },
   )
+  # lin-vel and ang-vel tracking: unchanged from Stage I (1.0), no override needed.
 
   # Soccer rewards.
   _foot_names = ("left_ankle_roll_link", "right_ankle_roll_link")
@@ -159,7 +155,7 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
   cfg.rewards["proximity"] = RewardTermCfg(
     func=target_point_proximity,
     weight=1.0,
-    params={"std": 4.0, "command_name": "motion"},
+    params={"std": 2.0, "command_name": "motion"},
   )
   cfg.rewards["contact"] = RewardTermCfg(
     func=target_point_contact,
@@ -167,7 +163,7 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
     params={
       "command_name": "motion",
       "ball_sensor_name": "ball_robot_contact",
-      "horizontal_force_threshold": 10.0,
+      "horizontal_force_threshold": 0.0,
       "foot_body_names": _foot_names,
     },
   )
@@ -177,7 +173,7 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
     params={
       "command_name": "motion",
       "ball_sensor_name": "ball_robot_contact",
-      "horizontal_force_threshold": 10.0,
+      "horizontal_force_threshold": 0.0,
       "foot_body_names": _foot_names,
     },
   )
@@ -189,7 +185,7 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
       "std": 0.8,
       "velocity_threshold": 0.5,
       "ball_sensor_name": "ball_robot_contact",
-      "horizontal_force_threshold": 10.0,
+      "horizontal_force_threshold": 0.0,
       "foot_body_names": _foot_names,
     },
   )
@@ -200,6 +196,17 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
       "command_name": "motion",
       "std": 1.2,
       "velocity_threshold": 0.5,
+      "ball_sensor_name": "ball_robot_contact",
+      "horizontal_force_threshold": 0.0,
+      "foot_body_names": _foot_names,
+    },
+  )
+  # z-speed penalty: original code has weight=0.0 (disabled).
+  cfg.rewards["z_speed"] = RewardTermCfg(
+    func=ball_z_speed_penalty,
+    weight=0.0,
+    params={
+      "command_name": "motion",
       "ball_sensor_name": "ball_robot_contact",
       "horizontal_force_threshold": 10.0,
       "foot_body_names": _foot_names,
@@ -231,7 +238,8 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
     },
   )
 
-  # Foot position tracking — matches reference G1FlatProximityEnvCfg.
+  # Foot position tracking for the two ankle bodies, which are excluded
+  # from track_body_pos/track_body_ori above (matching original code).
   cfg.rewards["track_foot_pos"] = RewardTermCfg(
     func=cfg.rewards["track_body_pos"].func,
     weight=1.0,
@@ -239,6 +247,64 @@ def make_stage2_env_cfg() -> ManagerBasedRlEnvCfg:
       "command_name": "motion",
       "std": 0.3,
       "body_names": _foot_names,
+    },
+  )
+
+  # -- Anti-clamp penalties and termination penalty (Stage 2.5) ---------------
+
+  # Termination penalty: aligns with compete.py (-200).
+  cfg.rewards["is_terminated"] = RewardTermCfg(
+    func=is_terminated,
+    weight=-200.0,
+  )
+
+  # Both feet simultaneously contacting ball (prevents clamping).
+  cfg.rewards["both_feet_ball"] = RewardTermCfg(
+    func=both_feet_ball_contact,
+    weight=-5.0,
+    params={
+      "command_name": "motion",
+      "ball_sensor_name": "ball_robot_contact",
+      "horizontal_force_threshold": 0.0,
+    },
+  )
+
+  # Non-foot body contacting ball (prevents body-bumping).
+  cfg.rewards["nonfoot_ball"] = RewardTermCfg(
+    func=nonfoot_ball_contact,
+    weight=-3.0,
+    params={
+      "command_name": "motion",
+      "ball_sensor_name": "ball_robot_contact",
+      "horizontal_force_threshold": 0.0,
+    },
+  )
+
+  # Downward foot velocity at kick moment (prevents stomping on ball).
+  # Only penalizes when foot is above ball AND vertical velocity dominates.
+  cfg.rewards["foot_stomp"] = RewardTermCfg(
+    func=foot_stomp_penalty,
+    weight=-20.0,
+    params={
+      "command_name": "motion",
+      "ball_sensor_name": "ball_robot_contact",
+      "horizontal_force_threshold": 0.0,
+      "foot_body_names": _foot_names,
+      "foot_above_ball_margin": 0.02,
+      "vz_ratio_threshold": 0.5,
+    },
+  )
+
+  # Penalize kicking foot being too high before valid kick (prevents stomp setup).
+  cfg.rewards["foot_lift"] = RewardTermCfg(
+    func=foot_lift_penalty,
+    weight=-2.0,
+    params={
+      "command_name": "motion",
+      "ball_sensor_name": "ball_robot_contact",
+      "horizontal_force_threshold": 0.0,
+      "foot_body_names": _foot_names,
+      "foot_above_threshold": 0.15,
     },
   )
 

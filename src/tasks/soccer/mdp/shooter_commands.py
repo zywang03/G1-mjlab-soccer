@@ -246,14 +246,15 @@ class MultiMotionSoccerCommand(CommandTerm):
 
     # Curve offset for ball placement variation.
     self.curve_radius_offset = torch.zeros(self.num_envs, device=self.device)
-    cc = cfg.curve_offset_range or {}
-    r = cc.get("radius")
-    if isinstance(r, Sequence) and len(r) >= 2:
-      self._radius_min, self._radius_max = float(r[0]), float(r[1])
+    cc = cfg.curve_offset_range
+    if cc is not None:
+      self._radius_min, self._radius_max = cc.radius[0], cc.radius[1]
+      self._target_arc_angle = cc.arc_angle
+      self._target_height = cc.height
     else:
       self._radius_min, self._radius_max = 0.0, 0.0
-    self._target_arc_angle = float(cc.get("arc_angle", math.pi / 18.0))
-    self._target_height = float(cc.get("height", 0.11))
+      self._target_arc_angle = 0.0
+      self._target_height = 0.0
 
     # Destination rectangle (in local env coords).
     dest = cfg.destination_center
@@ -466,12 +467,12 @@ class MultiMotionSoccerCommand(CommandTerm):
     # Update target point from simulation (tracks the ball as it moves).
     self._update_target_points_from_sim()
 
-    # Freeze initial_target_point_pos once kick contact occurs.
+    # Freeze initial_target_point_pos once a valid kick occurs.
     if hasattr(self, "kick_contact_tracker"):
-      contact_awarded = self.kick_contact_tracker.get_contact_awarded()
-      no_contact = ~contact_awarded
-      if torch.any(no_contact):
-        self.initial_target_point_pos[no_contact] = self.target_point_pos[no_contact]
+      valid_kick_awarded = self.kick_contact_tracker.get_valid_kick_awarded()
+      no_valid_kick = ~valid_kick_awarded
+      if torch.any(no_valid_kick):
+        self.initial_target_point_pos[no_valid_kick] = self.target_point_pos[no_valid_kick]
 
     self._compute_relative_transforms()
 
@@ -564,12 +565,9 @@ class MultiMotionSoccerCommand(CommandTerm):
 
     # Notify kick tracker of resample.
     if hasattr(self, "kick_contact_tracker"):
-      flag_name = "_motion_motion_resampled"
-      flags = getattr(self._env, flag_name, None)
-      if flags is None or flags.shape[0] != self.num_envs:
-        flags = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+      flags = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
       flags[env_ids] = True
-      setattr(self._env, flag_name, flags)
+      self.kick_contact_tracker._handle_resample(flags)
 
   # -- Sampling strategies ------------------------------------------------------
 
@@ -666,6 +664,7 @@ class MultiMotionSoccerCommand(CommandTerm):
     radius_sq = torch.sum(radius_vec * radius_vec, dim=-1)   # (n,)
     radius = torch.sqrt(radius_sq.clamp(min=1e-12))          # (n,)
     radius = radius + self.curve_radius_offset[env_ids]
+    radius = torch.clamp(radius, min=0.0)
 
     # Direction: either base direction (normalized radius_vec) or default (1, 0).
     valid = radius_sq > 1e-12                                # (n,)
@@ -747,6 +746,24 @@ class MultiMotionSoccerCommand(CommandTerm):
       visualizer.add_sphere(dp, ball_radius, (1.0, 0.0, 0.0, 1.0), label=f"destination_{batch}")
 
 
+@dataclass
+class CurveOffsetCfg:
+  """Ball placement randomization for Stage II perception-guided kicking.
+
+  The ball is offset from the motion's nominal terminal position along a
+  curved arc to promote positional generalization.
+  """
+
+  radius: tuple[float, float] = (0.0, 0.0)
+  """Range for random radius offset (min, max), in meters."""
+
+  arc_angle: float = 0.0
+  """Semi-angle of the arc perturbation, in radians."""
+
+  height: float = 0.0
+  """Ball height offset, in meters."""
+
+
 @dataclass(kw_only=True)
 class MultiMotionSoccerCommandCfg(CommandTermCfg):
   """Configuration for MultiMotionSoccerCommand."""
@@ -769,7 +786,7 @@ class MultiMotionSoccerCommandCfg(CommandTermCfg):
   adaptive_uniform_ratio: float = 0.1
   adaptive_alpha: float = 0.4
 
-  curve_offset_range: dict | None = None
+  curve_offset_range: CurveOffsetCfg | None = None
   destination_center: tuple[float, float, float] = (0.0, -5.0, 0.11)
   destination_length: float = 1.0
   destination_width: float = 0.5

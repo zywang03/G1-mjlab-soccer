@@ -25,7 +25,7 @@ def eval_shooter_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   placement, robot positioning, sampling, and noise settings are all
   identical to play mode.
   """
-  cfg = unitree_g1_stage2_env_cfg(play=True)
+  cfg = unitree_g1_stage2_env_cfg(play=play)
 
   # Add goal entity in front of G1 (motion-local coords: G1 faces -y).
   # destination_center defaults to (0, -5, 0.11) — place goal there,
@@ -35,7 +35,7 @@ def eval_shooter_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     rot=(0.7071068, 0.0, 0.0, 0.7071068),
   )
 
-  # Eval episode length (play uses infinite).
+  # Non-play mode: restore training episode length and terminations.
   if not play:
     cfg.episode_length_s = SETTINGS.episode_length_s
 
