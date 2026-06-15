@@ -84,8 +84,21 @@ def _load_policy(checkpoint_path: str, env, device: str):
     # Our distilled native rsl_rl MLP policy (actor_state_dict / critic_state_dict).
     print("[INFO] Detected native MLP checkpoint — loading.")
     from mjlab.rl import MjlabOnPolicyRunner
-    from src.tasks.soccer.config.g1.gk_train_cfg import goalkeeper_train_runner_cfg
-    agent_cfg = goalkeeper_train_runner_cfg()
+    from src.tasks.soccer.config.g1.gk_train_cfg import (
+      goalkeeper_ballistic_residual_runner_cfg,
+      goalkeeper_train_runner_cfg,
+    )
+    meta = loaded.get("ballistic_residual")
+    if meta:
+      print("[INFO] Detected ballistic residual checkpoint — loading frozen-base actor.")
+      import src.tasks.soccer.modules.gk_ballistic_residual as gkbr
+
+      gkbr.BASE_CKPT = meta.get("base")
+      gkbr.BASE_HIDDEN = tuple(meta.get("base_hidden", (1024, 512, 256)))
+      gkbr.RESIDUAL_SCALE = float(meta.get("residual_scale", 0.25))
+      agent_cfg = goalkeeper_ballistic_residual_runner_cfg()
+    else:
+      agent_cfg = goalkeeper_train_runner_cfg()
     runner = MjlabOnPolicyRunner(env, asdict(agent_cfg), device=device)
     runner.load(checkpoint_path, load_cfg={"actor": True})
 

@@ -41,6 +41,7 @@ class Cfg:
   steps: int = 150
   hidden: tuple[int, ...] = ()   # native checkpoint with custom net hidden_dims
   residual_base: str = ""        # eval a GoalkeeperResidual checkpoint on this frozen base
+  ballistic_residual: bool = False
   residual_scale: float = 1.5
   residual_head: tuple[int, ...] = (512, 256, 128)
 
@@ -55,7 +56,23 @@ def main(cfg: Cfg):
 
   import os, sys
   sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-  if cfg.residual_base:   # GoalkeeperResidual: frozen base + trained head
+  if cfg.ballistic_residual:
+    import src.tasks.soccer.modules.gk_ballistic_residual as gkbr
+    from src.tasks.soccer.config.g1.gk_train_cfg import goalkeeper_ballistic_residual_runner_cfg
+
+    ck = torch.load(cfg.checkpoint, map_location="cpu", weights_only=False)
+    meta = ck.get("ballistic_residual", {})
+    gkbr.BASE_CKPT = meta.get("base", cfg.residual_base or "src/assets/soccer/weight/goalkeeper_distilled_v3.pt")
+    gkbr.BASE_HIDDEN = tuple(meta.get("base_hidden", (1024, 512, 256)))
+    gkbr.RESIDUAL_SCALE = float(meta.get("residual_scale", cfg.residual_scale))
+    runner = MjlabOnPolicyRunner(
+      env,
+      asdict(goalkeeper_ballistic_residual_runner_cfg()),
+      device=cfg.device,
+    )
+    runner.load(cfg.checkpoint, load_cfg={"actor": True})
+    policy = runner.get_inference_policy(device=cfg.device)
+  elif cfg.residual_base:   # GoalkeeperResidual: frozen base + trained head
     from dataclasses import asdict
     import src.tasks.soccer.modules.gk_residual as gkr
     gkr.BASE_CKPT = None; gkr.BASE_HIDDEN = (1024, 512, 256); gkr.RESIDUAL_SCALE = cfg.residual_scale
