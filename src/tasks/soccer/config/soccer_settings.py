@@ -91,6 +91,9 @@ class GroundSettings:
 @dataclass
 class GoalkeeperTrainingSettings:
   ee_reach_std: float = 0.3
+  ee_reach_catch_distance: float = 0.20
+  ee_reach_sigmoid_scale: float = 12.0
+  approach_distance_threshold: float = 0.8
   stop_ball_vel_drop: float = 2.0
   behind_robot_x: float = 0.0
   episode_length_s: float = 3.0

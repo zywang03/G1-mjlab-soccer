@@ -1,7 +1,7 @@
 """Goalkeeper-specific observation functions.
 
 Includes:
-  - Privileged critic observations (ee_positions, ball_distance, end_target, region)
+  - Privileged critic observations (ee_positions, reach_distance, end_target, region)
   - Scaled observations matching the reference Humanoid-Goalkeeper paper
   - Reference default joint positions (goalkeeper stance)
 
@@ -228,6 +228,28 @@ _OBS_SCALE_LIN_VEL = 2.0
 _OBS_SCALE_BALL_VEL = 0.2
 
 
+def _cached_body_indices(
+  env: ManagerBasedRlEnv,
+  robot: Entity,
+  body_names: tuple[str, ...],
+) -> torch.Tensor:
+  cache = getattr(env, "_gk_body_index_cache", None)
+  if cache is None:
+    cache = {}
+    setattr(env, "_gk_body_index_cache", cache)
+  key = (robot.__class__.__name__, id(robot), tuple(body_names))
+  device = robot.data.body_link_pos_w.device
+  cached = cache.get(key)
+  if cached is None or cached.device != device:
+    cached = torch.as_tensor(
+      robot.find_bodies(body_names, preserve_order=True)[0],
+      device=device,
+      dtype=torch.long,
+    )
+    cache[key] = cached
+  return cached
+
+
 def gk_joint_pos_rel(
   env: ManagerBasedRlEnv,
   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -278,6 +300,81 @@ def gk_lin_vel(
   return sensor.data * _OBS_SCALE_LIN_VEL
 
 
+def gk_ball_pos_local(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  position_noise: float = 0.0,
+  dropout_after_s: float = 0.4,
+  dropout_prob: float = 0.0,
+  stop_speed_threshold: float = 0.1,
+  use_official_visibility: bool = False,
+) -> torch.Tensor:
+  """Ball position in robot pelvis frame with paper-style perception masking.
+
+  Training can add up to 5cm position noise, randomly drop observations after
+  0.4s of flight, and zero the observation once the ball is no longer flying.
+  """
+  ball: Entity = env.scene[ball_cfg.name]
+  robot: Entity = env.scene[robot_cfg.name]
+  ball_pos_w = ball.data.root_link_pos_w
+  robot_pos_w = robot.data.root_link_pos_w
+  robot_quat_w = robot.data.root_link_quat_w
+  delta_w = ball_pos_w - robot_pos_w
+  obs = quat_apply_inverse(robot_quat_w, delta_w)
+
+  if position_noise > 0.0:
+    obs = obs + (torch.rand_like(obs) * 2.0 - 1.0) * position_noise
+
+  mask = torch.zeros(env.num_envs, dtype=torch.bool, device=obs.device)
+
+  ball_vel = getattr(ball.data, "root_link_lin_vel_w", None)
+  if ball_vel is not None:
+    stopped = torch.norm(ball_vel, dim=-1) <= stop_speed_threshold
+    mask |= stopped
+
+  if use_official_visibility:
+    catchstep = getattr(env, "_gk_catchstep", None)
+    startstep = getattr(env, "_gk_startstep", None)
+    vanish_step = getattr(env, "_gk_vanish_step", None)
+    if catchstep is None or catchstep.shape[0] != env.num_envs:
+      catchstep = torch.zeros(env.num_envs, dtype=torch.long, device=obs.device)
+    else:
+      catchstep = catchstep.to(device=obs.device)
+    if startstep is None or startstep.shape[0] != env.num_envs:
+      startstep = torch.zeros(env.num_envs, dtype=torch.long, device=obs.device)
+    else:
+      startstep = startstep.to(device=obs.device)
+    if vanish_step is None or vanish_step.shape[0] != env.num_envs:
+      vanish_step = torch.zeros(env.num_envs, dtype=torch.long, device=obs.device)
+    else:
+      vanish_step = vanish_step.to(device=obs.device)
+    initial_visible = catchstep < startstep
+    random_visible = catchstep > vanish_step
+    flying = (
+      (obs[:, 0] > 0.05)
+      & (obs[:, 0] < 3.4)
+      & (obs[:, 1] > -2.0)
+      & (obs[:, 1] < 2.0)
+      & (obs[:, 2] < 1.8)
+      & (catchstep > 0)
+    )
+    visible = initial_visible & flying & random_visible
+    mask |= ~visible
+
+  step_buf = getattr(env, "episode_length_buf", None)
+  step_dt = getattr(env, "step_dt", None)
+  if step_buf is not None and step_dt is not None and dropout_prob > 0.0:
+    after_dropout_time = step_buf.to(obs.device).float() * float(step_dt) >= dropout_after_s
+    if dropout_prob >= 1.0:
+      dropout = after_dropout_time
+    else:
+      dropout = after_dropout_time & (torch.rand(env.num_envs, device=obs.device) < dropout_prob)
+    mask |= dropout
+
+  return torch.where(mask.unsqueeze(-1), torch.zeros_like(obs), obs)
+
+
 def gk_ball_vel_local(
   env: ManagerBasedRlEnv,
   ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
@@ -292,6 +389,42 @@ def gk_ball_vel_local(
   ball_vel_w = ball.data.root_link_lin_vel_w
   robot_quat_w = robot.data.root_link_quat_w
   return quat_apply_inverse(robot_quat_w, ball_vel_w) * _OBS_SCALE_BALL_VEL
+
+
+def goalkeeper_sidestep_command(
+  env: ManagerBasedRlEnv,
+  position_gain: float = 2.0,
+  max_speed: float = 1.2,
+  deadzone: float = 0.1,
+  approach_distance_threshold: float = 0.8,
+  goal_line_x: float = 0.0,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Desired lateral base motion toward the dynamic interception target.
+
+  The actor observes both the signed target-y error and a clipped y-velocity
+  command. This makes the goalkeeper task look more like a velocity-commanded
+  locomotion problem while still using the paper's landing-point/live-ball
+  target switch.
+  """
+  from src.tasks.soccer.mdp.goalkeeper_rewards import goalkeeper_dynamic_target_pos
+
+  ball: Entity = env.scene[ball_cfg.name]
+  robot: Entity = env.scene[robot_cfg.name]
+  target = goalkeeper_dynamic_target_pos(
+    env,
+    approach_distance_threshold=approach_distance_threshold,
+    goal_line_x=goal_line_x,
+    ball_cfg=ball_cfg,
+    robot_cfg=robot_cfg,
+  )
+  y_error = target[:, 1] - robot.data.root_link_pos_w[:, 1]
+  cmd_vy = torch.clamp(position_gain * y_error, -max_speed, max_speed)
+  active = torch.abs(y_error) > deadzone
+  before_goal_line = ball.data.root_link_pos_w[:, 0] > goal_line_x
+  cmd_vy = torch.where(active & before_goal_line, cmd_vy, torch.zeros_like(cmd_vy))
+  return torch.stack([y_error, cmd_vy], dim=-1)
 
 
 def gk_last_action(
@@ -329,10 +462,7 @@ def goalkeeper_ee_positions(
   pelvis_pos = robot.data.root_link_pos_w  # (B, 3)
   pelvis_quat = robot.data.root_link_quat_w  # (B, 4)
 
-  indices = torch.as_tensor(
-    robot.find_bodies(ee_body_names, preserve_order=True)[0],
-    device=env.device,
-  )
+  indices = _cached_body_indices(env, robot, ee_body_names)
   hand_pos_w = robot.data.body_link_pos_w[:, indices]  # (B, 2, 3)
   delta = hand_pos_w - pelvis_pos.unsqueeze(1)  # (B, 2, 3)
   hand_pos_local = quat_apply_inverse(
@@ -343,39 +473,55 @@ def goalkeeper_ee_positions(
 
 def goalkeeper_ball_distance(
   env: ManagerBasedRlEnv,
+  approach_distance_threshold: float = 0.8,
+  goal_line_x: float = 0.0,
   ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
   robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-  """Distance from robot pelvis to ball (1D privileged obs).
+  """Region-selected end-effector to dynamic target distance (1D privileged obs).
 
-  Provides the critic with explicit distance information for value
-  estimation. Kept as a 2D tensor (B, 1) for concatenation.
+  This matches the paper's privileged reach-distance term. The legacy function
+  name is kept so existing critic layouts do not need a semantic rename.
   """
-  ball: Entity = env.scene[ball_cfg.name]
-  robot: Entity = env.scene[robot_cfg.name]
-  ball_pos = ball.data.root_link_pos_w  # (B, 3)
-  robot_pos = robot.data.root_link_pos_w  # (B, 3)
-  delta = ball_pos - robot_pos
-  dist = torch.norm(delta, dim=-1)  # (B,)
-  return dist.unsqueeze(-1)  # (B, 1)
+  from src.tasks.soccer.mdp.goalkeeper_rewards import (
+    goalkeeper_selected_hand_target_distance,
+  )
+
+  return goalkeeper_selected_hand_target_distance(
+    env,
+    approach_distance_threshold=approach_distance_threshold,
+    goal_line_x=goal_line_x,
+    ball_cfg=ball_cfg,
+    robot_cfg=robot_cfg,
+  )
 
 
 def goalkeeper_end_target_pos(
   env: ManagerBasedRlEnv,
+  approach_distance_threshold: float = 0.8,
+  goal_line_x: float = 0.0,
   ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
   robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
   """End target position in robot pelvis frame (3D privileged obs).
 
-  The end target is where the robot should aim its hands to intercept.
-  We use the ball's current position as a proxy.
+  The end target is where the robot should aim its hands to intercept. It uses
+  the sampled landing point while far away and switches to the live ball near
+  the goalkeeper, matching the paper's dynamic target definition.
   """
-  ball: Entity = env.scene[ball_cfg.name]
+  from src.tasks.soccer.mdp.goalkeeper_rewards import goalkeeper_dynamic_target_pos
+
   robot: Entity = env.scene[robot_cfg.name]
-  ball_pos_w = ball.data.root_link_pos_w
   robot_pos_w = robot.data.root_link_pos_w
   robot_quat_w = robot.data.root_link_quat_w
-  delta_w = ball_pos_w - robot_pos_w
+  target_w = goalkeeper_dynamic_target_pos(
+    env,
+    approach_distance_threshold=approach_distance_threshold,
+    goal_line_x=goal_line_x,
+    ball_cfg=ball_cfg,
+    robot_cfg=robot_cfg,
+  )
+  delta_w = target_w - robot_pos_w
   return quat_apply_inverse(robot_quat_w, delta_w)  # (B, 3)
 
 

@@ -81,7 +81,7 @@ def _load_policy(checkpoint_path: str, env, device: str):
     runner.alg.actor.load_state_dict(actor_state, strict=False)
     print("[INFO] Policy loaded successfully.")
   else:
-    runner.load(checkpoint_path, load_cfg={"actor": True})
+    runner.load(checkpoint_path, load_cfg={"actor": True}, map_location=device)
     print("[INFO] Policy loaded successfully.")
 
   policy = runner.get_inference_policy(device=env.unwrapped.device)
@@ -103,10 +103,44 @@ def _make_zero_policy(env, device):
 # ----- Eval metric: ball must not enter the goal -----
 
 
-def _ball_entered_goal(ball_pos: torch.Tensor) -> bool:
-  """Ball has crossed the goal plane (x=-0.5) inside the goal frame."""
+def _in_goal_frame(y: float, z: float) -> bool:
+  return abs(y) <= _GOAL_HALF_WIDTH and z <= _GOAL_HEIGHT
+
+
+def _ball_entered_goal(
+  ball_pos: torch.Tensor,
+  prev_ball_pos: torch.Tensor | None = None,
+) -> bool:
+  """Ball crossed the goal plane inside the goal frame.
+
+  Uses segment crossing when the previous position is available so fast shots
+  are not missed between simulation samples.
+  """
   x, y, z = ball_pos[0].item(), ball_pos[1].item(), ball_pos[2].item()
-  return x <= _GOAL_X and abs(y) <= _GOAL_HALF_WIDTH and z <= _GOAL_HEIGHT
+  if prev_ball_pos is None:
+    return x <= _GOAL_X and _in_goal_frame(y, z)
+
+  prev_x = prev_ball_pos[0].item()
+  if prev_x > _GOAL_X and x <= _GOAL_X:
+    denom = x - prev_x
+    alpha = 0.0 if abs(denom) < 1e-8 else (_GOAL_X - prev_x) / denom
+    alpha = max(0.0, min(1.0, alpha))
+    cross_y = prev_ball_pos[1].item() + alpha * (y - prev_ball_pos[1].item())
+    cross_z = prev_ball_pos[2].item() + alpha * (z - prev_ball_pos[2].item())
+    return _in_goal_frame(cross_y, cross_z)
+
+  return x <= _GOAL_X and _in_goal_frame(y, z)
+
+
+def _as_bool(value) -> bool:
+  if isinstance(value, torch.Tensor):
+    return bool(value.flatten()[0].item())
+  return bool(value)
+
+
+def _successful_block(ball_entered_goal: bool) -> bool:
+  """Eval success: the ball did not enter the goal before timeout."""
+  return not ball_entered_goal
 
 
 def run_trial(env, policy, max_steps: int = 150) -> dict:
@@ -123,20 +157,22 @@ def run_trial(env, policy, max_steps: int = 150) -> dict:
   ball = env.unwrapped.scene["ball"]
   ball_entered = False
   steps = 0
+  prev_ball_pos = ball.data.root_link_pos_w[0].detach().cpu().clone()
 
   for _ in range(max_steps):
     with torch.inference_mode():
       action = policy(obs)
     result = env.step(action)
     obs = result[0]
-    dones = result[2]
+    done = _as_bool(result[2])
     steps += 1
 
     ball_pos = ball.data.root_link_pos_w[0].cpu()
-    if _ball_entered_goal(ball_pos):
+    if _ball_entered_goal(ball_pos, prev_ball_pos):
       ball_entered = True
+    prev_ball_pos = ball_pos.clone()
 
-    if dones.item():
+    if done:
       break
 
   return {"ball_entered_goal": ball_entered, "steps": steps}
@@ -156,14 +192,15 @@ def run_headless_eval(cfg: EvalConfig, env, policy):
 
   for trial in range(cfg.num_trials):
     stats = run_trial(env, policy)
-    if not stats["ball_entered_goal"]:
+    blocked = _successful_block(stats["ball_entered_goal"])
+    if blocked:
       blocked_count += 1
 
     print_interval = 1 if cfg.num_trials <= 10 else (cfg.num_trials // 10)
     if (trial + 1) % print_interval == 0 or trial == 0:
       print(
         f"  Trial {trial + 1:3d}/{cfg.num_trials}: "
-        f"blocked={not stats['ball_entered_goal']}, "
+        f"blocked={blocked}, "
         f"steps={stats['steps']}"
       )
 
@@ -218,7 +255,7 @@ def run_eval(cfg: EvalConfig):
   print(f"  t:     [{bt.t_flight[0]}, {bt.t_flight[1]}] s")
 
   region_names = [
-    "Right-Mid", "Left-Mid", "Right-Up", "Left-Up", "Right-Low", "Left-Low",
+    "Left-Mid", "Right-Mid", "Left-Up", "Right-Up", "Left-Low", "Right-Low",
   ]
   for i, r in enumerate(SETTINGS.goalkeeper_regions):
     print(f"  Region {i} ({region_names[i]}): h={r.height}, w={r.width}")

@@ -14,6 +14,7 @@ from .shared_obs import *  # noqa: F403
 from .shared_reset import *  # noqa: F403
 from .shared_rewards import *  # noqa: F403
 from .goalkeeper_ball_reset import *  # noqa: F403
+from .goalkeeper_curriculum import *  # noqa: F403
 from .shared_terminations import *  # noqa: F403
 from . import goalkeeper_obs  # noqa: F401
 from . import goalkeeper_rewards  # noqa: F401

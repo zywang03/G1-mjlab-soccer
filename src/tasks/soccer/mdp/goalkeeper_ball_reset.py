@@ -110,8 +110,13 @@ class RegionBallVelCfg:
     ball_end_x_range: Range of ball end distances behind robot (m).
     t_flight_range: Ball flight duration range (s).
     regions: List of region definitions (height/width ranges in goal frame).
-    ball_start_y_range: Init y range (computed from region y boundaries).
-    ball_start_z_range: Init z range (computed from region z boundaries).
+  ball_start_y_range: Init y range (computed from region y boundaries).
+  ball_start_z_range: Init z range (computed from region z boundaries).
+    interception_x: Local x plane used for the task target before live-ball
+      tracking takes over. The reference goalkeeper uses x=0.1, just in front
+      of the robot, instead of the behind-goal endpoint.
+    balanced_regions: Assign regions by env id modulo the region count,
+      matching the official fixed env split.
   """
 
   ball_start_x_range: tuple[float, float] = (3.0, 5.0)
@@ -120,6 +125,10 @@ class RegionBallVelCfg:
   regions: list = None
   ball_start_y_range: tuple[float, float] = (-1.5, 1.5)
   ball_start_z_range: tuple[float, float] = (0.1, 1.8)
+  interception_x: float = 0.1
+  balanced_regions: bool = True
+  train_t_flight_range: tuple[float, float] | None = None
+  play_t_flight_range: tuple[float, float] | None = None
 
   def __post_init__(self):
     if self.regions is None:
@@ -155,8 +164,10 @@ def reset_ball_with_parabolic_trajectory(
   num_regions = vel_cfg.num_regions
   assert num_regions > 0, "RegionBallVelCfg must have at least one region."
 
-  # Pick a random region for each env.
-  region_idx = torch.randint(0, num_regions, (n,), device=device)
+  if vel_cfg.balanced_regions:
+    region_idx = env_ids.to(device=device, dtype=torch.long) % num_regions
+  else:
+    region_idx = torch.randint(0, num_regions, (n,), device=device)
 
   # Sample ball start position in local frame.
   # G1 faces +x (yaw=0). Ball comes from +x (front), lateral variation in y.
@@ -194,6 +205,10 @@ def reset_ball_with_parabolic_trajectory(
     [vel_cfg.regions[i.item()]["width"][1] for i in region_idx],
     device=device, dtype=torch.float32,
   )
+  motion_ids = torch.tensor(
+    [int(vel_cfg.regions[i.item()].get("motion_id", i.item())) for i in region_idx],
+    device=device, dtype=torch.float32,
+  )
 
   # Behind robot (-x). Width (y) from region, height (z) from region.
   end_x = -(
@@ -209,15 +224,34 @@ def reset_ball_with_parabolic_trajectory(
   )
   ball_end_local = torch.stack([end_x, end_y, end_z], dim=-1)
 
+  denom_x = end_x - start_x
+  intercept_alpha = torch.where(
+    torch.abs(denom_x) > 1.0e-8,
+    (float(vel_cfg.interception_x) - start_x) / denom_x,
+    torch.zeros_like(denom_x),
+  ).clamp(0.0, 1.0)
+  ball_intercept_local = ball_start_local + intercept_alpha.unsqueeze(-1) * (
+    ball_end_local - ball_start_local
+  )
+
   # Convert to world frame (env_origins at robot base x=0).
   ball_start_w = ball_start_local + env.scene.env_origins[env_ids]
   ball_end_w = ball_end_local + env.scene.env_origins[env_ids]
+  ball_intercept_w = ball_intercept_local + env.scene.env_origins[env_ids]
 
-  # Sample flight time.
+  # Sample flight time. Official train/play ranges differ slightly.
+  t_range = vel_cfg.t_flight_range
+  play_mode = getattr(env, "_gk_play_mode", False) or getattr(
+    getattr(env, "cfg", None), "_gk_play_mode", False
+  )
+  if play_mode and vel_cfg.play_t_flight_range is not None:
+    t_range = vel_cfg.play_t_flight_range
+  elif vel_cfg.train_t_flight_range is not None:
+    t_range = vel_cfg.train_t_flight_range
   t_flight = (
-    vel_cfg.t_flight_range[0]
+    t_range[0]
     + torch.rand(n, device=device)
-    * (vel_cfg.t_flight_range[1] - vel_cfg.t_flight_range[0])
+    * (t_range[1] - t_range[0])
   )
 
   # Parabolic trajectory velocity computation.
@@ -234,8 +268,21 @@ def reset_ball_with_parabolic_trajectory(
   if t is None or t.shape[0] != env.num_envs:
     t = torch.zeros(env.num_envs, dtype=torch.float32, device=device)
     setattr(env, "_gk_region", t)
-  t[env_ids] = region_idx.float()
+  t[env_ids] = motion_ids
   setattr(env, "_gk_region", t)
+
+  target = getattr(env, "_gk_ball_end_pos", None)
+  if target is None or target.shape[0] != env.num_envs:
+    target = torch.zeros(env.num_envs, 3, dtype=torch.float32, device=device)
+    setattr(env, "_gk_ball_end_pos", target)
+  target[env_ids] = ball_intercept_w
+  setattr(env, "_gk_ball_end_pos", target)
+
+  initial_vx = getattr(env, "_gk_initial_ball_vx", None)
+  if initial_vx is None or initial_vx.shape[0] != env.num_envs:
+    initial_vx = torch.zeros(env.num_envs, dtype=torch.float32, device=device)
+    setattr(env, "_gk_initial_ball_vx", initial_vx)
+  initial_vx[env_ids] = ball_vel[:, 0]
 
   # Ball orientation unchanged from default.
   asset: Entity = env.scene[ball_cfg.name]
@@ -252,3 +299,21 @@ def reset_ball_with_parabolic_trajectory(
     torch.cat([ball_start_w, orientations], dim=-1), env_ids=env_ids
   )
   asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
+
+  catchstep = getattr(env, "_gk_catchstep", None)
+  if catchstep is None or catchstep.shape[0] != env.num_envs:
+    catchstep = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+    setattr(env, "_gk_catchstep", catchstep)
+  catchstep[env_ids] = 50
+
+  startstep = getattr(env, "_gk_startstep", None)
+  if startstep is None or startstep.shape[0] != env.num_envs:
+    startstep = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+    setattr(env, "_gk_startstep", startstep)
+  startstep[env_ids] = 50 - torch.randint(3, 10, (n,), device=device)
+
+  vanish_step = getattr(env, "_gk_vanish_step", None)
+  if vanish_step is None or vanish_step.shape[0] != env.num_envs:
+    vanish_step = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+    setattr(env, "_gk_vanish_step", vanish_step)
+  vanish_step[env_ids] = torch.randint(0, 30, (n,), device=device)

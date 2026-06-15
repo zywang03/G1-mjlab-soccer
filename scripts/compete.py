@@ -474,10 +474,29 @@ class CombinedPolicy:
 # Competition metrics
 # =============================================================================
 
-def _ball_entered_goal(ball_pos: torch.Tensor) -> bool:
-    """Ball has crossed the goal plane (x <= GOAL_X) inside the goal frame."""
+def _in_goal_frame(y: float, z: float) -> bool:
+    return abs(y) <= GOAL_HALF_WIDTH and z <= GOAL_HEIGHT
+
+
+def _ball_entered_goal(
+    ball_pos: torch.Tensor,
+    prev_ball_pos: torch.Tensor | None = None,
+) -> bool:
+    """Ball crossed the goal plane inside the goal frame."""
     x, y, z = ball_pos[0].item(), ball_pos[1].item(), ball_pos[2].item()
-    return x <= GOAL_X and abs(y) <= GOAL_HALF_WIDTH and z <= GOAL_HEIGHT
+    if prev_ball_pos is None:
+        return x <= GOAL_X and _in_goal_frame(y, z)
+
+    prev_x = prev_ball_pos[0].item()
+    if prev_x > GOAL_X and x <= GOAL_X:
+        denom = x - prev_x
+        alpha = 0.0 if abs(denom) < 1e-8 else (GOAL_X - prev_x) / denom
+        alpha = max(0.0, min(1.0, alpha))
+        cross_y = prev_ball_pos[1].item() + alpha * (y - prev_ball_pos[1].item())
+        cross_z = prev_ball_pos[2].item() + alpha * (z - prev_ball_pos[2].item())
+        return _in_goal_frame(cross_y, cross_z)
+
+    return x <= GOAL_X and _in_goal_frame(y, z)
 
 
 def _ball_blocked(
@@ -522,6 +541,7 @@ def run_trial(
     prev_ball_speed = 0.0
     steps = 0
     early_termination = False
+    prev_ball_pos = ball.data.root_link_pos_w[0].detach().cpu().clone()
 
     for _ in range(max_steps):
         with torch.inference_mode():
@@ -540,8 +560,9 @@ def run_trial(
         ball_vel = ball.data.root_link_vel_w[0, :3].cpu()
         ball_speed = float(torch.norm(ball_vel))
 
-        if _ball_entered_goal(ball_pos):
+        if _ball_entered_goal(ball_pos, prev_ball_pos):
             goal_scored = True
+        prev_ball_pos = ball_pos.clone()
 
         if _ball_blocked(ball_vel, ball_pos, prev_ball_speed):
             blocked = True

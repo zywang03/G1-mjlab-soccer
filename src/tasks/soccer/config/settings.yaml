@@ -55,31 +55,35 @@ ground:
 # Each region defines the ball's target landing position range in goal-relative frame
 # (y = width along goal line, z = height above ground). The parabolic trajectory
 # model computes launch velocity to hit a random point within the chosen region.
-# Regions: 0=Right-Mid, 1=Left-Mid, 2=Right-Up, 3=Left-Up, 4=Right-Low, 5=Left-Low.
+# Regions: 0=Left-Mid(+y), 1=Right-Mid(-y), 2=Left-Up(+y), 3=Right-Up(-y),
+#          4=Left-Low(+y), 5=Right-Low(-y).
 goalkeeper_regions:
-  - height: [0.3, 1.5]
-    width:  [0.0, 1.5]
-  - height: [0.3, 1.5]
-    width:  [-1.5, 0.0]
-  - height: [1.2, 1.5]
-    width:  [0.0, 1.5]
-  - height: [1.2, 1.5]
-    width:  [-1.5, 0.0]
+  - height: [0.4, 1.2]
+    width:  [0.2, 1.2]
+  - height: [0.4, 1.2]
+    width:  [-1.2, -0.2]
+  - height: [1.2, 1.6]
+    width:  [0.2, 1.2]
+  - height: [1.2, 1.6]
+    width:  [-1.2, -0.2]
   - height: [0.1, 0.3]
-    width:  [0.0, 1.5]
+    width:  [0.2, 1.2]
   - height: [0.1, 0.3]
-    width:  [-1.5, 0.0]
+    width:  [-1.2, -0.2]
 
 # Ball trajectory (matching Humanoid-GK assign_ball_states).
 # G1 faces +x (yaw=0). Ball starts at +x [3,5]m front, lands at -x behind.
 ball_trajectory:
   ball_start_distance: [3.0, 5.0] # m — front of robot (+x)
   ball_end_distance: [0.1, 0.6] # m — (negated: behind robot at -x)
-  t_flight: [0.6, 1.0] # s — flight time
+  t_flight: [0.4, 1.0] # s — official train flight time
 
 # Goalkeeper training settings.
 goalkeeper_training:
-  ee_reach_std: 0.3             # sigma for end-effector reach reward exp(-dist²/σ²)
+  ee_reach_std: 0.3             # legacy field kept for old configs; sigmoid reach now uses values below
+  ee_reach_catch_distance: 0.20 # d_keep in the paper's sigmoid reach reward
+  ee_reach_sigmoid_scale: 5.0   # official catch_sigma
+  approach_distance_threshold: 0.8 # switch from landing target to live ball earlier for final interception
   stop_ball_vel_drop: 2.0       # m/s velocity drop threshold for block detection
   behind_robot_x: 0.0           # x threshold for "ball behind robot"
   episode_length_s: 3.0         # matches goalkeeper_episode_length_s

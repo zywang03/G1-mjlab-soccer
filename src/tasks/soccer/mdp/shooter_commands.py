@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import torch
+import tyro
 
 from mjlab.managers import CommandTerm, CommandTermCfg
 from mjlab.utils.lab_api.math import (
@@ -769,7 +770,7 @@ class MultiMotionSoccerCommandCfg(CommandTermCfg):
   adaptive_uniform_ratio: float = 0.1
   adaptive_alpha: float = 0.4
 
-  curve_offset_range: dict | None = None
+  curve_offset_range: tyro.conf.Suppress[dict | None] = None
   destination_center: tuple[float, float, float] = (0.0, -5.0, 0.11)
   destination_length: float = 1.0
   destination_width: float = 0.5

@@ -14,32 +14,15 @@ Critical for pretrained checkpoint compatibility:
 from dataclasses import replace
 
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.envs.mdp.actions import JointPositionActionCfg
-from mjlab.managers.observation_manager import ObservationTermCfg
-from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from src.assets.robots.unitree_g1.g1_constants import FULL_COLLISION
-from src.tasks.soccer.config.g1.env_cfgs import unitree_g1_goalkeeper_env_cfg
+from src.tasks.soccer.config.g1.training_env_cfgs import unitree_g1_goalkeeper_training_env_cfg
 from src.tasks.soccer.config.soccer_settings import SETTINGS
-from src.tasks.soccer.mdp import (
-  ball_pos_in_robot_frame,
-)
 from src.tasks.soccer.mdp.goalkeeper_obs import (
   _GK_DEFAULT_JOINT_POS,
   get_gk_robot_cfg,
-  gk_ball_vel_local,
-  gk_ang_vel,
-  gk_joint_pos_rel,
-  gk_joint_vel_rel,
-  gk_last_action,
-  gk_lin_vel,
-  goalkeeper_ball_distance,
-  goalkeeper_ee_positions,
-  goalkeeper_end_region,
-  goalkeeper_end_target_pos,
 )
-
-_BALL_CFG = SceneEntityCfg("ball")
+from src.tasks.soccer.mdp.goalkeeper_actions import GoalkeeperJointPositionActionCfg
 
 # With reference-matched PD gains, the action scale is uniformly 0.25.
 _GK_ACTION = 0.25
@@ -74,7 +57,7 @@ def eval_goalkeeper_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   The base goalkeeper config already uses parabolic trajectory ball launching
   with 6 regions, matching the paper's assign_ball_states approach.
   """
-  cfg = unitree_g1_goalkeeper_env_cfg(play=play)
+  cfg = unitree_g1_goalkeeper_training_env_cfg(play=True)
 
   # -- Override robot with GK articulation and GK default joint positions ----
   # GK articulation: actuator PD gains match reference kp/kd exactly.
@@ -85,59 +68,12 @@ def eval_goalkeeper_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # Action scale is uniformly 0.25 (our PD gains now match reference).
   joint_pos_action = cfg.actions["joint_pos"]
-  assert isinstance(joint_pos_action, JointPositionActionCfg)
+  assert isinstance(joint_pos_action, GoalkeeperJointPositionActionCfg)
   joint_pos_action.scale = _GK_ACTION
 
   # Disable observation noise for clean eval (matching paper).
   cfg.observations["actor"].enable_corruption = False
-
-  # 10-frame history stacking (paper: num_actor_history=10, 96×10=960D).
   cfg.observations["actor"].history_length = 10
-
-  # Reconstruct actor terms in the SAME order as training config.
-  actor_terms = {
-    "ball_pos_local": ObservationTermCfg(
-      func=ball_pos_in_robot_frame,
-      params={"ball_cfg": _BALL_CFG},
-    ),
-    "base_ang_vel": ObservationTermCfg(
-      func=gk_ang_vel,
-      params={"sensor_name": "robot/imu_ang_vel"},
-    ),
-    "projected_gravity": cfg.observations["actor"].terms["projected_gravity"],
-    "joint_pos": ObservationTermCfg(func=gk_joint_pos_rel),
-    "joint_vel": ObservationTermCfg(func=gk_joint_vel_rel),
-    "actions": ObservationTermCfg(func=gk_last_action),
-  }
-  cfg.observations["actor"].terms = actor_terms
-
-  # Reconstruct critic terms in the SAME order as training config.
-  critic_terms = {
-    **actor_terms,
-    "base_lin_vel": ObservationTermCfg(
-      func=gk_lin_vel,
-      params={"sensor_name": "robot/imu_lin_vel"},
-    ),
-    "ball_vel_local": ObservationTermCfg(
-      func=gk_ball_vel_local,
-      params={"ball_cfg": _BALL_CFG},
-    ),
-    "ee_positions": ObservationTermCfg(
-      func=goalkeeper_ee_positions,
-    ),
-    "ball_distance": ObservationTermCfg(
-      func=goalkeeper_ball_distance,
-      params={"ball_cfg": _BALL_CFG},
-    ),
-    "end_target_pos": ObservationTermCfg(
-      func=goalkeeper_end_target_pos,
-      params={"ball_cfg": _BALL_CFG},
-    ),
-    "end_region": ObservationTermCfg(
-      func=goalkeeper_end_region,
-    ),
-  }
-  cfg.observations["critic"].terms = critic_terms
 
   # Remove push_robot and perturb_ball_vel if they exist (not in base config).
   cfg.events.pop("push_robot", None)

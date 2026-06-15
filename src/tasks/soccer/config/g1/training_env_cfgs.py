@@ -7,6 +7,7 @@ placement, action scale, contact sensors, and CCD settings.
 from dataclasses import replace
 
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from src.assets.robots import G1_ACTION_SCALE, get_g1_robot_cfg
 from src.assets.robots.unitree_g1.g1_constants import FULL_COLLISION, HOME_KEYFRAME
@@ -15,6 +16,7 @@ from src.tasks.soccer.config.training.goalkeeper_env_cfg import make_goalkeeper_
 from src.tasks.soccer.config.training.stage1_env_cfg import make_stage1_env_cfg
 from src.tasks.soccer.config.training.stage2_env_cfg import make_stage2_env_cfg
 from src.tasks.soccer.mdp import MultiMotionSoccerCommandCfg
+from src.tasks.soccer.mdp.goalkeeper_actions import GoalkeeperJointPositionActionCfg
 
 import math
 
@@ -32,12 +34,16 @@ def _g1_robot_at(pos: tuple[float, float, float], yaw: float = 0.0) -> dict:
   return cfg
 
 
-def _setup_g1_training(cfg: ManagerBasedRlEnvCfg) -> None:
+def _setup_g1_training(
+  cfg: ManagerBasedRlEnvCfg,
+  *,
+  include_ball_robot_sensor: bool = True,
+  include_full_body_contact_sensor: bool = True,
+) -> None:
   """Apply G1-specific overrides for training."""
   cfg.sim.mujoco.ccd_iterations = 500
   cfg.sim.contact_sensor_maxmatch = 500
 
-  from mjlab.envs.mdp.actions import JointPositionActionCfg
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
   joint_pos_action.scale = G1_ACTION_SCALE
@@ -54,7 +60,7 @@ def _setup_g1_training(cfg: ManagerBasedRlEnvCfg) -> None:
     ),
     secondary=ContactMatch(mode="subtree", pattern="ground", entity="ground"),
     fields=("found", "force"),
-    reduce="netforce",
+    reduce="none",
     num_slots=1,
     track_air_time=True,
   )
@@ -82,7 +88,12 @@ def _setup_g1_training(cfg: ManagerBasedRlEnvCfg) -> None:
     history_length=4,
   )
 
-  cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground, ball_robot, contact_forces)
+  sensors = [feet_ground]
+  if include_ball_robot_sensor:
+    sensors.append(ball_robot)
+  if include_full_body_contact_sensor:
+    sensors.append(contact_forces)
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + tuple(sensors)
 
   # Inject motion_dir into the command config at registration time.
   # The actual path is set by the training script via --motion-dir.
@@ -157,8 +168,6 @@ def unitree_g1_goalkeeper_training_env_cfg(play: bool = False) -> ManagerBasedRl
   from src.tasks.soccer.mdp.goalkeeper_obs import (
     _GK_DEFAULT_JOINT_POS, get_gk_robot_cfg,
   )
-  from mjlab.envs.mdp.actions import JointPositionActionCfg
-
   cfg = make_goalkeeper_env_cfg()
 
   # Robot with GK articulation (ref-matched PD gains) and GK stance.
@@ -171,16 +180,27 @@ def unitree_g1_goalkeeper_training_env_cfg(play: bool = False) -> ManagerBasedRl
   robot_cfg.collisions = (FULL_COLLISION,)
   cfg.scene.entities["robot"] = robot_cfg
 
-  _setup_g1_training(cfg)
+  _setup_g1_training(
+    cfg,
+    include_ball_robot_sensor=False,
+    include_full_body_contact_sensor=False,
+  )
 
   # Uniform action scale 0.25 (PD gains now match reference).
   joint_pos_action = cfg.actions["joint_pos"]
-  assert isinstance(joint_pos_action, JointPositionActionCfg)
+  assert isinstance(joint_pos_action, GoalkeeperJointPositionActionCfg)
   joint_pos_action.scale = 0.25
 
   if play:
+    cfg._gk_play_mode = True
     cfg.episode_length_s = int(1e9)
     cfg.observations["actor"].enable_corruption = False
+    actor_ball = cfg.observations["actor"].terms.get("ball_pos_local")
+    if actor_ball is not None:
+      actor_ball.params["position_noise"] = 0.0
+      actor_ball.params["dropout_prob"] = 0.0
+      actor_ball.params["stop_speed_threshold"] = -1.0
+    cfg.curriculum.pop("goalkeeper_difficulty", None)
     cfg.events.pop("push_robot", None)
     cfg.events.pop("perturb_ball_vel", None)
 

@@ -48,6 +48,7 @@ import uvicorn
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import quat_apply, quat_inv
+from src.tasks.soccer.mdp.goalkeeper_obs import _REF_DEFAULT_DOF_POS
 
 # ---------------------------------------------------------------------------
 # Default joint positions  (match training configs)
@@ -60,16 +61,9 @@ _SHOOTER_DEFAULT_JOINT_POS = torch.tensor([
     0.0, 0.0, 0.0,          # torso
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # left arm
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # right arm
-])
+], dtype=torch.float32)
 
-_GK_DEFAULT_JOINT_POS = torch.tensor([
-    0.0, 0.0, 0.0,          # left/right hip, waist
-    -0.35, 0.7, -0.35, -0.25, 0.3, -0.1,    # left leg
-    -0.35, 0.7, -0.35, -0.25, 0.3, -0.1,    # right leg
-    0.0, 0.3, 0.0,          # torso
-    0.8, 0.0, -1.6, 0.0, 0.5, 0.0, 0.0,   # left arm
-    0.8, 0.0, -1.6, 0.0, 0.5, 0.0, 0.0,   # right arm
-])
+_GK_DEFAULT_JOINT_POS = torch.tensor(_REF_DEFAULT_DOF_POS, dtype=torch.float32)
 
 # ---------------------------------------------------------------------------
 # Observation computation  (CUSTOMIZE: match your training observation space)
@@ -84,16 +78,16 @@ def compute_shooter_obs(raw_state: dict) -> torch.Tensor:
     s = raw_state["shooter"]
     ball = raw_state["ball"]
 
-    root_quat = torch.tensor(s["root_quat"])
-    root_ang_vel = torch.tensor(s["root_ang_vel"])
-    joint_pos = torch.tensor(s["joint_pos"])
-    joint_vel = torch.tensor(s["joint_vel"])
-    ball_pos = torch.tensor(ball["pos"])
-    root_pos = torch.tensor(s["root_pos"])
-    last_action = torch.tensor(s["last_action"])
+    root_quat = torch.tensor(s["root_quat"], dtype=torch.float32)
+    root_ang_vel = torch.tensor(s["root_ang_vel"], dtype=torch.float32)
+    joint_pos = torch.tensor(s["joint_pos"], dtype=torch.float32)
+    joint_vel = torch.tensor(s["joint_vel"], dtype=torch.float32)
+    ball_pos = torch.tensor(ball["pos"], dtype=torch.float32)
+    root_pos = torch.tensor(s["root_pos"], dtype=torch.float32)
+    last_action = torch.tensor(s["last_action"], dtype=torch.float32)
 
     # Projected gravity
-    gravity_w = torch.tensor([0.0, 0.0, -1.0])
+    gravity_w = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
     projected_gravity = quat_apply(quat_inv(root_quat), gravity_w)
 
     # Base angular velocity in robot frame
@@ -125,16 +119,16 @@ def compute_goalkeeper_obs(raw_state: dict) -> torch.Tensor:
     s = raw_state["goalkeeper"]
     ball = raw_state["ball"]
 
-    root_quat = torch.tensor(s["root_quat"])
-    root_ang_vel = torch.tensor(s["root_ang_vel"])
-    joint_pos = torch.tensor(s["joint_pos"])
-    joint_vel = torch.tensor(s["joint_vel"])
-    ball_pos = torch.tensor(ball["pos"])
-    root_pos = torch.tensor(s["root_pos"])
-    last_action = torch.tensor(s["last_action"])
+    root_quat = torch.tensor(s["root_quat"], dtype=torch.float32)
+    root_ang_vel = torch.tensor(s["root_ang_vel"], dtype=torch.float32)
+    joint_pos = torch.tensor(s["joint_pos"], dtype=torch.float32)
+    joint_vel = torch.tensor(s["joint_vel"], dtype=torch.float32)
+    ball_pos = torch.tensor(ball["pos"], dtype=torch.float32)
+    root_pos = torch.tensor(s["root_pos"], dtype=torch.float32)
+    last_action = torch.tensor(s["last_action"], dtype=torch.float32)
 
     # Projected gravity
-    gravity_w = torch.tensor([0.0, 0.0, -1.0])
+    gravity_w = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
     projected_gravity = quat_apply(quat_inv(root_quat), gravity_w)
 
     # Angular velocity with GK scaling (×0.25, matching GK PD gain ratio)
@@ -148,7 +142,6 @@ def compute_goalkeeper_obs(raw_state: dict) -> torch.Tensor:
 
     # Ball position in robot pelvis frame
     ball_pos_local = quat_apply(quat_inv(root_quat), ball_pos - root_pos)
-
     obs = torch.cat([
         ball_pos_local,         # 3
         base_ang_vel,           # 3
@@ -158,6 +151,26 @@ def compute_goalkeeper_obs(raw_state: dict) -> torch.Tensor:
         last_action,            # 29
     ])
     return obs.unsqueeze(0)  # (1, 96)
+
+
+_GK_TERM_SIZES = (3, 3, 3, 29, 29, 29)
+
+
+def stack_goalkeeper_history(frames: list[torch.Tensor] | deque[torch.Tensor]) -> torch.Tensor:
+    """Stack GK frame observations the same way mjlab's ObservationManager does.
+
+    The training env stores history per term, not per frame:
+      [ball_f0..ball_f9, ang_f0..ang_f9, gravity_f0..gravity_f9, ..., actions_f0..actions_f9].
+    GoalkeeperActorCritic expects that layout and reorders it internally.
+    """
+    if len(frames) == 0:
+        raise ValueError("goalkeeper history is empty")
+    chunks: list[torch.Tensor] = []
+    offset = 0
+    for size in _GK_TERM_SIZES:
+        chunks.append(torch.cat([frame[:, offset : offset + size] for frame in frames], dim=-1))
+        offset += size
+    return torch.cat(chunks, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +218,7 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
             }
             runner.alg.actor.load_state_dict(actor_state, strict=False)
         else:
-            runner.load(checkpoint_path, load_cfg={"actor": True})
+            runner.load(checkpoint_path, load_cfg={"actor": True}, map_location=device)
     else:
         from src.tasks.soccer.config.g1.rl_cfg import (
             SoccerRecurrentRunner,
@@ -267,8 +280,12 @@ def create_app(checkpoint_path: str, task_id: str, device: str) -> FastAPI:
 
         history.append(frame)
 
-        # Build stacked observation: (1, history_len × frame_dim).
-        stacked = torch.cat(list(history), dim=-1)
+        # Match the layout used by the training ObservationManager.
+        if is_gk:
+            stacked = stack_goalkeeper_history(history)
+        else:
+            stacked = torch.cat(list(history), dim=-1)
+        stacked = stacked.to(device=device, dtype=torch.float32)
 
         with torch.inference_mode():
             action = policy({"actor": stacked})
