@@ -48,3 +48,35 @@ MUJOCO_GL=egl python scripts/diagnose_gk.py \
 `scripts/api_server.py` now detects this checkpoint via its
 `ballistic_residual` metadata, rebuilds the frozen base path, and uses the same
 keeper observation/history layout as training.
+
+## Repair-oracle pipeline
+
+The ballistic residual PPO path is conservative, but early 2048-env runs stayed
+near the frozen base policy.  The higher-value next path is:
+
+1. diagnose the base policy's miss distribution;
+2. use CEM in simulation to repair sampled failing ball trajectories;
+3. distill the repaired `(observation, action)` pairs back into a native MLP;
+4. evaluate the distilled checkpoint with the standard goalkeeper metric.
+
+Run the whole pipeline:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_lyk.pt \
+  --num-envs 2048 \
+  --collect-batches 32 \
+  --device cuda:0
+```
+
+Resume selected stages if needed:
+
+```bash
+python scripts/run_keeper_repair_pipeline.py --stages distill diagnose-final
+```
+
+This is still single-agent simulation optimization.  It is not a claim of pure
+PPO training; in the report describe it as repair-oracle data generation plus
+policy distillation.
