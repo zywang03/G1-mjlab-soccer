@@ -35,8 +35,10 @@ _REGION_NAMES = ["Right-Mid", "Left-Mid", "Right-Up", "Left-Up", "Right-Low", "L
 class Cfg:
   checkpoint: str = "src/assets/soccer/weight/model_repaired_lyk.pt"
   out_dir: str = "videos/keeper_regions"
+  mode: str = "regions"  # "regions": forced per region, "random": official eval reset
   regions: tuple[int, ...] = (0, 1, 2, 3, 4, 5)
   cases_per_region: int = 3
+  random_cases: int = 24
   steps: int = 150
   width: int = 1280
   height: int = 720
@@ -97,8 +99,54 @@ def _force_region(env, region: int, generator: torch.Generator):
   return start[0].detach().cpu(), end[0].detach().cpu(), tf[0].detach().cpu()
 
 
+def _goal_entered(ball, org) -> bool:
+  bp = ball.data.root_link_pos_w[0]
+  bx = bp[0] - org[0]
+  by = bp[1] - org[1]
+  return bool(bx <= -0.5 and by.abs() <= 1.5 and bp[2] <= 1.8)
+
+
+def _height_band(cross_z: float) -> str:
+  if cross_z < 0.3:
+    return "low"
+  if cross_z >= 1.2:
+    return "up"
+  return "mid"
+
+
+def _render_one(wrapped, env, policy, ball, org, steps: int):
+  obs = wrapped.reset()
+  if isinstance(obs, tuple):
+    obs = obs[0]
+  frames = []
+  entered = False
+  best_xabs = float("inf")
+  cross_y = 0.0
+  cross_z = 0.0
+  for _ in range(steps):
+    with torch.inference_mode():
+      action = policy(obs)
+    res = wrapped.step(action)
+    obs = res[0]
+    frames.append(env.render())
+    bp = ball.data.root_link_pos_w[0]
+    bx = float((bp[0] - org[0]).detach().cpu())
+    by = float((bp[1] - org[1]).detach().cpu())
+    bz = float(bp[2].detach().cpu())
+    if abs(bx) < best_xabs:
+      best_xabs = abs(bx)
+      cross_y = by
+      cross_z = bz
+    entered = entered or _goal_entered(ball, org)
+    if res[2].item():
+      break
+  return frames, entered, cross_y, cross_z
+
+
 def main(cfg: Cfg) -> None:
   configure_torch_backends()
+  if cfg.mode not in ("regions", "random"):
+    raise ValueError("--mode must be 'regions' or 'random'")
   Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
 
   env_cfg = load_env_cfg("Eval-Goalkeeper", play=False)
@@ -119,40 +167,59 @@ def main(cfg: Cfg) -> None:
 
   total_save = 0
   total = 0
-  for region in cfg.regions:
-    for case_idx in range(cfg.cases_per_region):
-      start, end, tf = _force_region(wrapped, region, gen)
-      obs = wrapped.reset()
-      if isinstance(obs, tuple):
-        obs = obs[0]
-      frames = []
-      entered = False
-      for _ in range(cfg.steps):
-        with torch.inference_mode():
-          action = policy(obs)
-        res = wrapped.step(action)
-        obs = res[0]
-        frames.append(env.render())
-        bp = ball.data.root_link_pos_w[0]
-        bx = bp[0] - org[0]
-        by = bp[1] - org[1]
-        if bx <= -0.5 and by.abs() <= 1.5 and bp[2] <= 1.8:
-          entered = True
-        if res[2].item():
-          break
+  region_counts = {i: 0 for i in range(len(_REGION_NAMES))}
+  band_counts = {"low": 0, "mid": 0, "up": 0}
+
+  if cfg.mode == "regions":
+    for region in cfg.regions:
+      for case_idx in range(cfg.cases_per_region):
+        start, end, tf = _force_region(wrapped, region, gen)
+        frames, entered, cross_y, cross_z = _render_one(wrapped, env, policy, ball, org, cfg.steps)
+        label = "goal" if entered else "save"
+        band = _height_band(cross_z)
+        total += 1
+        total_save += int(not entered)
+        region_counts[region] += 1
+        band_counts[band] += 1
+        name = _REGION_NAMES[region]
+        path = Path(cfg.out_dir) / f"region{region}_{name}_case{case_idx:02d}_{label}.mp4"
+        imageio.mimsave(path, frames, fps=30, macro_block_size=1)
+        print(
+          f"region {region} {name}: {label} start={start.tolist()} "
+          f"end={end.tolist()} tf={float(tf):.2f} cross=({cross_y:+.2f},{cross_z:.2f}) "
+          f"band={band} -> {path}",
+          flush=True,
+        )
+  else:
+    if hasattr(env, "_gk_forced"):
+      delattr(env, "_gk_forced")
+    for case_idx in range(cfg.random_cases):
+      frames, entered, cross_y, cross_z = _render_one(wrapped, env, policy, ball, org, cfg.steps)
+      region = int(getattr(env, "_gk_region", torch.zeros(1, device=cfg.device))[0].item())
+      name = _REGION_NAMES[region] if 0 <= region < len(_REGION_NAMES) else f"Region-{region}"
       label = "goal" if entered else "save"
+      band = _height_band(cross_z)
       total += 1
       total_save += int(not entered)
-      name = _REGION_NAMES[region]
-      path = Path(cfg.out_dir) / f"region{region}_{name}_case{case_idx:02d}_{label}.mp4"
+      if 0 <= region < len(_REGION_NAMES):
+        region_counts[region] += 1
+      band_counts[band] += 1
+      path = Path(cfg.out_dir) / f"random_case{case_idx:02d}_region{region}_{name}_{label}.mp4"
       imageio.mimsave(path, frames, fps=30, macro_block_size=1)
       print(
-        f"region {region} {name}: {label} start={start.tolist()} "
-        f"end={end.tolist()} tf={float(tf):.2f} -> {path}",
+        f"random case {case_idx:02d}: region {region} {name} {label} "
+        f"cross=({cross_y:+.2f},{cross_z:.2f}) band={band} -> {path}",
         flush=True,
       )
 
   print(f"DONE: {total_save}/{total} saves rendered to {cfg.out_dir}", flush=True)
+  print("Region counts:", flush=True)
+  for region, count in region_counts.items():
+    if count:
+      print(f"  {region} {_REGION_NAMES[region]}: {count}", flush=True)
+  print("Height bands at keeper plane:", flush=True)
+  for band, count in band_counts.items():
+    print(f"  {band}: {count}", flush=True)
   env.close()
 
 
