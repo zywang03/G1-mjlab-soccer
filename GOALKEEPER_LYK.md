@@ -95,3 +95,29 @@ python scripts/run_keeper_repair_pipeline.py --stages distill diagnose-final
 This is still single-agent simulation optimization.  It is not a claim of pure
 PPO training; in the report describe it as repair-oracle data generation plus
 policy distillation.
+
+### Stability note
+
+If visual inspection shows the keeper blocks high balls but falls and flails
+afterward, regenerate repair data with the stable collection defaults.  The
+oracle residual fades back to the base policy after the save window, and
+distillation keeps only frames around the keeper-plane crossing instead of
+teaching the full post-save fall.
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --stages prove collect distill diagnose-final \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk_stable.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_lyk_stable.pt \
+  --num-envs 2048 \
+  --collect-hours 6 \
+  --collect-batches-per-shard 8 \
+  --release-steps 20 \
+  --w-stable 20 \
+  --w-final-upright 20 \
+  --collect-pre-steps 35 \
+  --collect-post-steps 12 \
+  --epochs 60 \
+  --device cuda:0
+```

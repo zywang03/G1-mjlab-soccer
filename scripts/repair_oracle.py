@@ -53,6 +53,7 @@ class Cfg:
   elites: int = 8
   knots: int = 12
   knot_span: int = 80        # knots concentrated in steps [0, knot_span] (save window)
+  release_steps: int = 20    # fade residual back to base after knot_span
   horizon: int = 150
   clip: float = 0.45         # residual clamp (rad)
   init_std: float = 0.25
@@ -65,6 +66,12 @@ class Cfg:
   w_goal: float = 1000.0     # cost weight on conceding
   w_res: float = 0.2         # cost weight on residual L2
   w_upright: float = 5.0     # cost weight on not-upright at the contact window
+  w_stable: float = 20.0     # cost weight on whole-episode tilt after aggressive saves
+  w_final_upright: float = 20.0
+  collect_pre_steps: int = 35
+  collect_post_steps: int = 12
+  require_final_upright: bool = False
+  final_upright_gz: float = -0.25
 
 
 def _gen_scenarios(env, regions, G, gen, device):
@@ -140,17 +147,36 @@ def main(cfg: Cfg):
   t0 = kt[idx]; t1 = kt[idx + 1]; frac = (st - t0) / (t1 - t0).clamp(min=1e-6)
   W = torch.zeros(T, K, device=dev)
   W[torch.arange(T), idx] = 1 - frac; W[torch.arange(T), idx + 1] = frac
+  release = max(1, cfg.release_steps)
+  fade = torch.ones(T, device=dev)
+  after_span = torch.arange(T, device=dev).float() - float(span)
+  fade = torch.where(after_span > 0.0, torch.clamp(1.0 - after_span / release, 0.0, 1.0), fade)
 
   keep = torch.arange(0, N, cfg.P, device=dev)   # 1 env per scenario (all P identical)
+
+  def collect_window(scen_start, scen_vel):
+    """Frame mask around keeper-plane crossing; avoids teaching post-save falls."""
+    vx = torch.minimum(
+      scen_vel[:, 0],
+      torch.full((scen_start.shape[0],), -1.0e-3, device=dev),
+    )
+    t_keeper = torch.clamp(-scen_start[:, 0] / vx, min=0.0, max=T * 0.02)
+    center = torch.round(t_keeper / 0.02).long().clamp(0, T - 1)
+    frame = torch.arange(T, device=dev).unsqueeze(0)
+    lo = (center - cfg.collect_pre_steps).unsqueeze(1)
+    hi = (center + cfg.collect_post_steps).unsqueeze(1)
+    return (frame >= lo) & (frame <= hi)
 
   def rollout(knots, scen_start, scen_vel, scen_region, collect=False):
     """knots:(N,K,J). Returns cost(N), blocked(N), and optionally (obs,act) seq
     for the `keep` envs only (stored on CPU to avoid OOM)."""
     R = torch.einsum('tk,nkj->ntj', W, knots).clamp(-cfg.clip, cfg.clip)  # (N,T,J)
+    R = R * fade[None, :, None]
     obs = _apply(env, robot, ball, scen_start, scen_vel, cfg.P, scen_region)
     entered = torch.zeros(N, dtype=torch.bool, device=dev)
     min_d = torch.full((N,), 1e9, device=dev)
     upr_bad = torch.zeros(N, device=dev)
+    stable_bad = torch.zeros(N, device=dev)
     obs_buf = [] if collect else None
     act_buf = [] if collect else None
     for t in range(T):
@@ -171,10 +197,14 @@ def main(cfg: Cfg):
       near = bx.abs() < 0.6
       gz = robot.data.projected_gravity_b[:, 2]   # ~ -1 upright
       upr_bad += near.float() * torch.clamp(gz + 0.3, min=0.0)
+      stable_bad += torch.clamp(gz + 0.5, min=0.0)
+    final_gz = robot.data.projected_gravity_b[:, 2]
     cost = (cfg.w_goal * entered.float() + cfg.w_dist * min_d
-            + cfg.w_res * R.pow(2).mean((1, 2)) + cfg.w_upright * upr_bad / T)
+            + cfg.w_res * R.pow(2).mean((1, 2)) + cfg.w_upright * upr_bad / T
+            + cfg.w_stable * stable_bad / T
+            + cfg.w_final_upright * torch.clamp(final_gz + 0.5, min=0.0))
     if collect:
-      return cost, ~entered, min_d, torch.stack(obs_buf, 1), torch.stack(act_buf, 1)
+      return cost, ~entered, min_d, torch.stack(obs_buf, 1), torch.stack(act_buf, 1), final_gz[keep].to("cpu")
     return cost, ~entered, min_d
 
   all_data_obs, all_data_act, all_data_blk = [], [], []
@@ -187,7 +217,7 @@ def main(cfg: Cfg):
     # action) — this protects the easy-ball behavior from CEM residual noise.
     z = torch.zeros(N, K, J, device=dev)
     if cfg.mode == "collect":
-      _, base_blk, _, base_ob, base_ac = rollout(z, start, vel, reg, collect=True)
+      _, base_blk, _, base_ob, base_ac, base_gz = rollout(z, start, vel, reg, collect=True)
     else:
       _, base_blk, _ = rollout(z, start, vel, reg)
     base_rate = base_blk.view(cfg.G, cfg.P).float().mean(1)   # per scenario
@@ -215,16 +245,19 @@ def main(cfg: Cfg):
     # final deterministic eval of the repair (elite-mean = CEM point estimate)
     mu_e = mu.repeat_interleave(cfg.P, 0)
     if cfg.mode == "collect":
-      _, rep_blk, _, rep_ob, rep_ac = rollout(mu_e, start, vel, reg, collect=True)
+      _, rep_blk, _, rep_ob, rep_ac, rep_gz = rollout(mu_e, start, vel, reg, collect=True)
       bbk = base_blk[keep].cpu()          # (G,) base blocked at keep env
       rbk = rep_blk[keep].cpu()           # (G,) repair blocked at keep env
+      if cfg.require_final_upright:
+        rbk = rbk & (rep_gz < cfg.final_upright_gz)
+        bbk = bbk & (base_gz < cfg.final_upright_gz)
       use_base = bbk[:, None, None]       # prefer pure base action where it works
       ob = torch.where(use_base, base_ob, rep_ob)
       ac = torch.where(use_base, base_ac, rep_ac)
-      blocked = (bbk | rbk)               # frame kept iff base or repair blocked
+      blocked = (bbk | rbk)[:, None] & collect_window(start, vel).cpu()
       all_data_obs.append(ob.reshape(-1, ob.shape[-1]))
       all_data_act.append(ac.reshape(-1, ac.shape[-1]))
-      all_data_blk.append(blocked.repeat_interleave(T))
+      all_data_blk.append(blocked.reshape(-1))
     else:
       _, rep_blk, _ = rollout(mu_e, start, vel, reg)
     rep_rate = rep_blk.view(cfg.G, cfg.P).float().mean(1)

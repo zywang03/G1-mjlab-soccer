@@ -44,7 +44,13 @@ class Cfg:
   elites: int = 8
   knots: int = 12
   knot_span: int = 80
+  release_steps: int = 20
   horizon: int = 150
+  w_stable: float = 20.0
+  w_final_upright: float = 20.0
+  collect_pre_steps: int = 35
+  collect_post_steps: int = 12
+  require_final_upright: bool = False
   collect_batches: int = 32
   collect_hours: float = 0.0
   collect_batches_per_shard: int = 8
@@ -136,8 +142,14 @@ def main(cfg: Cfg) -> None:
       str(cfg.knots),
       "--knot-span",
       str(cfg.knot_span),
+      "--release-steps",
+      str(cfg.release_steps),
       "--horizon",
       str(cfg.horizon),
+      "--w-stable",
+      str(cfg.w_stable),
+      "--w-final-upright",
+      str(cfg.w_final_upright),
       "--batches",
       str(max(1, min(4, cfg.collect_batches))),
       "--device",
@@ -191,8 +203,19 @@ def main(cfg: Cfg) -> None:
           str(cfg.knots),
           "--knot-span",
           str(cfg.knot_span),
+          "--release-steps",
+          str(cfg.release_steps),
           "--horizon",
           str(cfg.horizon),
+          "--w-stable",
+          str(cfg.w_stable),
+          "--w-final-upright",
+          str(cfg.w_final_upright),
+          "--collect-pre-steps",
+          str(cfg.collect_pre_steps),
+          "--collect-post-steps",
+          str(cfg.collect_post_steps),
+          "--require-final-upright" if cfg.require_final_upright else "--no-require-final-upright",
           "--batches",
           str(shard_batches),
           "--seed",
