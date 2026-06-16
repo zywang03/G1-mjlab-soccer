@@ -242,7 +242,7 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
     history_len = env_cfg.observations["actor"].history_length
     print(f"[INFO] Task: {task_id}")
     print(f"[INFO] Actor obs  ({len(actor_terms)} terms × {history_len} history): {actor_terms}")
-    print(f"[INFO] Action dim: {env.action_manager.total_action_dim}")
+    print(f"[INFO] Action dim: {env.unwrapped.action_manager.total_action_dim}")
 
     if task_id == "Eval-Goalkeeper":
         from src.tasks.soccer.config.g1.rl_cfg import (
