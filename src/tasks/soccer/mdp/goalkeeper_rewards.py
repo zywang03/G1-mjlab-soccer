@@ -393,6 +393,42 @@ def goalkeeper_recovery_upright(
   return save_window * tipped * tipped
 
 
+def goalkeeper_post_save_ang_vel(
+  env: ManagerBasedRlEnv,
+  near_or_past_x: float = 0.6,
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  """Penalty for tumbling after the save window.
+
+  The keeper is allowed to move aggressively before contact. Once the ball is
+  near or past the keeper plane, high roll/pitch angular velocity is almost
+  always post-save flailing, so this term pushes recovery without weakening the
+  initial dive.
+  """
+  robot: Entity = env.scene[robot_cfg.name]
+  ball: Entity = env.scene[ball_cfg.name]
+  ball_x_rel = ball.data.root_link_pos_w[:, 0] - env.scene.env_origins[:, 0]
+  save_window = (ball_x_rel < near_or_past_x).to(torch.float32)
+  ang_vel_xy = robot.data.root_link_ang_vel_b[:, :2]
+  return save_window * torch.sum(ang_vel_xy * ang_vel_xy, dim=-1)
+
+
+def goalkeeper_post_save_action_rate(
+  env: ManagerBasedRlEnv,
+  near_or_past_x: float = 0.6,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  """Penalty for high-frequency action changes after the save window."""
+  ball: Entity = env.scene[ball_cfg.name]
+  ball_x_rel = ball.data.root_link_pos_w[:, 0] - env.scene.env_origins[:, 0]
+  save_window = (ball_x_rel < near_or_past_x).to(torch.float32)
+  action = env.action_manager.action
+  prev_action = env.action_manager.prev_action
+  rate = torch.sum((action - prev_action) ** 2, dim=-1)
+  return save_window * torch.clamp(rate, max=100.0)
+
+
 def goalkeeper_ang_vel_xy(
   env: ManagerBasedRlEnv,
   robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
