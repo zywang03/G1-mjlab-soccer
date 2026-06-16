@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import tyro
 
@@ -33,11 +34,14 @@ class Cfg:
   distilled_out: str = "logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_lyk.pt"
   stages: tuple[str, ...] = ("diagnose-base", "prove", "collect", "distill", "diagnose-final")
   device: str = "cuda:0"
+  devices: tuple[str, ...] = ()
   num_envs: int = 2048
   diagnose_batches: int = 4
   final_batches: int = 8
   regions: tuple[int, ...] = (3, 2, 1, 0, 4, 5)
+  region_weights: tuple[float, ...] = ()
   prove_regions: tuple[int, ...] = (3, 2, 1, 0)
+  prove_region_weights: tuple[float, ...] = ()
   G: int = 32
   P: int = 64
   iters: int = 8
@@ -73,6 +77,23 @@ def _run(label: str, args: list[str], env: dict[str, str]) -> None:
   subprocess.run(args, cwd=_REPO_ROOT, env=env, check=True)
 
 
+def _popen(label: str, args: list[str], env: dict[str, str], log_path: Path) -> subprocess.Popen:
+  log_path.parent.mkdir(parents=True, exist_ok=True)
+  print(f"\n[PIPELINE] {label}", flush=True)
+  print("[PIPELINE] " + " ".join(args), flush=True)
+  print(f"[PIPELINE] log -> {log_path}", flush=True)
+  log = open(log_path, "w")
+  proc = subprocess.Popen(args, cwd=_REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+  proc._pipeline_log = log  # keep the file handle alive until the process exits
+  return proc
+
+
+def _extend_region_args(args: list[str], regions: Sequence[int], weights: Sequence[float]) -> None:
+  args.extend(["--regions", *[str(r) for r in regions]])
+  if weights:
+    args.extend(["--region-weights", *[str(w) for w in weights]])
+
+
 def _parse_stages(stages: tuple[str, ...]) -> set[str]:
   allowed = {"diagnose-base", "prove", "collect", "distill", "diagnose-final"}
   selected = set(stages)
@@ -101,6 +122,7 @@ def main(cfg: Cfg) -> None:
   env.setdefault("MUJOCO_GL", "egl")
   env.setdefault("MPLCONFIGDIR", "/tmp/mpl")
   collected_data: list[str] = []
+  collect_devices = tuple(cfg.devices) or (cfg.device,)
 
   if "diagnose-base" in selected:
     _run(
@@ -128,8 +150,9 @@ def main(cfg: Cfg) -> None:
       cfg.base,
       "--mode",
       "prove",
-      "--regions",
-      *[str(r) for r in cfg.prove_regions],
+    ]
+    _extend_region_args(prove_cmd, cfg.prove_regions, cfg.prove_region_weights)
+    prove_cmd.extend([
       "--G",
       str(cfg.G),
       "--P",
@@ -154,7 +177,7 @@ def main(cfg: Cfg) -> None:
       str(max(1, min(4, cfg.collect_batches))),
       "--device",
       cfg.device,
-    ]
+    ])
     try:
       _run("prove repair oracle", prove_cmd, env)
     except subprocess.CalledProcessError:
@@ -167,30 +190,36 @@ def main(cfg: Cfg) -> None:
     collect_deadline = collect_start + max(0.0, cfg.collect_hours) * 3600.0
     shard_count = cfg.max_collect_shards if cfg.collect_hours > 0.0 else 1
 
-    for shard_idx in range(shard_count):
+    shard_idx = 0
+    while shard_idx < shard_count:
       if cfg.collect_hours > 0.0 and shard_idx > 0 and time.monotonic() >= collect_deadline:
         break
-      shard_out = (
-        _repair_shard_path(cfg.repair_data, shard_idx)
-        if cfg.collect_hours > 0.0
-        else cfg.repair_data
-      )
       shard_batches = (
         cfg.collect_batches_per_shard
         if cfg.collect_hours > 0.0
         else cfg.collect_batches
       )
-      _run(
-        f"collect repaired trajectories shard {shard_idx}",
-        [
+      procs: list[tuple[int, str, subprocess.Popen]] = []
+      for dev_idx, dev in enumerate(collect_devices):
+        if shard_idx >= shard_count:
+          break
+        if cfg.collect_hours > 0.0 and shard_idx > 0 and time.monotonic() >= collect_deadline:
+          break
+        shard_out = (
+          _repair_shard_path(cfg.repair_data, shard_idx)
+          if cfg.collect_hours > 0.0 or len(collect_devices) > 1
+          else cfg.repair_data
+        )
+        collect_cmd = [
           sys.executable,
           _script("repair_oracle.py"),
           "--checkpoint",
           cfg.base,
           "--mode",
           "collect",
-          "--regions",
-          *[str(r) for r in cfg.regions],
+        ]
+        _extend_region_args(collect_cmd, cfg.regions, cfg.region_weights)
+        collect_cmd.extend([
           "--G",
           str(cfg.G),
           "--P",
@@ -223,11 +252,27 @@ def main(cfg: Cfg) -> None:
           "--out",
           shard_out,
           "--device",
-          cfg.device,
-        ],
-        env,
-      )
-      collected_data.append(shard_out)
+          dev,
+        ])
+        if len(collect_devices) == 1:
+          _run(f"collect repaired trajectories shard {shard_idx}", collect_cmd, env)
+          collected_data.append(shard_out)
+        else:
+          log_path = Path(cfg.repair_data).parent / f"collect_shard{shard_idx:03d}_{dev.replace(':', '')}.log"
+          proc = _popen(
+            f"collect repaired trajectories shard {shard_idx} on {dev}",
+            collect_cmd,
+            env,
+            log_path,
+          )
+          procs.append((shard_idx, shard_out, proc))
+        shard_idx += 1
+      for done_idx, shard_out, proc in procs:
+        code = proc.wait()
+        getattr(proc, "_pipeline_log").close()
+        if code != 0:
+          raise subprocess.CalledProcessError(code, f"collect shard {done_idx}")
+        collected_data.append(shard_out)
 
     if cfg.collect_hours > 0.0:
       elapsed_h = (time.monotonic() - collect_start) / 3600.0

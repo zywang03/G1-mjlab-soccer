@@ -121,3 +121,45 @@ MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py
   --epochs 60 \
   --device cuda:0
 ```
+
+### Multi-GPU balanced collection
+
+On a 4-GPU machine, run one repair worker per GPU.  Use region weights to avoid
+overfitting to high balls:
+
+- regions `0,1`: mid-height balls;
+- regions `2,3`: upper balls;
+- regions `4,5`: low/ground balls.
+
+The following mix oversamples low and mid balls while still keeping enough high
+ball repair data:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --stages prove collect distill diagnose-final \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk_balanced_4gpu.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_lyk_balanced_4gpu.pt \
+  --devices cuda:0 cuda:1 cuda:2 cuda:3 \
+  --num-envs 4096 \
+  --regions 4 5 0 1 2 3 \
+  --region-weights 2.0 2.0 1.5 1.5 1.0 1.0 \
+  --prove-regions 4 5 0 1 2 3 \
+  --prove-region-weights 2.0 2.0 1.5 1.5 1.0 1.0 \
+  --G 32 \
+  --P 64 \
+  --collect-hours 8 \
+  --collect-batches-per-shard 8 \
+  --release-steps 20 \
+  --w-stable 20 \
+  --w-final-upright 20 \
+  --collect-pre-steps 35 \
+  --collect-post-steps 12 \
+  --epochs 80 \
+  --batch-size 32768 \
+  --device cuda:0
+```
+
+`G * P` is the number of environments per repair worker.  `G=32, P=64` uses
+2048 envs per GPU.  If each 4090 still has headroom, try `--G 48 --P 64`
+(3072 envs per GPU).  Prefer four workers over one giant process.

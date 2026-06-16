@@ -47,6 +47,7 @@ class Cfg:
   checkpoint: str = "src/assets/soccer/weight/goalkeeper.pt"  # base policy (teacher)
   mode: str = "prove"
   regions: tuple[int, ...] = (3, 2, 1, 0)   # which regions to repair (default: hard ones)
+  region_weights: tuple[float, ...] = ()
   G: int = 16                # scenarios per batch
   P: int = 64                # CEM population per scenario  (N = G*P)
   iters: int = 8             # CEM iterations
@@ -74,12 +75,23 @@ class Cfg:
   final_upright_gz: float = -0.25
 
 
-def _gen_scenarios(env, regions, G, gen, device):
+def _gen_scenarios(env, regions, region_weights, G, gen, device):
   """Sample G ball scenarios (region pinned per scenario) exactly as the env does."""
   rb = env.unwrapped.cfg.events["reset_ball"]
   vc = rb.params["vel_cfg"]
-  reg = torch.tensor([regions[int(i)] for i in torch.randint(0, len(regions), (G,), generator=gen, device=device)],
-                     device=device)
+  region_ids = torch.tensor(regions, dtype=torch.long, device=device)
+  if region_weights:
+    if len(region_weights) != len(regions):
+      raise ValueError(
+        f"region_weights length {len(region_weights)} must match regions length {len(regions)}"
+      )
+    weights = torch.tensor(region_weights, dtype=torch.float32, device=device)
+    if torch.any(weights < 0.0) or float(weights.sum()) <= 0.0:
+      raise ValueError("region_weights must be non-negative with positive sum")
+    pick = torch.multinomial(weights, G, replacement=True, generator=gen)
+  else:
+    pick = torch.randint(0, len(regions), (G,), generator=gen, device=device)
+  reg = region_ids[pick]
   u = lambda lo, hi: lo + torch.rand(G, generator=gen, device=device) * (hi - lo)
   start_x = u(*vc.ball_start_x_range)
   start_y = u(*vc.ball_start_y_range)
@@ -210,7 +222,7 @@ def main(cfg: Cfg):
   all_data_obs, all_data_act, all_data_blk = [], [], []
   agg_base, agg_rep, agg_n = 0, 0, 0
   for b in range(cfg.batches):
-    reg, start, end, tf = _gen_scenarios(env, cfg.regions, cfg.G, gen, dev)
+    reg, start, end, tf = _gen_scenarios(env, cfg.regions, cfg.region_weights, cfg.G, gen, dev)
     vel = _ball_vel(start, end, tf)
     # baseline (residual 0). In collect mode also record the base trajectory so
     # scenarios the base ALREADY blocks are taught with residual=0 (pure base
