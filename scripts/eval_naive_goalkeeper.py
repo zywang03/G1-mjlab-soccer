@@ -23,11 +23,16 @@ Usage:
 """
 
 import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
 import tyro
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+  sys.path.insert(0, str(_REPO_ROOT))
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
@@ -70,20 +75,39 @@ def _load_policy(checkpoint_path: str, env, device: str):
   legacy migration which would convert keys to MLPModel format.
   """
   print(f"[INFO] Loading policy from: {checkpoint_path}")
-  loaded = torch.load(checkpoint_path, map_location=device)
+  loaded = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-  agent_cfg = unitree_g1_goalkeeper_ppo_runner_cfg()
-  runner = GoalkeeperRunner(env, asdict(agent_cfg), device=device)
-
-  if "model_state_dict" in loaded and hasattr(runner.alg.actor, "history_encoder"):
+  if "model_state_dict" in loaded:
+    # Reference Humanoid-Goalkeeper checkpoint: a single unified HIMPPO
+    # ActorCritic. Load it directly into GoalkeeperRunner's custom model.
     print("[INFO] Detected HIMPPO ActorCritic checkpoint — loading directly.")
+    agent_cfg = unitree_g1_goalkeeper_ppo_runner_cfg()
+    runner = GoalkeeperRunner(env, asdict(agent_cfg), device=device)
     actor_state = {k: v for k, v in loaded["model_state_dict"].items() if not k.startswith("critic.")}
     runner.alg.actor.load_state_dict(actor_state, strict=False)
-    print("[INFO] Policy loaded successfully.")
   else:
-    runner.load(checkpoint_path, load_cfg={"actor": True})
-    print("[INFO] Policy loaded successfully.")
+    # Our distilled native rsl_rl MLP policy (actor_state_dict / critic_state_dict).
+    print("[INFO] Detected native MLP checkpoint — loading.")
+    from mjlab.rl import MjlabOnPolicyRunner
+    from src.tasks.soccer.config.g1.gk_train_cfg import (
+      goalkeeper_ballistic_residual_runner_cfg,
+      goalkeeper_train_runner_cfg,
+    )
+    meta = loaded.get("ballistic_residual")
+    if meta:
+      print("[INFO] Detected ballistic residual checkpoint — loading frozen-base actor.")
+      import src.tasks.soccer.modules.gk_ballistic_residual as gkbr
 
+      gkbr.BASE_CKPT = meta.get("base")
+      gkbr.BASE_HIDDEN = tuple(meta.get("base_hidden", (1024, 512, 256)))
+      gkbr.RESIDUAL_SCALE = float(meta.get("residual_scale", 0.25))
+      agent_cfg = goalkeeper_ballistic_residual_runner_cfg()
+    else:
+      agent_cfg = goalkeeper_train_runner_cfg()
+    runner = MjlabOnPolicyRunner(env, asdict(agent_cfg), device=device)
+    runner.load(checkpoint_path, load_cfg={"actor": True})
+
+  print("[INFO] Policy loaded successfully.")
   policy = runner.get_inference_policy(device=env.unwrapped.device)
   return policy
 
@@ -278,6 +302,7 @@ def run_eval(cfg: EvalConfig):
 def main():
   import mjlab.tasks  # noqa: F401
   import src.tasks  # noqa: F401
+  import src.tasks.soccer.config.eval  # noqa: F401
 
   all_tasks = list_tasks()
   eval_tasks = [t for t in all_tasks if "Eval" in t]

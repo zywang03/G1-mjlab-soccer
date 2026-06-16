@@ -1,0 +1,224 @@
+# Goalkeeper LYK: ballistic residual policy
+
+This branch keeps the strongest existing path from `keeper-qbs` and adds one
+targeted improvement: a frozen distilled goalkeeper plus a small PPO-trained
+residual that receives explicit ballistic timing features.
+
+## Why this change
+
+The distilled goalkeeper already dives coherently but misses hard regions
+because the policy must infer the ball's future crossing point from history.
+`GoalkeeperBallisticResidual` keeps the distilled 960D MLP frozen and trains only
+a bounded residual head.  Internally it computes:
+
+- time and `(y, z)` at the keeper plane `x = 0`
+- time and `(y, z)` at the goal plane `x = -0.5`
+- incoming `vx` and ball speed
+
+The residual is zero-initialized, so training starts exactly at the base policy.
+
+## Train
+
+```bash
+MUJOCO_GL=egl python scripts/train_ballistic_residual.py \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --out logs/lyk/goalkeeper_ballistic_residual.pt \
+  --num-envs 1024 --warmup 30 --block-iters 20 --blocks 40 \
+  --eval-resets 3 --lr 1e-4 --std 0.06 --residual-scale 0.25
+```
+
+## Evaluate
+
+```bash
+MUJOCO_GL=egl python scripts/eval_naive_goalkeeper.py \
+  --headless --num-trials 50 \
+  --checkpoint logs/lyk/goalkeeper_ballistic_residual.pt
+```
+
+For failure structure:
+
+```bash
+MUJOCO_GL=egl python scripts/diagnose_gk.py \
+  --checkpoint logs/lyk/goalkeeper_ballistic_residual.pt \
+  --ballistic-residual --num-envs 256 --batches 8
+```
+
+## Deploy
+
+`scripts/api_server.py` now detects this checkpoint via its
+`ballistic_residual` metadata, rebuilds the frozen base path, and uses the same
+keeper observation/history layout as training.
+
+## Repair-oracle pipeline
+
+The ballistic residual PPO path is conservative, but early 2048-env runs stayed
+near the frozen base policy.  The higher-value next path is:
+
+1. diagnose the base policy's miss distribution;
+2. use CEM in simulation to repair sampled failing ball trajectories;
+3. distill the repaired `(observation, action)` pairs back into a native MLP;
+4. evaluate the distilled checkpoint with the standard goalkeeper metric.
+
+Run the whole pipeline:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_lyk.pt \
+  --num-envs 2048 \
+  --collect-batches 32 \
+  --device cuda:0
+```
+
+For a longer data-collection run, shard repair data for about six hours before
+distillation:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk_long.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_lyk_long.pt \
+  --num-envs 2048 \
+  --collect-hours 6 \
+  --collect-batches-per-shard 8 \
+  --epochs 60 \
+  --device cuda:0
+```
+
+Resume selected stages if needed:
+
+```bash
+python scripts/run_keeper_repair_pipeline.py --stages distill diagnose-final
+```
+
+This is still single-agent simulation optimization.  It is not a claim of pure
+PPO training; in the report describe it as repair-oracle data generation plus
+policy distillation.
+
+### Stability note
+
+If visual inspection shows the keeper blocks high balls but falls and flails
+afterward, regenerate repair data with the stable collection defaults.  The
+oracle residual fades back to the base policy after the save window, and
+distillation keeps only frames around the keeper-plane crossing instead of
+teaching the full post-save fall.
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --stages prove collect distill diagnose-final \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk_stable.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_lyk_stable.pt \
+  --num-envs 2048 \
+  --collect-hours 6 \
+  --collect-batches-per-shard 8 \
+  --release-steps 20 \
+  --w-stable 20 \
+  --w-final-upright 20 \
+  --collect-pre-steps 35 \
+  --collect-post-steps 12 \
+  --epochs 60 \
+  --device cuda:0
+```
+
+### Multi-GPU balanced collection
+
+On a 4-GPU machine, run one repair worker per GPU.  Use region weights to avoid
+overfitting to high balls:
+
+- regions `0,1`: mid-height balls;
+- regions `2,3`: upper balls;
+- regions `4,5`: low/ground balls.
+
+The following mix oversamples low and mid balls while still keeping enough high
+ball repair data:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --stages prove collect distill diagnose-final \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk_balanced_4gpu.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_lyk_balanced_4gpu.pt \
+  --devices cuda:0 cuda:1 cuda:2 cuda:3 \
+  --num-envs 4096 \
+  --regions 4 5 0 1 2 3 \
+  --region-weights 2.0 2.0 1.5 1.5 1.0 1.0 \
+  --prove-regions 4 5 0 1 2 3 \
+  --prove-region-weights 2.0 2.0 1.5 1.5 1.0 1.0 \
+  --G 32 \
+  --P 64 \
+  --collect-hours 8 \
+  --collect-batches-per-shard 8 \
+  --release-steps 20 \
+  --w-stable 20 \
+  --w-final-upright 20 \
+  --collect-pre-steps 35 \
+  --collect-post-steps 12 \
+  --epochs 80 \
+  --batch-size 32768 \
+  --device cuda:0
+```
+
+`G * P` is the number of environments per repair worker.  `G=32, P=64` uses
+2048 envs per GPU.  If each 4090 still has headroom, try `--G 48 --P 64`
+(3072 envs per GPU).  Prefer four workers over one giant process.
+
+### Residual distillation target
+
+The plain MLP distilled checkpoint reached 81.7% block rate, while the repair
+oracle itself is much higher.  To reduce this gap, distill repair data into a
+frozen-base ballistic residual policy instead of replacing the full MLP:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --stages prove collect distill diagnose-final \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk_residual_4gpu.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_residual_lyk_4gpu.pt \
+  --distill-mode residual \
+  --residual-scale 0.45 \
+  --devices cuda:0 cuda:1 cuda:2 cuda:3 \
+  --regions 4 5 0 1 2 3 \
+  --region-weights 2.0 2.0 1.5 1.5 1.0 1.0 \
+  --prove-regions 4 5 0 1 2 3 \
+  --prove-region-weights 2.0 2.0 1.5 1.5 1.0 1.0 \
+  --G 32 \
+  --P 64 \
+  --collect-hours 12 \
+  --collect-batches-per-shard 8 \
+  --release-steps 20 \
+  --w-stable 20 \
+  --w-final-upright 20 \
+  --collect-pre-steps 35 \
+  --collect-post-steps 12 \
+  --epochs 120 \
+  --batch-size 32768 \
+  --lr 3e-4 \
+  --lr-final 3e-5 \
+  --device cuda:0
+```
+
+This checkpoint stores metadata so `eval_naive_goalkeeper.py`, `diagnose_gk.py`,
+and `api_server.py` can rebuild the frozen base plus residual actor.
+
+### Evaluation ball visualization
+
+The official goalkeeper eval script is `scripts/eval_naive_goalkeeper.py`.  It
+uses the `Eval-Goalkeeper` task, which samples 6 regions uniformly:
+
+- `0,1`: mid-height, broad `z=[0.3,1.5]`
+- `2,3`: upper, `z=[1.2,1.5]`
+- `4,5`: low, `z=[0.1,0.3]`
+
+It is not all high balls, but the mid regions are broad enough that visual
+samples can look high-heavy.  Render fixed-region cases with:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/render_goalkeeper_regions.py \
+  --checkpoint src/assets/soccer/weight/model_repaired_lyk.pt \
+  --out-dir videos/keeper_regions \
+  --regions 0 1 2 3 4 5 \
+  --cases-per-region 3 \
+  --device cuda:0
+```

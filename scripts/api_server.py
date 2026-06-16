@@ -36,10 +36,17 @@ from __future__ import annotations
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+from pathlib import Path
+import sys
 from typing import Any
 
 import torch
 import tyro
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -48,6 +55,7 @@ import uvicorn
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import quat_apply, quat_inv
+from src.tasks.soccer.mdp.goalkeeper_obs import _REF_DEFAULT_DOF_POS
 
 # ---------------------------------------------------------------------------
 # Default joint positions  (match training configs)
@@ -62,14 +70,8 @@ _SHOOTER_DEFAULT_JOINT_POS = torch.tensor([
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # right arm
 ])
 
-_GK_DEFAULT_JOINT_POS = torch.tensor([
-    0.0, 0.0, 0.0,          # left/right hip, waist
-    -0.35, 0.7, -0.35, -0.25, 0.3, -0.1,    # left leg
-    -0.35, 0.7, -0.35, -0.25, 0.3, -0.1,    # right leg
-    0.0, 0.3, 0.0,          # torso
-    0.8, 0.0, -1.6, 0.0, 0.5, 0.0, 0.0,   # left arm
-    0.8, 0.0, -1.6, 0.0, 0.5, 0.0, 0.0,   # right arm
-])
+_GK_DEFAULT_JOINT_POS = torch.tensor(_REF_DEFAULT_DOF_POS, dtype=torch.float32)
+_GK_TERM_SIZES = (3, 3, 3, 29, 29, 29)
 
 # ---------------------------------------------------------------------------
 # Observation computation  (CUSTOMIZE: match your training observation space)
@@ -84,16 +86,16 @@ def compute_shooter_obs(raw_state: dict) -> torch.Tensor:
     s = raw_state["shooter"]
     ball = raw_state["ball"]
 
-    root_quat = torch.tensor(s["root_quat"])
-    root_ang_vel = torch.tensor(s["root_ang_vel"])
-    joint_pos = torch.tensor(s["joint_pos"])
-    joint_vel = torch.tensor(s["joint_vel"])
-    ball_pos = torch.tensor(ball["pos"])
-    root_pos = torch.tensor(s["root_pos"])
-    last_action = torch.tensor(s["last_action"])
+    root_quat = torch.tensor(s["root_quat"], dtype=torch.float32)
+    root_ang_vel = torch.tensor(s["root_ang_vel"], dtype=torch.float32)
+    joint_pos = torch.tensor(s["joint_pos"], dtype=torch.float32)
+    joint_vel = torch.tensor(s["joint_vel"], dtype=torch.float32)
+    ball_pos = torch.tensor(ball["pos"], dtype=torch.float32)
+    root_pos = torch.tensor(s["root_pos"], dtype=torch.float32)
+    last_action = torch.tensor(s["last_action"], dtype=torch.float32)
 
     # Projected gravity
-    gravity_w = torch.tensor([0.0, 0.0, -1.0])
+    gravity_w = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
     projected_gravity = quat_apply(quat_inv(root_quat), gravity_w)
 
     # Base angular velocity in robot frame
@@ -125,16 +127,16 @@ def compute_goalkeeper_obs(raw_state: dict) -> torch.Tensor:
     s = raw_state["goalkeeper"]
     ball = raw_state["ball"]
 
-    root_quat = torch.tensor(s["root_quat"])
-    root_ang_vel = torch.tensor(s["root_ang_vel"])
-    joint_pos = torch.tensor(s["joint_pos"])
-    joint_vel = torch.tensor(s["joint_vel"])
-    ball_pos = torch.tensor(ball["pos"])
-    root_pos = torch.tensor(s["root_pos"])
-    last_action = torch.tensor(s["last_action"])
+    root_quat = torch.tensor(s["root_quat"], dtype=torch.float32)
+    root_ang_vel = torch.tensor(s["root_ang_vel"], dtype=torch.float32)
+    joint_pos = torch.tensor(s["joint_pos"], dtype=torch.float32)
+    joint_vel = torch.tensor(s["joint_vel"], dtype=torch.float32)
+    ball_pos = torch.tensor(ball["pos"], dtype=torch.float32)
+    root_pos = torch.tensor(s["root_pos"], dtype=torch.float32)
+    last_action = torch.tensor(s["last_action"], dtype=torch.float32)
 
     # Projected gravity
-    gravity_w = torch.tensor([0.0, 0.0, -1.0])
+    gravity_w = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
     projected_gravity = quat_apply(quat_inv(root_quat), gravity_w)
 
     # Angular velocity with GK scaling (×0.25, matching GK PD gain ratio)
@@ -158,6 +160,18 @@ def compute_goalkeeper_obs(raw_state: dict) -> torch.Tensor:
         last_action,            # 29
     ])
     return obs.unsqueeze(0)  # (1, 96)
+
+
+def stack_goalkeeper_history(frames: list[torch.Tensor] | deque[torch.Tensor]) -> torch.Tensor:
+    """Match mjlab's term-major history stacking for the 6 keeper actor terms."""
+    if len(frames) == 0:
+        raise ValueError("goalkeeper history is empty")
+    chunks: list[torch.Tensor] = []
+    offset = 0
+    for size in _GK_TERM_SIZES:
+        chunks.append(torch.cat([frame[:, offset : offset + size] for frame in frames], dim=-1))
+        offset += size
+    return torch.cat(chunks, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -188,15 +202,16 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
     print(f"[INFO] Action dim: {env.num_actions}")
 
     if task_id == "Eval-Goalkeeper":
-        from src.tasks.soccer.config.g1.rl_cfg import (
-            GoalkeeperRunner,
-            unitree_g1_goalkeeper_ppo_runner_cfg,
-        )
         loaded = torch.load(checkpoint_path, map_location=device)
-        agent_cfg = unitree_g1_goalkeeper_ppo_runner_cfg()
-        runner = GoalkeeperRunner(env, asdict(agent_cfg), device=device)
 
-        if "model_state_dict" in loaded and hasattr(runner.alg.actor, "history_encoder"):
+        if "model_state_dict" in loaded:
+            from src.tasks.soccer.config.g1.rl_cfg import (
+                GoalkeeperRunner,
+                unitree_g1_goalkeeper_ppo_runner_cfg,
+            )
+
+            agent_cfg = unitree_g1_goalkeeper_ppo_runner_cfg()
+            runner = GoalkeeperRunner(env, asdict(agent_cfg), device=device)
             print("[INFO] Detected HIMPPO ActorCritic checkpoint — loading directly.")
             actor_state = {
                 k: v
@@ -205,6 +220,25 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
             }
             runner.alg.actor.load_state_dict(actor_state, strict=False)
         else:
+            from mjlab.rl import MjlabOnPolicyRunner
+            from src.tasks.soccer.config.g1.gk_train_cfg import (
+                goalkeeper_ballistic_residual_runner_cfg,
+                goalkeeper_train_runner_cfg,
+            )
+
+            meta = loaded.get("ballistic_residual")
+            if meta:
+                print("[INFO] Detected ballistic residual checkpoint — loading.")
+                import src.tasks.soccer.modules.gk_ballistic_residual as gkbr
+
+                gkbr.BASE_CKPT = meta.get("base")
+                gkbr.BASE_HIDDEN = tuple(meta.get("base_hidden", (1024, 512, 256)))
+                gkbr.RESIDUAL_SCALE = float(meta.get("residual_scale", 0.25))
+                agent_cfg = goalkeeper_ballistic_residual_runner_cfg()
+            else:
+                print("[INFO] Detected native MLP goalkeeper checkpoint — loading.")
+                agent_cfg = goalkeeper_train_runner_cfg()
+            runner = MjlabOnPolicyRunner(env, asdict(agent_cfg), device=device)
             runner.load(checkpoint_path, load_cfg={"actor": True})
     else:
         from src.tasks.soccer.config.g1.rl_cfg import (
@@ -267,8 +301,11 @@ def create_app(checkpoint_path: str, task_id: str, device: str) -> FastAPI:
 
         history.append(frame)
 
-        # Build stacked observation: (1, history_len × frame_dim).
-        stacked = torch.cat(list(history), dim=-1)
+        if is_gk:
+            stacked = stack_goalkeeper_history(history)
+        else:
+            stacked = torch.cat(list(history), dim=-1)
+        stacked = stacked.to(device=device, dtype=torch.float32)
 
         with torch.inference_mode():
             action = policy({"actor": stacked})
@@ -304,6 +341,7 @@ class ServerConfig:
 
 def main():
     import src.tasks  # noqa: F401  — register eval tasks
+    import src.tasks.soccer.config.eval  # noqa: F401
 
     args = tyro.cli(ServerConfig, prog="api_server")
 
