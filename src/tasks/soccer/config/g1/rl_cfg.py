@@ -80,6 +80,40 @@ def unitree_g1_soccer_recurrent_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   )
 
 
+def unitree_g1_student_shooter_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
+  """LSTM PPO config for motion-free shooter student.
+
+  Uses the same RNN architecture as Stage II (128-64-32 MLP + LSTM 2×128)
+  so BC actor checkpoints can initialize PPO with ``--load-actor-only``.
+  RNN hidden/type/layers are injected by ``SoccerRecurrentRunner``.
+  """
+  return RslRlOnPolicyRunnerCfg(
+    actor=RslRlModelCfg(
+      hidden_dims=_RNN_HIDDEN,
+      activation="elu",
+      obs_normalization=True,
+      distribution_cfg={"class_name": "GaussianDistribution", "init_std": 0.5, "std_type": "scalar"},
+      class_name="RNNModel",
+    ),
+    critic=RslRlModelCfg(
+      hidden_dims=_RNN_HIDDEN,
+      activation="elu",
+      obs_normalization=True,
+      class_name="RNNModel",
+    ),
+    algorithm=RslRlPpoAlgorithmCfg(
+      value_loss_coef=1.0, use_clipped_value_loss=True, clip_param=0.2,
+      entropy_coef=0.005, num_learning_epochs=5, num_mini_batches=4,
+      learning_rate=3.0e-4, schedule="adaptive", gamma=0.99, lam=0.95,
+      desired_kl=0.01, max_grad_norm=1.0,
+    ),
+    experiment_name="g1_soccer_student",
+    save_interval=100,
+    num_steps_per_env=24,
+    max_iterations=20000,
+  )
+
+
 class SoccerRecurrentRunner(MjlabOnPolicyRunner):
   """Runner that injects LSTM params into the RSL-RL config dict.
 
@@ -89,9 +123,10 @@ class SoccerRecurrentRunner(MjlabOnPolicyRunner):
 
   def __init__(self, env, train_cfg: dict, log_dir=None, device="cpu", **kwargs):
     for key in ("actor", "critic"):
-      train_cfg[key].setdefault("rnn_type", _RNN_TYPE)
-      train_cfg[key].setdefault("rnn_hidden_dim", _RNN_HIDDEN_DIM)
-      train_cfg[key].setdefault("rnn_num_layers", _RNN_NUM_LAYERS)
+      if train_cfg[key].get("class_name") == "RNNModel":
+        train_cfg[key].setdefault("rnn_type", _RNN_TYPE)
+        train_cfg[key].setdefault("rnn_hidden_dim", _RNN_HIDDEN_DIM)
+        train_cfg[key].setdefault("rnn_num_layers", _RNN_NUM_LAYERS)
     super().__init__(env, train_cfg, log_dir, device, **kwargs)
 
 

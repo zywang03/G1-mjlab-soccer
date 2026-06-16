@@ -1,7 +1,7 @@
 """Evaluate shooter — Stage II-compatible obs, zero-agent or trained checkpoint.
 
-Scene: physical goal at origin, robot at penalty spot (-5,0,0.8),
-ball at (-4,0,0.1).  Robot root pose is randomized each episode (±0.5m xy, ±0.5rad yaw).
+Scene: physical goal at origin, robot at penalty spot, ball in front.
+Robot root pose is randomized each episode (±0.5m xy, ±0.5rad yaw).
 
 Metrics (matching HumanoidSoccer Section IV-B):
   - Success Rate: ball crosses goal line inside the frame
@@ -9,18 +9,44 @@ Metrics (matching HumanoidSoccer Section IV-B):
   - Kick Speed: ball speed when it first exceeds 1 m/s
 
 Usage:
-  # Interactive viewer (zero agent)
+  # ---- Interactive viewer ----
+  # Zero agent
   python scripts/eval_naive_shooter.py
 
-  # Trained checkpoint
-  python scripts/eval_naive_shooter.py --checkpoint logs/rsl_rl/g1_soccer/<run>/model_6000.pt
+  # Trained policy (native MuJoCo window)
+  python scripts/eval_naive_shooter.py \\
+      --checkpoint logs/rsl_rl/g1_soccer/<run>/model_6000.pt
 
-  # Headless multi-trial
+  # Web viewer (no DISPLAY needed)
+  python scripts/eval_naive_shooter.py --viewer viser
+
+  # ---- Headless evaluation ----
+  # 50 trials, zero agent baseline
   python scripts/eval_naive_shooter.py --headless --num-trials 50
-  python scripts/eval_naive_shooter.py --headless --num-trials 50 --checkpoint <path>
 
-  # Video
-  python scripts/eval_naive_shooter.py --video --video-length 500
+  # 50 trials, trained checkpoint
+  python scripts/eval_naive_shooter.py --headless --num-trials 50 \\
+      --checkpoint logs/rsl_rl/g1_soccer/<run>/model_6000.pt
+
+  # Large-scale eval with fixed seed
+  python scripts/eval_naive_shooter.py --headless --num-trials 100 \\
+      --checkpoint model.pt --seed 42
+
+  # ---- Video recording ----
+  python scripts/eval_naive_shooter.py --video --video-length 500 \\
+      --checkpoint model.pt
+
+  # Headless + video
+  python scripts/eval_naive_shooter.py --headless --num-trials 1 \\
+      --checkpoint model.pt --video
+
+Key parameters:
+  --checkpoint PATH    Policy .pt file (omit for zero-agent)
+  --headless           Batch eval without viewer window
+  --num-trials N       Trial count (>0 required for batch mode)
+  --video              Record MP4 video
+  --viewer auto|native|viser   Viewer type (auto: detect DISPLAY)
+  --seed N             Random seed (default 2810)
 """
 
 import os

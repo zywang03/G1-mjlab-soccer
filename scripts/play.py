@@ -1,4 +1,48 @@
-"""Script to play RL agent with RSL-RL."""
+"""Interactive environment viewer for G1 soccer tasks.
+
+Runs a registered mjlab task with zero-agent, random-agent, or trained
+policy in a MuJoCo native window or Viser web viewer.
+
+Task IDs:
+  Unitree-G1-Shooter            Playable shooter scene
+  Unitree-G1-Goalkeeper         Playable goalkeeper scene
+  Unitree-G1-Shooter-Stage1     Training Stage I motion (needs --motion-dir)
+  Unitree-G1-Shooter-Stage2     Training Stage II motion (needs --motion-dir)
+  Eval-Shooter                  Eval scene with goal entity
+  Eval-Goalkeeper               Eval scene with parabolic ball trajectories
+
+Usage:
+  # ---- Soccer tasks (zero agent, native viewer) ----
+  python scripts/play.py Unitree-G1-Shooter --agent zero --viewer native
+  python scripts/play.py Unitree-G1-Goalkeeper --agent zero --viewer native
+
+  # Soccer tasks with trained policy
+  python scripts/play.py Unitree-G1-Shooter --agent trained \\
+      --checkpoint-file logs/rsl_rl/g1_soccer/<run>/model_5000.pt
+
+  # View training motions (Stage I, disable terminations for full playback)
+  python scripts/play.py Unitree-G1-Shooter-Stage1 --agent zero \\
+      --motion-dir src/assets/soccer/motions/shooter --no-terminations
+
+  # ---- Viser web viewer (no DISPLAY needed) ----
+  python scripts/play.py Unitree-G1-Shooter --agent zero --viewer viser
+
+  # ---- Multiple parallel environments for diversity ----
+  python scripts/play.py Unitree-G1-Shooter-Stage1 --agent zero \\
+      --motion-dir src/assets/soccer/motions/shooter --num-envs 4 --no-terminations
+
+  # ---- Record video ----
+  python scripts/play.py Unitree-G1-Shooter --agent trained \\
+      --checkpoint-file model.pt --video --video-length 300
+
+Key parameters:
+  --agent zero|random|trained  Policy type (default trained)
+  --checkpoint-file PATH       .pt checkpoint (trained mode)
+  --motion-dir PATH            .npz directory (soccer tasks)
+  --viewer auto|native|viser   auto: detect DISPLAY, else viser
+  --no-terminations            Disable all terminations (watch full motion)
+  --num-envs N                 Parallel env count
+"""
 
 import os
 import sys

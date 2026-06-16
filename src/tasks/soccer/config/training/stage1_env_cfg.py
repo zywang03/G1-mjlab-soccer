@@ -43,15 +43,18 @@ from mjlab.tasks.tracking.mdp.rewards import (  # type: ignore[import-untyped]
 
 # Soccer training observation functions (MultiMotionSoccerCommand-aware).
 from src.tasks.soccer.mdp.shooter_obs import (
+  constant_target_point_pos,
   motion_anchor_ang_vel as _motion_anchor_ang_vel,
   robot_body_pos_b,
   robot_body_ori_b,
+  target_destination_pos_local,
 )
 
 # Soccer reward functions.
 from src.tasks.soccer.mdp.shooter_rewards import (
   action_rate_l2_clip,
   foot_distance,
+  undesired_contacts,
 )
 
 # Soccer-specific command.
@@ -157,6 +160,14 @@ def make_stage1_env_cfg() -> ManagerBasedRlEnvCfg:
       noise=Unoise(n_min=-0.5, n_max=0.5),
     ),
     "actions": ObservationTermCfg(func=mdp.last_action),
+    "target_point_pos": ObservationTermCfg(
+      func=constant_target_point_pos,
+      params={"command_name": "motion"},
+    ),
+    "target_destination_pos": ObservationTermCfg(
+      func=target_destination_pos_local,
+      params={"command_name": "motion"},
+    ),
   }
 
   critic_terms = {
@@ -267,6 +278,18 @@ def make_stage1_env_cfg() -> ManagerBasedRlEnvCfg:
       func=joint_pos_limits,
       weight=-10.0,
       params={"asset_cfg": SceneEntityCfg("robot", joint_names=(".*",))},
+    ),
+    "undesired_contacts": RewardTermCfg(
+      func=undesired_contacts,
+      weight=-0.1,
+      params={
+        "threshold": 1.0,
+        "entity_name": "robot",
+        "excluded_body_names": (
+          "left_ankle_roll_link", "right_ankle_roll_link",
+          "left_wrist_yaw_link", "right_wrist_yaw_link",
+        ),
+      },
     ),
   }
 

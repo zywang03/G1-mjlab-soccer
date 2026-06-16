@@ -14,6 +14,7 @@ from src.tasks.soccer.config.soccer_settings import SETTINGS
 from src.tasks.soccer.config.training.goalkeeper_env_cfg import make_goalkeeper_env_cfg
 from src.tasks.soccer.config.training.stage1_env_cfg import make_stage1_env_cfg
 from src.tasks.soccer.config.training.stage2_env_cfg import make_stage2_env_cfg
+from src.tasks.soccer.config.training.stage3_env_cfg import make_stage3_env_cfg
 from src.tasks.soccer.mdp import MultiMotionSoccerCommandCfg
 
 import math
@@ -59,11 +60,48 @@ def _setup_g1_training(cfg: ManagerBasedRlEnvCfg) -> None:
     track_air_time=True,
   )
 
-  # Ball-robot contact sensor for kick detection.
+  # Ball-robot contact sensor for kick detection (whole body).
   ball_robot = ContactSensorCfg(
     name="ball_robot_contact",
     primary=ContactMatch(mode="subtree", pattern="ball", entity="ball"),
-    secondary=ContactMatch(mode="subtree", pattern="torso_link", entity="robot"),
+    secondary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
+    fields=("found", "force"),
+    reduce="none",
+    num_slots=2,
+    history_length=4,
+  )
+
+  # Foot-specific ball contact sensors for valid kick detection.
+  left_foot_ball = ContactSensorCfg(
+    name="left_foot_ball_contact",
+    primary=ContactMatch(mode="subtree", pattern="ball", entity="ball"),
+    secondary=ContactMatch(mode="subtree", pattern="left_ankle_roll_link", entity="robot"),
+    fields=("found", "force"),
+    reduce="none",
+    num_slots=2,
+    history_length=4,
+  )
+  right_foot_ball = ContactSensorCfg(
+    name="right_foot_ball_contact",
+    primary=ContactMatch(mode="subtree", pattern="ball", entity="ball"),
+    secondary=ContactMatch(mode="subtree", pattern="right_ankle_roll_link", entity="robot"),
+    fields=("found", "force"),
+    reduce="none",
+    num_slots=2,
+    history_length=4,
+  )
+
+  # Non-foot ball contact sensor for anti-clamp detection.
+  # Uses geom mode with a negative-lookahead regex to match all collision
+  # geoms EXCEPT those containing "foot" in the name. This gives an
+  # independent non-foot contact signal, unlike the whole-body
+  # ball_robot_contact which can't disambiguate foot+body simultaneous contact.
+  nonfoot_ball = ContactSensorCfg(
+    name="nonfoot_ball_contact",
+    primary=ContactMatch(mode="subtree", pattern="ball", entity="ball"),
+    secondary=ContactMatch(
+      mode="geom", pattern=r"^(?!.*foot).*collision$", entity="robot",
+    ),
     fields=("found", "force"),
     reduce="none",
     num_slots=2,
@@ -82,7 +120,9 @@ def _setup_g1_training(cfg: ManagerBasedRlEnvCfg) -> None:
     history_length=4,
   )
 
-  cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground, ball_robot, contact_forces)
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + (
+    feet_ground, ball_robot, left_foot_ball, right_foot_ball, nonfoot_ball, contact_forces,
+  )
 
   # Inject motion_dir into the command config at registration time.
   # The actual path is set by the training script via --motion-dir.
@@ -137,6 +177,52 @@ def unitree_g1_stage2_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     if isinstance(motion_cmd, MultiMotionSoccerCommandCfg):
       motion_cmd.debug_vis = True
       motion_cmd.sampling_mode = "uniform"
+      motion_cmd.pose_range = {}
+      motion_cmd.velocity_range = {}
+      motion_cmd.joint_position_range = (0.0, 0.0)
+
+  return cfg
+
+
+def unitree_g1_stage3_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 shooter Stage III: goal-plane accuracy + speed curriculum."""
+  cfg = make_stage3_env_cfg()
+  cfg.scene.entities["robot"] = _g1_robot_at(tuple(SETTINGS.scene.shooter_pos), 0.0)
+  _setup_g1_training(cfg)
+
+  if play:
+    cfg.episode_length_s = int(1e9)
+    cfg.observations["actor"].enable_corruption = False
+    cfg.events.pop("push_robot", None)
+    for key in ("anchor_pos_z", "anchor_ori", "ee_body_pos"):
+      cfg.terminations.pop(key, None)
+    from src.tasks.soccer.mdp.shooter_commands import MultiMotionSoccerCommandCfg
+    motion_cmd = cfg.commands.get("motion")
+    if isinstance(motion_cmd, MultiMotionSoccerCommandCfg):
+      motion_cmd.debug_vis = True
+      motion_cmd.sampling_mode = "uniform"
+      motion_cmd.pose_range = {}
+      motion_cmd.velocity_range = {}
+      motion_cmd.joint_position_range = (0.0, 0.0)
+
+  return cfg
+
+
+def unitree_g1_student_shooter_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 shooter student: motion-free observation and PPO rewards."""
+  from src.tasks.soccer.config.training.student_shooter_env_cfg import make_student_shooter_env_cfg
+  from src.tasks.soccer.mdp.student_shooter_commands import StudentShooterCommandCfg
+
+  cfg = make_student_shooter_env_cfg()
+  cfg.scene.entities["robot"] = _g1_robot_at((0.0, 0.0, 0.8), -1.5707963267948966)
+  _setup_g1_training(cfg)
+
+  if play:
+    cfg.episode_length_s = int(1e9)
+    cfg.observations["actor"].enable_corruption = False
+    motion_cmd = cfg.commands.get("motion")
+    if isinstance(motion_cmd, StudentShooterCommandCfg):
+      motion_cmd.debug_vis = True
       motion_cmd.pose_range = {}
       motion_cmd.velocity_range = {}
       motion_cmd.joint_position_range = (0.0, 0.0)
