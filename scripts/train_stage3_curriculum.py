@@ -11,11 +11,12 @@ Usage:
       --env.scene.num-envs 4096 --gpu-ids '[0,1]' \\
       --min-iters 3000
 
-  # Single-phase smoke test
+  # Smoke run — skip eval pass/fail gate, verify all 5 phases chain correctly
   python scripts/train_stage3_curriculum.py \\
       --base-checkpoint <model_100000.pt> \\
       --motion-dir src/assets/soccer/motions/shooter \\
-      --min-iters 100 --num-trials 2 --num-eval-envs 2
+      --min-iters 100 --num-trials 2 --num-eval-envs 2 \\
+      --skip-eval-check
 """
 
 from __future__ import annotations
@@ -57,12 +58,12 @@ class CurriculumConfig:
   base_checkpoint: str
   motion_dir: str
   min_iters: int = 3000
-  max_iters: int = 20000
   max_attempts: int = 3
   num_trials: int = 50
   num_eval_envs: int = 64
   gpu_ids: list[int] | str | None = field(default_factory=lambda: [0])
   env_num_envs: int = 4096
+  skip_eval_check: bool = False
 
 
 def _find_python() -> str:
@@ -84,17 +85,17 @@ def _run_train(cfg: CurriculumConfig, ckpt_path: str, phase: CurriculumPhase,
     "--motion-dir", cfg.motion_dir,
     "--load-checkpoint-path", ckpt_path,
     "--ball-speed-std", str(phase.ball_speed_std),
-    "--agent.max-iterations", str(cfg.max_iters),
+    "--agent.max-iterations", str(cfg.min_iters),
     "--agent.run-name", run_name,
     "--env.scene.num-envs", str(cfg.env_num_envs),
     "--agent.save-interval", "100",
   ]
 
   gpu = cfg.gpu_ids
-  if isinstance(gpu, list) and len(gpu) > 1:
-    cmd.extend(["--gpu-ids", ",".join(map(str, gpu))])
-  elif isinstance(gpu, list) and len(gpu) == 1:
-    cmd.extend(["--gpu-ids", str(gpu[0])])
+  if isinstance(gpu, str):
+    cmd.extend(["--gpu-ids", gpu])
+  elif isinstance(gpu, list):
+    cmd.extend(["--gpu-ids", str(gpu)])
 
   print(f"\n[TRAIN] phase ball_speed_std={phase.ball_speed_std}, run={run_name}")
   print(f"[TRAIN] {' '.join(cmd)}\n", flush=True)
@@ -125,12 +126,24 @@ def _run_eval(ckpt_path: Path, num_trials: int, num_envs: int) -> dict[str, Any]
   print(f"\n[EVAL] checkpoint={ckpt_path.name}")
   print(f"[EVAL] {' '.join(cmd)}\n", flush=True)
 
-  subprocess.run(cmd, check=True)
-
-  with open(json_path, encoding="utf-8") as fh:
-    metrics = json.load(fh)
-  os.unlink(json_path)
-  return metrics
+  for retry in range(3):
+    try:
+      subprocess.run(cmd, check=True)
+      with open(json_path, encoding="utf-8") as fh:
+        metrics = json.load(fh)
+      return metrics
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+      if retry == 2:
+        raise RuntimeError(f"[EVAL] failed after 3 attempts: {exc}") from exc
+      print(f"[EVAL] attempt {retry + 1} failed ({exc}), retrying in 5s ...")
+      import time
+      time.sleep(5)
+    finally:
+      try:
+        if os.path.exists(json_path):
+          os.unlink(json_path)
+      except OSError:
+        pass
 
 
 def _check_pass(metrics: dict[str, Any], phase: CurriculumPhase) -> tuple[bool, list[str]]:
@@ -197,6 +210,9 @@ def main():
       _print_metrics(metrics, phase)
 
       passed, reasons = _check_pass(metrics, phase)
+      if args.skip_eval_check:
+        passed = True
+        reasons = ["(skip_eval_check — smoke run)"]
       if passed:
         print(f"\n  *** Phase {i+1} PASSED (attempt {attempt}) ***")
         current_ckpt = str(latest_ckpt)
