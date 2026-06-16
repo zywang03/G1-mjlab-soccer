@@ -43,6 +43,7 @@ from pydantic import BaseModel
 import uvicorn
 
 from mjlab.envs import ManagerBasedRlEnv
+from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import quat_apply, quat_inv
 
@@ -234,7 +235,8 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
 
     env_cfg = load_env_cfg(task_id, play=False)
     env_cfg.scene.num_envs = 1
-    env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+    env_base = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+    env = RslRlVecEnvWrapper(env_base, clip_actions=100.0)
 
     actor_terms = list(env_cfg.observations["actor"].terms.keys())
     history_len = env_cfg.observations["actor"].history_length
