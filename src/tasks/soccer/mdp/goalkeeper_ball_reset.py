@@ -118,6 +118,7 @@ class RegionBallVelCfg:
   ball_end_x_range: tuple[float, float] = (0.1, 0.6)
   t_flight_range: tuple[float, float] = (0.5, 1.0)
   regions: list = None
+  region_weights: tuple[float, ...] = ()
   ball_start_y_range: tuple[float, float] = (-1.5, 1.5)
   ball_start_z_range: tuple[float, float] = (0.1, 1.8)
 
@@ -193,8 +194,20 @@ def reset_ball_with_parabolic_trajectory(
   num_regions = vel_cfg.num_regions
   assert num_regions > 0, "RegionBallVelCfg must have at least one region."
 
-  # Pick a random region for each env.
-  region_idx = torch.randint(0, num_regions, (n,), device=device)
+  # Pick a random region for each env. Eval leaves region_weights empty, which
+  # preserves the official uniform distribution. Training can oversample weak
+  # regions without changing the eval protocol.
+  if vel_cfg.region_weights:
+    if len(vel_cfg.region_weights) != num_regions:
+      raise ValueError(
+        f"region_weights length {len(vel_cfg.region_weights)} must match {num_regions} regions"
+      )
+    weights = torch.tensor(vel_cfg.region_weights, dtype=torch.float32, device=device)
+    if torch.any(weights < 0.0) or float(weights.sum()) <= 0.0:
+      raise ValueError("region_weights must be non-negative with positive sum")
+    region_idx = torch.multinomial(weights, n, replacement=True)
+  else:
+    region_idx = torch.randint(0, num_regions, (n,), device=device)
 
   # -- Curriculum difficulty (training only) ----------------------------------
   warmup = getattr(vel_cfg, "curriculum_warmup_calls", 0)

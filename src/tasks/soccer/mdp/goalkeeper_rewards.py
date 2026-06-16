@@ -371,6 +371,28 @@ def goalkeeper_posture_orientation(
   return torch.clamp(-grav_z, 0.0, 1.0)
 
 
+def goalkeeper_recovery_upright(
+  env: ManagerBasedRlEnv,
+  near_or_past_x: float = 0.6,
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  """Penalty for staying tipped over after the ball reaches the save window.
+
+  A constant upright reward can make PPO avoid legitimate dives. This term only
+  turns on once the ball is near the keeper plane or has passed it, so the policy
+  can still make aggressive saves but is pushed to recover instead of learning
+  long post-contact flailing.
+  """
+  robot: Entity = env.scene[robot_cfg.name]
+  ball: Entity = env.scene[ball_cfg.name]
+  ball_x_rel = ball.data.root_link_pos_w[:, 0] - env.scene.env_origins[:, 0]
+  save_window = (ball_x_rel < near_or_past_x).to(torch.float32)
+  grav_z = robot.data.projected_gravity_b[:, 2]
+  tipped = torch.clamp(grav_z + 0.5, min=0.0)
+  return save_window * tipped * tipped
+
+
 def goalkeeper_ang_vel_xy(
   env: ManagerBasedRlEnv,
   robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
