@@ -114,21 +114,23 @@ def compute_shooter_obs(
     motion: MotionData,
     time_step: int,
     destination_world: tuple[float, float, float],
+    device: str,
 ) -> torch.Tensor:
     """Compute 160D shooter observation from raw state + motion data.
 
     Concatenation order matches ``stage1_env_cfg.py`` actor_terms (9 terms).
+    All tensors created on ``device`` to match the motion data device.
     """
     s = raw_state["shooter"]
     ball = raw_state["ball"]
 
-    root_quat = torch.tensor(s["root_quat"])
-    root_pos = torch.tensor(s["root_pos"])
-    root_ang_vel = torch.tensor(s["root_ang_vel"])
-    joint_pos = torch.tensor(s["joint_pos"])
-    joint_vel = torch.tensor(s["joint_vel"])
-    ball_pos = torch.tensor(ball["pos"])
-    last_action = torch.tensor(s["last_action"])
+    root_quat = torch.tensor(s["root_quat"], device=device)
+    root_pos = torch.tensor(s["root_pos"], device=device)
+    root_ang_vel = torch.tensor(s["root_ang_vel"], device=device)
+    joint_pos = torch.tensor(s["joint_pos"], device=device)
+    joint_vel = torch.tensor(s["joint_vel"], device=device)
+    ball_pos = torch.tensor(ball["pos"], device=device)
+    last_action = torch.tensor(s["last_action"], device=device)
 
     # Freeze at last frame when motion ends.
     T = motion.joint_pos.shape[0]
@@ -138,7 +140,7 @@ def compute_shooter_obs(
     command = torch.cat([motion.joint_pos[t], motion.joint_vel[t]])
 
     # 2. projected_gravity (3D)
-    gravity_w = torch.tensor([0.0, 0.0, -1.0])
+    gravity_w = torch.tensor([0.0, 0.0, -1.0], device=device)
     projected_gravity = quat_apply(quat_inv(root_quat), gravity_w)
 
     # 3. motion_ref_ang_vel — reference anchor angular velocity (3D)
@@ -148,7 +150,7 @@ def compute_shooter_obs(
     base_ang_vel = quat_apply(quat_inv(root_quat), root_ang_vel)
 
     # 5. joint_pos_rel — relative to HOME_KEYFRAME (29D)
-    joint_pos_rel = joint_pos - _HOME_KEYFRAME_JOINT_POS.to(joint_pos.device)
+    joint_pos_rel = joint_pos - _HOME_KEYFRAME_JOINT_POS.to(device)
 
     # 6. joint_vel_rel (29D, default_vel = 0)
     joint_vel_rel = joint_vel
@@ -159,7 +161,7 @@ def compute_shooter_obs(
     ball_body = quat_apply(quat_inv(root_quat), ball_pos - root_pos)
 
     # 9. target_destination_pos — destination in robot pelvis frame (3D)
-    dest_w = torch.tensor(destination_world)
+    dest_w = torch.tensor(destination_world, device=device)
     dest_body = quat_apply(quat_inv(root_quat), dest_w - root_pos)
 
     obs = torch.cat([
@@ -238,7 +240,7 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
     history_len = env_cfg.observations["actor"].history_length
     print(f"[INFO] Task: {task_id}")
     print(f"[INFO] Actor obs  ({len(actor_terms)} terms × {history_len} history): {actor_terms}")
-    print(f"[INFO] Action dim: {env.action_manager.action_dim}")
+    print(f"[INFO] Action dim: {env.action_manager.total_action_dim}")
 
     if task_id == "Eval-Goalkeeper":
         from src.tasks.soccer.config.g1.rl_cfg import (
@@ -328,7 +330,7 @@ def create_app(
             frame = compute_goalkeeper_obs(raw_state)
         else:
             m = motion_ctx["motion"]
-            frame = compute_shooter_obs(raw_state, m, motion_ctx["time_step"], motion_ctx["destination"])
+            frame = compute_shooter_obs(raw_state, m, motion_ctx["time_step"], motion_ctx["destination"], device)
             motion_ctx["time_step"] += 1
 
         if len(history) == 0:
