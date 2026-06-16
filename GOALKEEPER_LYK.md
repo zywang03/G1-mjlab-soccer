@@ -163,3 +163,62 @@ MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py
 `G * P` is the number of environments per repair worker.  `G=32, P=64` uses
 2048 envs per GPU.  If each 4090 still has headroom, try `--G 48 --P 64`
 (3072 envs per GPU).  Prefer four workers over one giant process.
+
+### Residual distillation target
+
+The plain MLP distilled checkpoint reached 81.7% block rate, while the repair
+oracle itself is much higher.  To reduce this gap, distill repair data into a
+frozen-base ballistic residual policy instead of replacing the full MLP:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/run_keeper_repair_pipeline.py \
+  --stages prove collect distill diagnose-final \
+  --base src/assets/soccer/weight/goalkeeper_distilled_v3.pt \
+  --repair-data logs/repairs/repairs_lyk_residual_4gpu.pt \
+  --distilled-out logs/rsl_rl/g1_goalkeeper/distilled/model_repaired_residual_lyk_4gpu.pt \
+  --distill-mode residual \
+  --residual-scale 0.45 \
+  --devices cuda:0 cuda:1 cuda:2 cuda:3 \
+  --regions 4 5 0 1 2 3 \
+  --region-weights 2.0 2.0 1.5 1.5 1.0 1.0 \
+  --prove-regions 4 5 0 1 2 3 \
+  --prove-region-weights 2.0 2.0 1.5 1.5 1.0 1.0 \
+  --G 32 \
+  --P 64 \
+  --collect-hours 12 \
+  --collect-batches-per-shard 8 \
+  --release-steps 20 \
+  --w-stable 20 \
+  --w-final-upright 20 \
+  --collect-pre-steps 35 \
+  --collect-post-steps 12 \
+  --epochs 120 \
+  --batch-size 32768 \
+  --lr 3e-4 \
+  --lr-final 3e-5 \
+  --device cuda:0
+```
+
+This checkpoint stores metadata so `eval_naive_goalkeeper.py`, `diagnose_gk.py`,
+and `api_server.py` can rebuild the frozen base plus residual actor.
+
+### Evaluation ball visualization
+
+The official goalkeeper eval script is `scripts/eval_naive_goalkeeper.py`.  It
+uses the `Eval-Goalkeeper` task, which samples 6 regions uniformly:
+
+- `0,1`: mid-height, broad `z=[0.3,1.5]`
+- `2,3`: upper, `z=[1.2,1.5]`
+- `4,5`: low, `z=[0.1,0.3]`
+
+It is not all high balls, but the mid regions are broad enough that visual
+samples can look high-heavy.  Render fixed-region cases with:
+
+```bash
+MUJOCO_GL=egl MPLCONFIGDIR=/tmp/mpl python scripts/render_goalkeeper_regions.py \
+  --checkpoint src/assets/soccer/weight/model_repaired_lyk.pt \
+  --out-dir videos/keeper_regions \
+  --regions 0 1 2 3 4 5 \
+  --cases-per-region 3 \
+  --device cuda:0
+```

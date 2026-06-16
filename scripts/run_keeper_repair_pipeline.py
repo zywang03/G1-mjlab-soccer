@@ -59,10 +59,12 @@ class Cfg:
   collect_hours: float = 0.0
   collect_batches_per_shard: int = 8
   max_collect_shards: int = 999
+  distill_mode: str = "mlp"
   epochs: int = 40
   batch_size: int = 16384
   lr: float = 5.0e-4
   lr_final: float = 5.0e-5
+  residual_scale: float = 0.45
   seed: int = 2810
   continue_on_prove_failure: bool = False
 
@@ -283,28 +285,40 @@ def main(cfg: Cfg) -> None:
 
   if "distill" in selected:
     data_paths = collected_data or _existing_repair_data(cfg.repair_data)
+    if cfg.distill_mode not in ("mlp", "residual"):
+      raise ValueError("distill_mode must be 'mlp' or 'residual'")
+    distill_script = (
+      "distill_repairs.py"
+      if cfg.distill_mode == "mlp"
+      else "distill_ballistic_residual_repairs.py"
+    )
+    distill_args = [
+      sys.executable,
+      _script(distill_script),
+      "--data",
+      *data_paths,
+    ]
+    if cfg.distill_mode == "mlp":
+      distill_args.extend(["--resume", cfg.base])
+    else:
+      distill_args.extend(["--base", cfg.base, "--residual-scale", str(cfg.residual_scale)])
+    distill_args.extend([
+      "--out",
+      cfg.distilled_out,
+      "--epochs",
+      str(cfg.epochs),
+      "--batch-size",
+      str(cfg.batch_size),
+      "--lr",
+      str(cfg.lr),
+      "--lr-final",
+      str(cfg.lr_final),
+      "--device",
+      cfg.device,
+    ])
     _run(
       "distill repaired goalkeeper",
-      [
-        sys.executable,
-        _script("distill_repairs.py"),
-        "--data",
-        *data_paths,
-        "--resume",
-        cfg.base,
-        "--out",
-        cfg.distilled_out,
-        "--epochs",
-        str(cfg.epochs),
-        "--batch-size",
-        str(cfg.batch_size),
-        "--lr",
-        str(cfg.lr),
-        "--lr-final",
-        str(cfg.lr_final),
-        "--device",
-        cfg.device,
-      ],
+      distill_args,
       env,
     )
 
@@ -316,6 +330,7 @@ def main(cfg: Cfg) -> None:
         _script("diagnose_gk.py"),
         "--checkpoint",
         cfg.distilled_out,
+        *(["--ballistic-residual"] if cfg.distill_mode == "residual" else []),
         "--num-envs",
         str(cfg.num_envs),
         "--batches",
