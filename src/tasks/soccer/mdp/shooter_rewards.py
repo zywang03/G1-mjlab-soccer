@@ -599,7 +599,6 @@ def _goal_plane_crossing(
   out_crossed.zero_()
   out_in_goal.zero_()
   out_cross_pos.zero_()
-  out_target_err.zero_()
 
   # --- crossing detection ---
   ball = env.scene["ball"]

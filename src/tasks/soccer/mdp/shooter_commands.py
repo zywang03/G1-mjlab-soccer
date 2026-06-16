@@ -805,3 +805,120 @@ class MultiMotionSoccerCommandCfg(CommandTermCfg):
 
   def build(self, env: ManagerBasedRlEnv) -> MultiMotionSoccerCommand:
     return MultiMotionSoccerCommand(self, env)
+
+
+# -- Stage 3: adaptive goal-plane target sampling --------------------------------
+
+
+@dataclass(kw_only=True)
+class Stage3SoccerCommandCfg(MultiMotionSoccerCommandCfg):
+  """Stage 3 command config with adaptive goal-plane target bin sampling.
+
+  Inherits all Stage 2 fields.  Adds error-weighted adaptive target
+  selection so that poorly-hit x-regions are sampled more often.
+  Stage 2 behaviour is completely unaffected — only Stage 3 tasks
+  use this config class.
+  """
+
+  adaptive_target: bool = True
+  """If True, sample target_x bins weighted by historical EMA crossing error."""
+
+  target_bins: int = 11
+  """Number of equal-width bins across destination_length (default 11 × 0.2m)."""
+
+  target_alpha: float = 0.3
+  """EMA decay for per-bin error histogram."""
+
+  def build(self, env: ManagerBasedRlEnv) -> "Stage3SoccerCommand":
+    return Stage3SoccerCommand(self, env)
+
+
+class Stage3SoccerCommand(MultiMotionSoccerCommand):
+  """Stage 3 command term: adaptive goal-plane target point sampling.
+
+  Maintains a per-bin EMA failure histogram (binary: did the crossing
+  error exceed 0.3 m?) and biases ``target_x`` sampling toward
+  regions that haven't been mastered yet.  Once a bin's EMA drops
+  below the other bins, attention shifts to the next weakest region.
+
+  This mirrors Stage I's adaptive motion-phase sampling: binary
+  success/failure signal + EMA decay = natural attention shift.
+  """
+
+  cfg: Stage3SoccerCommandCfg
+
+  def __init__(self, cfg: Stage3SoccerCommandCfg, env: ManagerBasedRlEnv):
+    # Init adaptive state BEFORE super().__init__ — the parent calls
+    # _update_destination_points which dispatches to the overridden method.
+    self._device = env.device
+    self._num_envs = env.num_envs
+    self.destination_length = cfg.destination_length
+    self.destination_center = torch.tensor(cfg.destination_center, device=self._device)
+
+    half_len = self.destination_length / 2.0
+    self._bin_edges = torch.linspace(
+      -half_len, half_len, cfg.target_bins + 1, device=self._device,
+    )
+    self._bin_centers = (self._bin_edges[:-1] + self._bin_edges[1:]) / 2.0
+
+    # All bins start at 1.0 → equal probability → broad exploration.
+    self.target_error_hist = torch.full(
+      (cfg.target_bins,), 1.0, dtype=torch.float32, device=self._device,
+    )
+    self.target_bin_per_env = torch.full((self._num_envs,), -1, dtype=torch.long, device=self._device)
+
+    super().__init__(cfg, env)
+
+  def _record_previous_errors(self, env_ids: torch.Tensor):
+    """Save EMA from the just-completed episode BEFORE new bins are assigned.
+
+    Reads the cached ``goal_cross_cache_target_error`` (set by the
+    goal-plane crossing helper in ``shooter_rewards.py``) and updates
+    the bin histogram with a binary signal: 1.0 if error > 0.3 m,
+    0.0 otherwise.  EMA decay naturally shifts probability away from
+    bins that the policy has mastered.
+    """
+    target_err_name = self.kick_contact_tracker._tensor_name("goal_cross_cache_target_error")
+    target_err = getattr(self._env, target_err_name, None)
+    if target_err is None:
+      return
+
+    old_bins = self.target_bin_per_env[env_ids]
+    valid = old_bins >= 0
+    if not torch.any(valid):
+      return
+
+    b = old_bins[valid]
+    e = target_err[env_ids][valid].to(torch.float32)
+    # Binary signal: error > 0.3 m → "not yet mastered" (cf. curriculum pass criterion).
+    signal = (e > 0.3).to(torch.float32)
+
+    for i in range(len(b)):
+      idx = int(b[i].item())
+      self.target_error_hist[idx] = (
+        self.cfg.target_alpha * signal[i]
+        + (1.0 - self.cfg.target_alpha) * self.target_error_hist[idx]
+      )
+
+  def _update_destination_points(self, env_ids: torch.Tensor):
+    # 1. Record errors from the episode that just finished.
+    self._record_previous_errors(env_ids)
+
+    n = len(env_ids)
+    dev = self._device
+
+    if self.cfg.adaptive_target:
+      # Probabilities directly from EMA histogram (initial 1.0 → broad exploration).
+      probs = (self.target_error_hist + 1e-12) / (self.target_error_hist.sum() + self.target_error_hist.numel() * 1e-12)
+      bins = torch.multinomial(probs, n, replacement=True)
+      target_x = self._bin_centers[bins]
+      self.target_bin_per_env[env_ids] = bins
+    else:
+      target_x = (torch.rand(n, device=dev) - 0.5) * self.destination_length
+
+    dest = self.destination_center.expand(n, -1) + torch.stack(
+      [target_x,
+       torch.zeros(n, device=dev),
+       torch.zeros(n, device=dev)], dim=1,
+    )
+    self.target_destination_pos[env_ids] = dest

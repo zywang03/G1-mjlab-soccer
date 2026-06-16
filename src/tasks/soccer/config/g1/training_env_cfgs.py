@@ -15,6 +15,7 @@ from src.tasks.soccer.config.training.goalkeeper_env_cfg import make_goalkeeper_
 from src.tasks.soccer.config.training.stage1_env_cfg import make_stage1_env_cfg
 from src.tasks.soccer.config.training.stage2_env_cfg import make_stage2_env_cfg
 from src.tasks.soccer.config.training.stage3_env_cfg import make_stage3_env_cfg
+from src.tasks.soccer.config.training.stage4_env_cfg import make_stage4_env_cfg
 from src.tasks.soccer.mdp import MultiMotionSoccerCommandCfg
 
 import math
@@ -187,6 +188,30 @@ def unitree_g1_stage2_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 def unitree_g1_stage3_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """G1 shooter Stage III: goal-plane accuracy + speed curriculum."""
   cfg = make_stage3_env_cfg()
+  cfg.scene.entities["robot"] = _g1_robot_at(tuple(SETTINGS.scene.shooter_pos), 0.0)
+  _setup_g1_training(cfg)
+
+  if play:
+    cfg.episode_length_s = int(1e9)
+    cfg.observations["actor"].enable_corruption = False
+    cfg.events.pop("push_robot", None)
+    for key in ("anchor_pos_z", "anchor_ori", "ee_body_pos"):
+      cfg.terminations.pop(key, None)
+    from src.tasks.soccer.mdp.shooter_commands import MultiMotionSoccerCommandCfg
+    motion_cmd = cfg.commands.get("motion")
+    if isinstance(motion_cmd, MultiMotionSoccerCommandCfg):
+      motion_cmd.debug_vis = True
+      motion_cmd.sampling_mode = "uniform"
+      motion_cmd.pose_range = {}
+      motion_cmd.velocity_range = {}
+      motion_cmd.joint_position_range = (0.0, 0.0)
+
+  return cfg
+
+
+def unitree_g1_stage4_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 shooter Stage IV: high-speed goal-plane accuracy (target 10 m/s)."""
+  cfg = make_stage4_env_cfg()
   cfg.scene.entities["robot"] = _g1_robot_at(tuple(SETTINGS.scene.shooter_pos), 0.0)
   _setup_g1_training(cfg)
 
