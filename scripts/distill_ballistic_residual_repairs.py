@@ -44,12 +44,34 @@ class Cfg:
   residual_l2: float = 1.0e-4
   val_frac: float = 0.02
   blocked_only: bool = True
+  max_frames_per_file: int = 0  # 0 disables per-shard subsampling
+  max_frames: int = 0           # 0 disables global subsampling after concatenation
   seed: int = 2810
   device: str = "cuda:0"
 
 
-def _load_data(paths: tuple[str, ...], blocked_only: bool) -> tuple[torch.Tensor, torch.Tensor]:
+def _subsample(
+  obs: torch.Tensor,
+  act: torch.Tensor,
+  max_frames: int,
+  gen: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  if max_frames <= 0 or obs.shape[0] <= max_frames:
+    return obs, act
+  idx = torch.randperm(obs.shape[0], generator=gen)[:max_frames]
+  return obs[idx], act[idx]
+
+
+def _load_data(
+  paths: tuple[str, ...],
+  blocked_only: bool,
+  max_frames_per_file: int,
+  max_frames: int,
+  seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
   obs_parts, act_parts = [], []
+  gen = torch.Generator(device="cpu")
+  gen.manual_seed(seed)
   for path in paths:
     data = torch.load(path, map_location="cpu", weights_only=False)
     obs = data["obs"]
@@ -58,10 +80,13 @@ def _load_data(paths: tuple[str, ...], blocked_only: bool) -> tuple[torch.Tensor
       mask = data["blocked"].bool()
       obs = obs[mask]
       act = act[mask]
+    obs, act = _subsample(obs, act, max_frames_per_file, gen)
     obs_parts.append(obs)
     act_parts.append(act)
     print(f"  loaded {path}: {obs.shape[0]} frames (blocked_only={blocked_only})", flush=True)
-  return torch.cat(obs_parts), torch.cat(act_parts)
+  obs = torch.cat(obs_parts)
+  act = torch.cat(act_parts)
+  return _subsample(obs, act, max_frames, gen)
 
 
 def main(cfg: Cfg) -> None:
@@ -69,7 +94,13 @@ def main(cfg: Cfg) -> None:
   torch.manual_seed(cfg.seed)
   dev = cfg.device
 
-  X, Y = _load_data(cfg.data, cfg.blocked_only)
+  X, Y = _load_data(
+    cfg.data,
+    cfg.blocked_only,
+    cfg.max_frames_per_file,
+    cfg.max_frames,
+    cfg.seed,
+  )
   n = X.shape[0]
   print(f"[INFO] total {n} pairs, obs {X.shape[1]}, act {Y.shape[1]}", flush=True)
 

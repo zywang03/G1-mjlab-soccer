@@ -65,6 +65,8 @@ class Cfg:
   lr: float = 5.0e-4
   lr_final: float = 5.0e-5
   residual_scale: float = 0.45
+  distill_max_frames_per_file: int = 0
+  distill_max_frames: int = 0
   seed: int = 2810
   continue_on_prove_failure: bool = False
 
@@ -302,6 +304,10 @@ def main(cfg: Cfg) -> None:
       distill_args.extend(["--resume", cfg.base])
     else:
       distill_args.extend(["--base", cfg.base, "--residual-scale", str(cfg.residual_scale)])
+      if cfg.distill_max_frames_per_file > 0:
+        distill_args.extend(["--max-frames-per-file", str(cfg.distill_max_frames_per_file)])
+      if cfg.distill_max_frames > 0:
+        distill_args.extend(["--max-frames", str(cfg.distill_max_frames)])
     distill_args.extend([
       "--out",
       cfg.distilled_out,
