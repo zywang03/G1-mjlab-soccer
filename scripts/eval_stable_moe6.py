@@ -31,6 +31,7 @@ class Cfg:
   num_envs: int = 256
   batches: int = 16
   steps: int = 150
+  episode_length_s: float = 0.0
   seed: int = 2810
   z_low: float = 0.85
   z_up: float = 1.35
@@ -91,9 +92,20 @@ def main(cfg: Cfg) -> None:
   env_cfg = load_env_cfg("Eval-Goalkeeper", play=False)
   env_cfg.scene.num_envs = cfg.num_envs
   env_cfg.seed = cfg.seed
+  if cfg.episode_length_s > 0.0:
+    env_cfg.episode_length_s = cfg.episode_length_s
   if "fell_over" in env_cfg.terminations:
     env_cfg.terminations["fell_over"] = None
   env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device), clip_actions=100.0)
+  steps = cfg.steps
+  max_steps = int(getattr(env.unwrapped, "max_episode_length", 0))
+  if max_steps > 0 and steps >= max_steps:
+    steps = max(1, max_steps - 1)
+    print(
+      f"[WARN] --steps reached timeout ({max_steps}); using {steps}. "
+      "Set --episode-length-s larger for long recovery eval.",
+      flush=True,
+    )
 
   experts = [_load_policy(env, path, device) for path in _expert_paths(cfg)]
   if cfg.mirror_map:
@@ -147,7 +159,7 @@ def main(cfg: Cfg) -> None:
         if hasattr(env.unwrapped, "_gk_region")
         else torch.zeros(num_envs, dtype=torch.long, device=device)
       )
-      for _ in range(cfg.steps):
+      for _ in range(steps):
         region, valid = gate_region()
         new_latch = valid & (latched < 0)
         latched = torch.where(new_latch, region, latched)

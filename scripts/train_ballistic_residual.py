@@ -63,6 +63,8 @@ class Cfg:
   block_iters: int = 20
   blocks: int = 40
   eval_resets: int = 3
+  eval_steps: int = 150
+  episode_length_s: float = 0.0
   lr: float = 1.0e-4
   std: float = 0.06
   residual_scale: float = 0.0
@@ -241,6 +243,8 @@ def main(cfg: Cfg) -> None:
   env_cfg = load_env_cfg("Eval-Goalkeeper", play=False)
   env_cfg.scene.num_envs = cfg.num_envs
   env_cfg.seed = cfg.seed
+  if cfg.episode_length_s > 0.0:
+    env_cfg.episode_length_s = cfg.episode_length_s
   if cfg.train_regions and cfg.region_weights:
     raise ValueError("Use either train_regions or region_weights, not both.")
   if "fell_over" in env_cfg.terminations:
@@ -295,6 +299,15 @@ def main(cfg: Cfg) -> None:
     ManagerBasedRlEnv(cfg=env_cfg, device=dev),
     clip_actions=100.0,
   )
+  eval_steps = cfg.eval_steps
+  max_steps = int(getattr(env.unwrapped, "max_episode_length", 0))
+  if max_steps > 0 and eval_steps >= max_steps:
+    eval_steps = max(1, max_steps - 1)
+    print(
+      f"[WARN] --eval-steps reached timeout ({max_steps}); using {eval_steps}. "
+      "Set --episode-length-s larger for long recovery eval.",
+      flush=True,
+    )
 
   import src.tasks.soccer.modules.gk_ballistic_residual as gkbr
 
@@ -350,6 +363,7 @@ def main(cfg: Cfg) -> None:
     env,
     policy,
     ball,
+    n_steps=eval_steps,
     n_resets=cfg.eval_resets,
     stable_save_weight=cfg.stable_save_weight,
     upright_gravity_z=cfg.upright_gravity_z,
@@ -398,6 +412,7 @@ def main(cfg: Cfg) -> None:
       env,
       policy,
       ball,
+      n_steps=eval_steps,
       n_resets=cfg.eval_resets,
       stable_save_weight=cfg.stable_save_weight,
       upright_gravity_z=cfg.upright_gravity_z,
