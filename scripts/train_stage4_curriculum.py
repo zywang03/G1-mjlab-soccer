@@ -70,8 +70,8 @@ class CurriculumConfig:
   motion_dir: str
   min_iters: int = 3000
   max_attempts: int = 3
-  num_trials: int = 50
-  num_eval_envs: int = 64
+  num_trials: int = 5000
+  num_eval_envs: int = 2048
   gpu_ids: list[int] | str | None = field(default_factory=lambda: [0])
   env_num_envs: int = 4096
   skip_eval_check: bool = False
@@ -121,7 +121,8 @@ def _run_train(cfg: CurriculumConfig, ckpt_path: str, phase: CurriculumPhase,
   return run_dirs[-1]
 
 
-def _run_eval(ckpt_path: Path, num_trials: int, num_envs: int) -> dict[str, Any]:
+def _run_eval(ckpt_path: Path, num_trials: int, num_envs: int,
+              run_dir: Path | None = None) -> dict[str, Any]:
   with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
     json_path = f.name
 
@@ -134,6 +135,8 @@ def _run_eval(ckpt_path: Path, num_trials: int, num_envs: int) -> dict[str, Any]
     "--num-envs", str(num_envs),
     "--summary-json", json_path,
   ]
+  if run_dir is not None:
+    cmd.extend(["--save-npz", str(run_dir / "eval_trials.npz")])
 
   print(f"\n[EVAL] checkpoint={ckpt_path.name}")
   print(f"[EVAL] {' '.join(cmd)}\n", flush=True)
@@ -221,7 +224,7 @@ def main():
       run_name = f"stage4_{phase_label}_att{attempt}"
       run_dir = _run_train(args, current_ckpt, phase, run_name)
       latest_ckpt = _find_latest_checkpoint(run_dir)
-      metrics = _run_eval(latest_ckpt, args.num_trials, args.num_eval_envs)
+      metrics = _run_eval(latest_ckpt, args.num_trials, args.num_eval_envs, run_dir)
 
       print(f"\n  [Phase {i+1} attempt {attempt}] Eval metrics:")
       _print_metrics(metrics, phase)

@@ -58,6 +58,7 @@ class EvalConfig:
   video_height: int = 480
   video_width: int = 640
   summary_json: str | None = None
+  save_npz: str | None = None
 
 
 class ZeroPolicy:
@@ -389,6 +390,10 @@ def run_eval(cfg: EvalConfig):
     trial_offset += take
     remaining -= take
 
+    import gc
+    torch.cuda.empty_cache()
+    gc.collect()
+
   merged = {k: torch.cat(v, dim=0) for k, v in all_metrics.items()}
   summary = _summarise(merged)
 
@@ -414,6 +419,22 @@ def run_eval(cfg: EvalConfig):
     out = Path(cfg.summary_json)
     out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"[INFO] Wrote summary to: {out.resolve()}")
+
+  if cfg.save_npz:
+    import numpy as np
+    from pathlib import Path
+    npz_path = Path(cfg.save_npz)
+    npz_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(npz_path,
+      kick_speed=merged["kick_speed"].numpy(),
+      target_error=merged["target_error"].numpy(),
+      goal_scored=merged["goal"].numpy(),
+      cross_recorded=merged["cross_recorded"].numpy(),
+      kick_accuracy=merged["kick_accuracy"].numpy(),
+      cross_pos_z=merged["cross_pos_z"].numpy(),
+      abs_z_speed=merged["abs_z_speed"].numpy(),
+    )
+    print(f"[INFO] Saved per-trial metrics to: {npz_path.resolve()}")
 
   env.close()
 
