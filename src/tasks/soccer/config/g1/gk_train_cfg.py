@@ -69,3 +69,23 @@ def goalkeeper_ballistic_residual_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   cfg.experiment_name = "g1_goalkeeper_ballistic_residual"
   cfg.save_interval = 50
   return cfg
+
+
+def goalkeeper_lstm_student_runner_cfg() -> RslRlOnPolicyRunnerCfg:
+  """Runner config for a single recurrent goalkeeper student policy."""
+  cfg = goalkeeper_train_runner_cfg()
+  cfg.actor.class_name = "src.tasks.soccer.modules.gk_lstm_student.GoalkeeperLSTMStudent"
+  cfg.actor.hidden_dims = (256, 128)
+  cfg.actor.distribution_cfg = {
+    "class_name": "GaussianDistribution",
+    "init_std": 0.05,
+    "std_type": "scalar",
+  }
+  cfg.critic.hidden_dims = (512, 256, 256)
+  cfg.algorithm.entropy_coef = 0.0
+  cfg.algorithm.clip_param = 0.08
+  cfg.algorithm.learning_rate = 3.0e-4
+  cfg.algorithm.desired_kl = 0.005
+  cfg.experiment_name = "g1_goalkeeper_lstm_student"
+  cfg.save_interval = 50
+  return cfg

@@ -231,6 +231,7 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
             from mjlab.rl import MjlabOnPolicyRunner
             from src.tasks.soccer.config.g1.gk_train_cfg import (
                 goalkeeper_ballistic_residual_runner_cfg,
+                goalkeeper_lstm_student_runner_cfg,
                 goalkeeper_train_runner_cfg,
             )
 
@@ -243,6 +244,9 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
                 gkbr.BASE_HIDDEN = tuple(meta.get("base_hidden", (1024, 512, 256)))
                 gkbr.RESIDUAL_SCALE = float(meta.get("residual_scale", 0.25))
                 agent_cfg = goalkeeper_ballistic_residual_runner_cfg()
+            elif loaded.get("goalkeeper_lstm_student"):
+                print("[INFO] Detected recurrent goalkeeper student checkpoint — loading.")
+                agent_cfg = goalkeeper_lstm_student_runner_cfg()
             else:
                 print("[INFO] Detected native MLP goalkeeper checkpoint — loading.")
                 agent_cfg = goalkeeper_train_runner_cfg()

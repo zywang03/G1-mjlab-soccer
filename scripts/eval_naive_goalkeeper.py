@@ -99,6 +99,7 @@ def _load_policy(checkpoint_path: str, env, device: str):
     from mjlab.rl import MjlabOnPolicyRunner
     from src.tasks.soccer.config.g1.gk_train_cfg import (
       goalkeeper_ballistic_residual_runner_cfg,
+      goalkeeper_lstm_student_runner_cfg,
       goalkeeper_train_runner_cfg,
     )
     meta = loaded.get("ballistic_residual")
@@ -110,6 +111,9 @@ def _load_policy(checkpoint_path: str, env, device: str):
       gkbr.BASE_HIDDEN = tuple(meta.get("base_hidden", (1024, 512, 256)))
       gkbr.RESIDUAL_SCALE = float(meta.get("residual_scale", 0.25))
       agent_cfg = goalkeeper_ballistic_residual_runner_cfg()
+    elif loaded.get("goalkeeper_lstm_student"):
+      print("[INFO] Detected recurrent goalkeeper student checkpoint — loading.")
+      agent_cfg = goalkeeper_lstm_student_runner_cfg()
     else:
       agent_cfg = goalkeeper_train_runner_cfg()
     runner = MjlabOnPolicyRunner(env, asdict(agent_cfg), device=device)
