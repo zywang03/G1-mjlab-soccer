@@ -230,7 +230,9 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
         else:
             from mjlab.rl import MjlabOnPolicyRunner
             from src.tasks.soccer.config.g1.gk_train_cfg import (
+                GoalkeeperRecurrentRunner,
                 goalkeeper_ballistic_residual_runner_cfg,
+                goalkeeper_lstm_ppo_runner_cfg,
                 goalkeeper_lstm_student_runner_cfg,
                 goalkeeper_train_runner_cfg,
             )
@@ -247,6 +249,21 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
             elif loaded.get("goalkeeper_lstm_student"):
                 print("[INFO] Detected recurrent goalkeeper student checkpoint — loading.")
                 agent_cfg = goalkeeper_lstm_student_runner_cfg()
+            elif (
+                loaded.get("goalkeeper_lstm_ppo")
+                or "lstm" in str(checkpoint_path).lower()
+                or any(
+                    ".rnn." in key or key.startswith("rnn.")
+                    for key in loaded.get("actor_state_dict", {})
+                )
+            ):
+                print("[INFO] Detected pure recurrent goalkeeper PPO checkpoint — loading.")
+                agent_cfg = goalkeeper_lstm_ppo_runner_cfg()
+                runner = GoalkeeperRecurrentRunner(env, asdict(agent_cfg), device=device)
+                runner.load(checkpoint_path, load_cfg={"actor": True})
+                policy = runner.get_inference_policy(device=device)
+                print(f"[INFO] Policy loaded from: {checkpoint_path}")
+                return policy, env
             else:
                 print("[INFO] Detected native MLP goalkeeper checkpoint — loading.")
                 agent_cfg = goalkeeper_train_runner_cfg()
