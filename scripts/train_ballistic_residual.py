@@ -67,6 +67,7 @@ class Cfg:
   std: float = 0.06
   residual_scale: float = 0.0
   region_weights: tuple[float, ...] = ()
+  train_regions: tuple[int, ...] = ()
   bc_data: tuple[str, ...] = ()
   bc_coef: float = 0.0
   bc_coef_final: float = 0.0
@@ -113,6 +114,22 @@ def _set_region_weights(env, weights: tuple[float, ...]) -> tuple[float, ...]:
   old = tuple(getattr(vc, "region_weights", ()))
   vc.region_weights = tuple(weights)
   return old
+
+
+def _restrict_train_regions(env_cfg, train_regions: tuple[int, ...]) -> None:
+  if not train_regions:
+    return
+  bad = [r for r in train_regions if r < 0 or r > 5]
+  if bad:
+    raise ValueError(f"train_regions must be in [0, 5], got {bad}")
+  import copy
+
+  reset_ball = env_cfg.events["reset_ball"]
+  vel_cfg = copy.copy(reset_ball.params["vel_cfg"])
+  vel_cfg.regions = [vel_cfg.regions[i] for i in train_regions]
+  vel_cfg.region_weights = ()
+  reset_ball.params["vel_cfg"] = vel_cfg
+  print(f"[INFO] specialist training on global regions {tuple(train_regions)}", flush=True)
 
 
 def _eval(
@@ -224,8 +241,11 @@ def main(cfg: Cfg) -> None:
   env_cfg = load_env_cfg("Eval-Goalkeeper", play=False)
   env_cfg.scene.num_envs = cfg.num_envs
   env_cfg.seed = cfg.seed
+  if cfg.train_regions and cfg.region_weights:
+    raise ValueError("Use either train_regions or region_weights, not both.")
   if "fell_over" in env_cfg.terminations:
     env_cfg.terminations["fell_over"] = None
+  _restrict_train_regions(env_cfg, cfg.train_regions)
   env_cfg.rewards = {
     "goal_conceded": RewardTermCfg(
       func=goalkeeper_goal_conceded,
@@ -355,6 +375,8 @@ def main(cfg: Cfg) -> None:
       "upright_gravity_z": cfg.upright_gravity_z,
       "final_ang_vel_xy": cfg.final_ang_vel_xy,
     }
+    if cfg.train_regions:
+      saved["train_regions"] = tuple(cfg.train_regions)
     torch.save(saved, cfg.out)
 
   _save_best(best)
