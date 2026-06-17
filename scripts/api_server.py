@@ -202,7 +202,15 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
     print(f"[INFO] Action dim: {env.num_actions}")
 
     if task_id == "Eval-Goalkeeper":
-        loaded = torch.load(checkpoint_path, map_location=device)
+        loaded = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        if isinstance(loaded, dict) and loaded.get("moe6"):
+            from src.tasks.soccer.modules.gk_moe6 import GoalkeeperMoE6Policy
+
+            print("[INFO] Detected MoE6 checkpoint bundle — loading mixture-of-experts.")
+            policy = GoalkeeperMoE6Policy(loaded, env, device)
+            print(f"[INFO] Policy loaded from: {checkpoint_path}")
+            return policy, env
 
         if "model_state_dict" in loaded:
             from src.tasks.soccer.config.g1.rl_cfg import (
@@ -308,6 +316,9 @@ def create_app(checkpoint_path: str, task_id: str, device: str) -> FastAPI:
         stacked = stacked.to(device=device, dtype=torch.float32)
 
         with torch.inference_mode():
+            set_raw_ball_state = getattr(policy, "set_raw_ball_state", None)
+            if set_raw_ball_state is not None:
+                set_raw_ball_state(raw_state["ball"]["pos"], raw_state["ball"]["vel"])
             action = policy({"actor": stacked})
 
         return ActResponse(action=action.cpu().tolist())

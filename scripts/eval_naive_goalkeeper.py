@@ -77,6 +77,14 @@ def _load_policy(checkpoint_path: str, env, device: str):
   print(f"[INFO] Loading policy from: {checkpoint_path}")
   loaded = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
+  if isinstance(loaded, dict) and loaded.get("moe6"):
+    print("[INFO] Detected MoE6 checkpoint bundle — loading mixture-of-experts.")
+    from src.tasks.soccer.modules.gk_moe6 import GoalkeeperMoE6Policy
+
+    policy = GoalkeeperMoE6Policy(loaded, env, device)
+    print("[INFO] Policy loaded successfully.")
+    return policy
+
   if "model_state_dict" in loaded:
     # Reference Humanoid-Goalkeeper checkpoint: a single unified HIMPPO
     # ActorCritic. Load it directly into GoalkeeperRunner's custom model.
@@ -179,6 +187,9 @@ def run_headless_eval(cfg: EvalConfig, env, policy):
   blocked_count = 0
 
   for trial in range(cfg.num_trials):
+    reset = getattr(policy, "reset", None)
+    if reset is not None:
+      reset()
     stats = run_trial(env, policy)
     if not stats["ball_entered_goal"]:
       blocked_count += 1
