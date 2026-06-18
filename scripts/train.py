@@ -85,6 +85,7 @@ class TrainConfig:
   video_interval: int = 2000
   enable_nan_guard: bool = False
   load_actor_only: bool = False
+  load_model_only: bool = False
   load_checkpoint_path: str | None = None
   torchrunx_log_dir: str | None = None
   gpu_ids: list[int] | Literal["all"] | None = field(default_factory=lambda: [0])
@@ -222,6 +223,11 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
       runner.load(
         str(resume_path),
         load_cfg={"actor": True, "critic": False, "optimizer": False, "iteration": False},
+      )
+    elif cfg.load_model_only:
+      runner.load(
+        str(resume_path),
+        load_cfg={"actor": True, "critic": True, "optimizer": False, "iteration": False},
       )
     else:
       runner.load(str(resume_path))

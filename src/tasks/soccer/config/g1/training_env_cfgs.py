@@ -16,6 +16,7 @@ from src.tasks.soccer.config.training.stage1_env_cfg import make_stage1_env_cfg
 from src.tasks.soccer.config.training.stage2_env_cfg import make_stage2_env_cfg
 from src.tasks.soccer.config.training.stage3_env_cfg import make_stage3_env_cfg
 from src.tasks.soccer.config.training.stage4_env_cfg import make_stage4_env_cfg
+from src.tasks.soccer.config.training.stage5_env_cfg import make_stage5_env_cfg
 from src.tasks.soccer.mdp import MultiMotionSoccerCommandCfg
 
 import math
@@ -229,6 +230,46 @@ def unitree_g1_stage4_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       motion_cmd.pose_range = {}
       motion_cmd.velocity_range = {}
       motion_cmd.joint_position_range = (0.0, 0.0)
+
+  return cfg
+
+
+def unitree_g1_stage5_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 shooter Stage V: compete-aligned coordinates + full-goal accuracy."""
+  cfg = make_stage5_env_cfg()
+  cfg.scene.entities["robot"] = _g1_robot_at((4.0, 0.0, 0.8), math.pi)
+  _setup_g1_training(cfg)
+
+  if play:
+    cfg.episode_length_s = int(1e9)
+    for key in ("anchor_pos_z", "anchor_ori", "ee_body_pos"):
+      cfg.terminations.pop(key, None)
+    from src.tasks.soccer.mdp.shooter_commands import MultiMotionSoccerCommandCfg
+    motion_cmd = cfg.commands.get("motion")
+    if isinstance(motion_cmd, MultiMotionSoccerCommandCfg):
+      motion_cmd.debug_vis = True
+      motion_cmd.sampling_mode = "uniform"
+
+  return cfg
+
+
+def unitree_g1_stage6_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 shooter Stage VI: high-speed compete-aligned kicking."""
+  from src.tasks.soccer.config.training.stage6_env_cfg import make_stage6_env_cfg
+
+  cfg = make_stage6_env_cfg()
+  cfg.scene.entities["robot"] = _g1_robot_at((4.0, 0.0, 0.8), math.pi)
+  _setup_g1_training(cfg)
+
+  if play:
+    cfg.episode_length_s = int(1e9)
+    for key in ("anchor_pos_z", "anchor_ori", "ee_body_pos"):
+      cfg.terminations.pop(key, None)
+    from src.tasks.soccer.mdp.shooter_commands import MultiMotionSoccerCommandCfg
+    motion_cmd = cfg.commands.get("motion")
+    if isinstance(motion_cmd, MultiMotionSoccerCommandCfg):
+      motion_cmd.debug_vis = True
+      motion_cmd.sampling_mode = "uniform"
 
   return cfg
 

@@ -32,7 +32,7 @@ import random
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -107,8 +107,100 @@ def _load_motions(motion_dir: str, device: str) -> list[MotionData]:
 
 
 # ---------------------------------------------------------------------------
+# Kick frame map — measured by analyze_kick_timing.py with 50 trials/motion.
+# All motions kick consistently at frame 26-30 (0.52-0.60s), std=0.
+# ---------------------------------------------------------------------------
+
+_KICK_FRAME_MAP: dict[str, dict[str, int | float]] = {
+    "soccer-standard-001_right.npz": {"total_frames": 260, "kick_frame": 27},
+    "soccer-standard-002_left.npz":  {"total_frames": 214, "kick_frame": 29},
+    "soccer-standard-003_left.npz":  {"total_frames": 289, "kick_frame": 30},
+    "soccer-standard-004_right.npz": {"total_frames": 257, "kick_frame": 27},
+    "soccer-standard-005_right.npz": {"total_frames": 230, "kick_frame": 26},
+    "soccer-standard-006_right.npz": {"total_frames": 225, "kick_frame": 27},
+    "soccer-standard-007_left.npz":  {"total_frames": 229, "kick_frame": 29},
+    "soccer-standard-008_left.npz":  {"total_frames": 225, "kick_frame": 29},
+    "soccer-standard-009_right.npz": {"total_frames": 205, "kick_frame": 27},
+    "soccer-standard-010_right.npz": {"total_frames": 230, "kick_frame": 27},
+}
+
+
+# ---------------------------------------------------------------------------
 # Observation computation  (CUSTOMIZE: match your training observation space)
 # ---------------------------------------------------------------------------
+
+def _plan_destination(gk_y: float) -> float:
+    """基于守门员 y 位置决策射门目标 y。
+
+    Strategy:
+      - GK 在左 (y < -0.3) → 射右侧全区域
+      - GK 在右 (y > +0.3) → 射左侧全区域
+      - GK 在中间 (|y| ≤ 0.3) → 全门均匀随机
+
+    射门覆盖范围 [0.3, 1.4] 覆盖球门 93% 宽度 (球门 ±1.5m)。
+    """
+    THRESHOLD = 0.3
+    if gk_y < -THRESHOLD:
+        return random.uniform(0.3, 1.4)
+    elif gk_y > THRESHOLD:
+        return random.uniform(-1.4, -0.3)
+    else:
+        return random.uniform(-1.4, 1.4)
+
+
+def _select_motion_for_dest(dest_y: float, motions: list[MotionData]) -> MotionData:
+    """根据目标位置 y 选最优 right-leg motion。
+
+    映射来自 motion analysis 评测数据（5000 trials/pair）：
+      - y < -0.7:        006_right — 速度 16.2m/s, err 0.10m  (左远角)
+      - -0.7 ≤ y < -0.3: 009_right — 速度 14.2m/s, err 0.35m  (左中)
+      - |y| ≤ 0.3:       010_right — 速度 16.4m/s, err 0.11m  (正中)
+      - 0.3 < y ≤ 0.7:   005_right — 速度 12.1m/s, err 0.006m (右中)
+      - y > 0.7:         005_right — 速度 15.7m/s, err 0.64m  (右远角)
+
+    随 dest_y 扩展，函数确保覆盖 [-1.4, 1.4] 全范围。
+    """
+    PATTERNS: list[tuple[float, float, str]] = [
+        (-1.5, -0.7, "006_right.npz"),   # 左远角
+        (-0.7, -0.3, "009_right.npz"),   # 左中
+        (-0.3,  0.3, "010_right.npz"),   # 正中
+        ( 0.3,  0.7, "005_right.npz"),   # 右中
+        ( 0.7,  1.5, "005_right.npz"),   # 右远角
+    ]
+    for lo, hi, suffix in PATTERNS:
+        if lo <= dest_y <= hi:
+            for m in motions:
+                if m.name.endswith(suffix):
+                    return m
+    for m in motions:
+        if "005_right" in m.name:
+            return m
+    return motions[0]
+
+
+def _should_lock(gk_y_history: list[float], motion_name: str,
+                 min_observe: int = 5, commit_threshold: float = 0.3) -> bool:
+    """Returns True when we should lock the destination.
+
+    Conditions:
+      1. GK has visibly committed to one side for min_observe frames → lock early
+      2. We've reached 60% of kick_frame deadline → lock by force
+    """
+    if len(gk_y_history) < min_observe:
+        return False
+
+    kick_info = _KICK_FRAME_MAP.get(motion_name, {"kick_frame": 27})
+    deadline = int(kick_info["kick_frame"] * 0.6)
+
+    if len(gk_y_history) >= deadline:
+        return True
+
+    recent = gk_y_history[-min_observe:]
+    if abs(recent[-1]) >= commit_threshold:
+        return True
+
+    return False
+
 
 def compute_shooter_obs(
     raw_state: dict,
@@ -288,6 +380,7 @@ def create_app(
     task_id: str,
     device: str,
     motion_dir: str,
+    strategy: str = "gk-aware",
 ) -> FastAPI:
     """Build the FastAPI app with a loaded policy and motion data."""
 
@@ -308,11 +401,15 @@ def create_app(
 
     if not is_gk:
         motions = _load_motions(motion_dir, device)
-        motion_ctx["motion"] = motions[0]  # placeholder, overwritten on /reset
+        motion_ctx["motion"] = motions[0]  # placeholder, overwritten on first /act
+
+    # Track whether destination has been planned for current episode.
+    shoot_planned: dict[str, bool] = {"done": False}
+    gk_y_history: list[float] = []  # gk-aware observation buffer
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        print(f"[INFO] Server ready — {task_id} policy on {device}")
+        print(f"[INFO] Server ready — {task_id} policy on {device}  (strategy={strategy})")
         yield
         env.close()
         print("[INFO] Server shutting down.")
@@ -327,10 +424,19 @@ def create_app(
 
     @app.post("/act", response_model=ActResponse)
     async def act(req: dict):
+        nonlocal shoot_planned, gk_y_history
         raw_state = req
         if is_gk:
             frame = compute_goalkeeper_obs(raw_state)
         else:
+            if strategy == "gk-aware" and not shoot_planned["done"]:
+                gk_root = raw_state["goalkeeper"]["root_pos"]
+                gk_y_history.append(gk_root[1])
+                if _should_lock(gk_y_history, motion_ctx["motion"].name):
+                    avg_gk_y = sum(gk_y_history) / len(gk_y_history)
+                    dest_y = _plan_destination(avg_gk_y)
+                    motion_ctx["destination"] = (-0.5, dest_y, 0.11)
+                    shoot_planned["done"] = True
             m = motion_ctx["motion"]
             frame = compute_shooter_obs(raw_state, m, motion_ctx["time_step"], motion_ctx["destination"], device)
             motion_ctx["time_step"] += 1
@@ -349,13 +455,27 @@ def create_app(
 
     @app.post("/reset")
     async def reset():
+        nonlocal shoot_planned, gk_y_history
         if is_gk:
             policy.reset()
         else:
-            motion_ctx["motion"] = random.choice(motions)
             motion_ctx["time_step"] = 0
-            dest_y = random.uniform(-1.1, 1.1)
-            motion_ctx["destination"] = (-0.5, dest_y, 0.11)
+            if strategy == "uniform":
+                motion_ctx["motion"] = random.choice(motions)
+                dest_y = random.uniform(-1.4, 1.4)
+                motion_ctx["destination"] = (-0.5, dest_y, 0.11)
+                shoot_planned["done"] = True
+            elif strategy == "best-motion":
+                dest_y = random.uniform(-1.4, 1.4)
+                motion_ctx["destination"] = (-0.5, dest_y, 0.11)
+                motion_ctx["motion"] = _select_motion_for_dest(dest_y, motions)
+                shoot_planned["done"] = True
+            else:  # gk-aware
+                right_motions = [m for m in motions if "right" in m.name]
+                motion_ctx["motion"] = random.choice(right_motions) if right_motions else motions[0]
+                motion_ctx["destination"] = (-0.5, 0.0, 0.11)
+                shoot_planned["done"] = False
+                gk_y_history.clear()
             policy.reset()
         history.clear()
         return {"status": "ok"}
@@ -381,6 +501,11 @@ class ServerConfig:
     """Torch device (auto-detected if omitted)."""
     motion_dir: str = "thirdparty/G1-mjlab-soccer/src/assets/soccer/motions/shooter"
     """Directory containing soccer-standard-*.npz motion files."""
+    strategy: Literal["uniform", "best-motion", "gk-aware"] = "gk-aware"
+    """Shooting strategy:
+       - uniform:    随机 motion + 随机目标 (原始行为)
+       - best-motion: 随机目标 + 该目标最优 right-leg motion
+       - gk-aware:    根据 GK 位置避开射远角 + 最优 motion (默认)"""
 
 
 def main():
@@ -388,10 +513,10 @@ def main():
 
     args = tyro.cli(ServerConfig, prog="api_server")
 
-    task_id = "Eval-Shooter" if args.task == "shooter" else "Eval-Goalkeeper"
+    task_id = "Eval-Shooter-Stage6" if args.task == "shooter" else "Eval-Goalkeeper"
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    app = create_app(args.checkpoint, task_id, device, args.motion_dir)
+    app = create_app(args.checkpoint, task_id, device, args.motion_dir, args.strategy)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
