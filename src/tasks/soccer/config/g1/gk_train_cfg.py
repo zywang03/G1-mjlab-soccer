@@ -110,7 +110,7 @@ def goalkeeper_lstm_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       obs_normalization=False,
       distribution_cfg={
         "class_name": "GaussianDistribution",
-        "init_std": 0.8,
+        "init_std": 0.45,
         "std_type": "scalar",
       },
       class_name="RNNModel",
@@ -128,7 +128,7 @@ def goalkeeper_lstm_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       entropy_coef=0.005,
       num_learning_epochs=5,
       num_mini_batches=4,
-      learning_rate=5.0e-4,
+      learning_rate=3.0e-4,
       schedule="adaptive",
       gamma=0.99,
       lam=0.95,
@@ -136,7 +136,7 @@ def goalkeeper_lstm_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       max_grad_norm=1.0,
     ),
     experiment_name="g1_goalkeeper_lstm_ppo",
-    save_interval=100,
+    save_interval=50,
     num_steps_per_env=24,
     max_iterations=12000,
   )
