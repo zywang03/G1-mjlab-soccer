@@ -10,7 +10,13 @@ from src.tasks.soccer.config.eval.eval_goalkeeper_cfg import eval_goalkeeper_env
 from src.tasks.soccer.config.eval.eval_shooter_cfg import eval_shooter_env_cfg
 from src.tasks.soccer.config.eval.eval_shooter_stage3_cfg import eval_shooter_stage3_env_cfg
 from src.tasks.soccer.config.eval.eval_shooter_stage4_cfg import eval_shooter_stage4_env_cfg
-from src.tasks.soccer.config.g1.rl_cfg import unitree_g1_soccer_ppo_runner_cfg
+from src.tasks.soccer.config.eval.eval_shooter_stage5_cfg import eval_shooter_stage5_env_cfg
+from src.tasks.soccer.config.eval.eval_shooter_stage6_cfg import eval_shooter_stage6_env_cfg
+from src.tasks.soccer.config.g1.rl_cfg import (
+    SoccerRecurrentRunner,
+    unitree_g1_soccer_ppo_runner_cfg,
+    unitree_g1_soccer_recurrent_runner_cfg,
+)
 
 
 register_mjlab_task(
@@ -35,6 +41,22 @@ register_mjlab_task(
   play_env_cfg=eval_shooter_stage4_env_cfg(play=True),
   rl_cfg=unitree_g1_soccer_ppo_runner_cfg(),
   runner_cls=None,
+)
+
+register_mjlab_task(
+  task_id="Eval-Shooter-Stage5",
+  env_cfg=eval_shooter_stage5_env_cfg(play=False),
+  play_env_cfg=eval_shooter_stage5_env_cfg(play=True),
+  rl_cfg=unitree_g1_soccer_recurrent_runner_cfg(),
+  runner_cls=SoccerRecurrentRunner,
+)
+
+register_mjlab_task(
+  task_id="Eval-Shooter-Stage6",
+  env_cfg=eval_shooter_stage6_env_cfg(play=False),
+  play_env_cfg=eval_shooter_stage6_env_cfg(play=True),
+  rl_cfg=unitree_g1_soccer_recurrent_runner_cfg(),
+  runner_cls=SoccerRecurrentRunner,
 )
 
 register_mjlab_task(

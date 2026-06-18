@@ -521,17 +521,38 @@ def undesired_contacts(
 # -- Goal-plane crossing rewards (Stage 3) -------------------------------------
 
 
+def _get_axis_index(axis: str) -> int:
+  return {"x": 0, "y": 1}[axis]
+
+
 def _goal_plane_crossing(
   env: ManagerBasedRlEnv,
   command_name: str = "motion",
-  goal_y: float = -5.0,
+  goal_axis: str = "y",
+  goal_coord: float = -5.0,
+  lateral_axis: str = "x",
   goal_half_width: float = 1.5,
   goal_height: float = 1.8,
+  # Deprecated: kept for backwards compat
+  goal_y: float | None = None,
 ):
   """Detect ball crossing goal plane — per-step cached so reward order doesn't matter.
 
+  ``goal_axis`` selects the attack direction ("x" or "y").
+  ``goal_coord`` is the goal-plane coordinate along that axis.
+  ``lateral_axis`` selects the axis along which goal width is measured.
+
+  Old callers that only pass ``goal_y`` still work — when ``goal_y`` is not None
+  it overrides ``goal_axis="y", goal_coord=goal_y, lateral_axis="x"``.
+
   Returns (crossed, in_goal, cross_pos, target_error) all as (num_envs,) or (num_envs, 3) tensors.
   """
+  if goal_y is not None:
+    goal_axis, goal_coord, lateral_axis = "y", goal_y, "x"
+
+  gax = _get_axis_index(goal_axis)       # 0=x, 1=y
+  lax = _get_axis_index(lateral_axis)     # 0=x, 1=y
+
   command: MultiMotionSoccerCommand = env.command_manager.get_term(command_name)
   tracker = _get_kick_tracker(command)
   valid_kick_awarded = tracker.get_valid_kick_awarded()
@@ -615,20 +636,20 @@ def _goal_plane_crossing(
 
   can_check = active & prev_valid & (~need_init)
   if torch.any(can_check):
-    crossed = can_check & (prev[:, 1] > goal_y) & (ball_local[:, 1] <= goal_y)
+    crossed = can_check & (prev[:, gax] > goal_coord) & (ball_local[:, gax] <= goal_coord)
     if torch.any(crossed):
-      dy = ball_local[:, 1] - prev[:, 1]
-      safe = torch.where(dy >= 0, torch.tensor(1e-6, device=env.device),
+      dg = ball_local[:, gax] - prev[:, gax]
+      safe = torch.where(dg >= 0, torch.tensor(1e-6, device=env.device),
                          torch.tensor(-1e-6, device=env.device))
-      alpha = ((goal_y - prev[:, 1]) / (dy + safe)).clamp(0.0, 1.0).unsqueeze(-1)
+      alpha = ((goal_coord - prev[:, gax]) / (dg + safe)).clamp(0.0, 1.0).unsqueeze(-1)
       cross_pos = prev + alpha * (ball_local - prev)
 
       in_goal = (
-        (cross_pos[:, 0].abs() <= goal_half_width)
+        (cross_pos[:, lax].abs() <= goal_half_width)
         & (cross_pos[:, 2] >= 0.0)
         & (cross_pos[:, 2] <= goal_height)
       )
-      target_err = (cross_pos[:, 0] - command.target_destination_pos[:, 0]).abs()
+      target_err = (cross_pos[:, lax] - command.target_destination_pos[:, lax]).abs()
 
       out_crossed[crossed] = True
       out_in_goal[crossed] = in_goal[crossed]
@@ -648,14 +669,20 @@ def goal_plane_accuracy(
   goal_y: float = -5.0,
   goal_half_width: float = 1.5,
   goal_height: float = 1.8,
+  goal_axis: str = "y",
+  goal_coord: float = -5.0,
+  lateral_axis: str = "x",
 ) -> torch.Tensor:
-  """Reward for ball crossing goal plane inside the frame, measured against target x.
+  """Reward for ball crossing goal plane inside the frame, measured against target.
 
-  Fires once per episode when the ball first crosses y=goal_y inside the goal frame.
-  reward = exp(-target_error² / std²), where target_error = |cross_x - destination_x|.
+  Fires once per episode when the ball first crosses the goal plane.
+  reward = exp(-target_error² / std²).
   """
   crossed, in_goal, _cross_pos, target_err = _goal_plane_crossing(
-    env, command_name, goal_y, goal_half_width, goal_height,
+    env, command_name,
+    goal_axis=goal_axis, goal_coord=goal_coord, lateral_axis=lateral_axis,
+    goal_half_width=goal_half_width, goal_height=goal_height,
+    goal_y=goal_y,
   )
   reward = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
   mask = crossed & in_goal
@@ -670,12 +697,109 @@ def goal_miss_penalty(
   goal_y: float = -5.0,
   goal_half_width: float = 1.5,
   goal_height: float = 1.8,
+  goal_axis: str = "y",
+  goal_coord: float = -5.0,
+  lateral_axis: str = "x",
 ) -> torch.Tensor:
   """One-shot penalty when ball crosses goal plane outside the frame.
 
   Returns 1.0 for miss; weight should be negative (e.g. -5.0).
   """
   crossed, in_goal, _cross_pos, _target_err = _goal_plane_crossing(
-    env, command_name, goal_y, goal_half_width, goal_height,
+    env, command_name,
+    goal_axis=goal_axis, goal_coord=goal_coord, lateral_axis=lateral_axis,
+    goal_half_width=goal_half_width, goal_height=goal_height,
+    goal_y=goal_y,
   )
   return (crossed & (~in_goal)).to(torch.float32)
+
+
+def goal_miss_scaled(
+  env: ManagerBasedRlEnv,
+  command_name: str = "motion",
+  goal_y: float = -5.0,
+  goal_half_width: float = 1.5,
+  goal_height: float = 1.8,
+  max_deviation: float = 1.0,
+  goal_axis: str = "y",
+  goal_coord: float = -5.0,
+  lateral_axis: str = "x",
+) -> torch.Tensor:
+  """Penalty scaled by how far the ball missed the goal frame.
+
+  Returns ``deviation / max_deviation`` clamped to ``[0, 1]``
+  where ``deviation = max(lateral_excess, z_excess)``.
+
+  - 0.0   = within goal frame (no penalty)
+  - ~0.1  = just outside a post (weak penalty, weight×0.1)
+  - 1.0   = 1m+ outside any edge (max penalty, weight×1.0)
+  """
+  crossed, in_goal, cross_pos, _ = _goal_plane_crossing(
+    env, command_name,
+    goal_axis=goal_axis, goal_coord=goal_coord, lateral_axis=lateral_axis,
+    goal_half_width=goal_half_width, goal_height=goal_height,
+    goal_y=goal_y,
+  )
+  miss = crossed & (~in_goal)
+  penalty = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+  if not torch.any(miss):
+    return penalty
+
+  lax = _get_axis_index(lateral_axis)
+  lat_dev = torch.clamp(cross_pos[miss, lax].abs() - goal_half_width, min=0.0)
+  z_dev = torch.clamp(cross_pos[miss, 2] - goal_height, min=0.0)
+  dev = torch.max(lat_dev, z_dev)
+  scaled = torch.clamp(dev / max_deviation, 0.0, 1.0)
+  penalty[miss] = scaled
+  return penalty
+
+
+def both_feet_air_time(
+  env: ManagerBasedRlEnv,
+  threshold: float = 0.15,
+) -> torch.Tensor:
+  """Penalty when both feet are above ``threshold`` metres off the ground.
+
+  Uses robot body positions (left/right ankle Z).  Fires per-step.
+  Weight should be negative (e.g. -10.0).
+  """
+  robot = env.scene["robot"]
+  left_idx = robot.body_names.index("left_ankle_roll_link")
+  right_idx = robot.body_names.index("right_ankle_roll_link")
+  left_z = robot.data.body_link_pos_w[:, left_idx, 2]
+  right_z = robot.data.body_link_pos_w[:, right_idx, 2]
+  both_off = (left_z > threshold) & (right_z > threshold)
+  return both_off.to(torch.float32)
+
+
+def ball_out_of_bounds(
+  env: ManagerBasedRlEnv,
+  command_name: str = "motion",
+  goal_y: float = -5.0,
+  goal_half_width: float = 1.5,
+  goal_height: float = 1.8,
+  margin: float = 1.0,
+  goal_axis: str = "y",
+  goal_coord: float = -5.0,
+  lateral_axis: str = "x",
+) -> torch.Tensor:
+  """One-shot penalty when ball crosses goal plane WAY outside the frame.
+
+  ``margin=1.0`` means the ball must be > goal_half_width + margin from centre
+  (default: 1.5 + 1.0 = 2.5m) to trigger.
+
+  This distinguishes *"near miss"* (handled by ``goal_miss`` / ``goal_miss_scaled``)
+  from *"wildly off-target"* where the ball never went near the frame.
+  """
+  crossed, in_goal, cross_pos, _ = _goal_plane_crossing(
+    env, command_name,
+    goal_axis=goal_axis, goal_coord=goal_coord, lateral_axis=lateral_axis,
+    goal_half_width=goal_half_width, goal_height=goal_height,
+    goal_y=goal_y,
+  )
+
+  lax = _get_axis_index(lateral_axis)
+  wide_miss = crossed & (~in_goal) & (
+    cross_pos[:, lax].abs() > (goal_half_width + margin)
+  )
+  return wide_miss.to(torch.float32)
