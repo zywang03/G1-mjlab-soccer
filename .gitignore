@@ -24,3 +24,5 @@ temp
 *.fls
 *.log
 *.out
+results
+out

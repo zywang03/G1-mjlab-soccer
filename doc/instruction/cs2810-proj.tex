@@ -109,11 +109,11 @@ Success rates below 80\% receive 0 points. At 80\% the score is 0, at 100\% the 
 
 Phase 2 is an all-to-all cross-evaluation tournament conducted centrally by the teaching team. The 30\% allocation is divided equally between shooting and goalkeeping (15\% each). After completing basic single-agent policies in Phase 1, teams continue to improve their agents---through adversarial training, self-play, or further single-agent optimization---and then compete against every other team.
 
-Because each team will design unique observation spaces, feature extractors, and neural network architectures, your codebases will be heterogeneous. To enable cross-evaluation without requiring teams to share code or checkpoints, the tournament adopts a standardized API interface: each team deploys their trained policy behind a lightweight server, and the competition script \texttt{scripts/compete.py} loads two G1 robots into a single MuJoCo scene and queries each team's server at every simulation step.
+Because each team will design unique observation spaces, feature extractors, and neural network architectures, your codebases will be heterogeneous. To enable cross-evaluation without requiring teams to share code or checkpoints, the tournament adopts a standardized API interface: each team deploys their trained policy behind a lightweight server, and the competition script \texttt{phase2/compete.py} loads two G1 robots into a single MuJoCo scene and queries each team's server at every simulation step.
 
 \subsubsection{API Protocol}
 
-All teams must implement a policy server exposing the following two endpoints (a reference implementation is provided as \texttt{scripts/api\_server.py}):
+All teams must implement a policy server exposing the following two endpoints (a reference implementation is provided as \texttt{phase2/api\_server.py}):
 
 \begin{itemize}
     \item \texttt{POST /act} --- Receives raw MuJoCo state for both robots and the ball, and returns an action for the robot the server controls (determined by the \texttt{-\/-task} flag).
@@ -131,7 +131,7 @@ All teams must implement a policy server exposing the following two endpoints (a
     Response: {"status": "ok"}\end{verbatim}
 \end{itemize}
 
-\texttt{compete.py} sends the same raw state to both servers regardless of their role---each server extracts its own robot's data to compute observations.
+\texttt{phase2/compete.py} sends the same raw state to both servers regardless of their role---each server extracts its own robot's data to compute observations.
 
 \subsubsection{Timeline and Milestones}
 \begin{itemize}
@@ -139,7 +139,7 @@ All teams must implement a policy server exposing the following two endpoints (a
     Teams first complete their basic single-agent shooting and goalkeeping policies (Phase 1). They then continuously improve their agents' capabilities through adversarial training, self-play, or further single-agent optimization. And this phase will continue until the end of week 16 (6.21).
 
     \item \textbf{Week 17: Tournament \& Report Submission} \\
-    The tournament is conducted centrally on a server provided by the teaching team (we will make the server available later). Each team deploys their policy servers (which must be network-reachable from the tournament server) and submits the access URLs. The teaching team runs \texttt{scripts/compete.py} for every pair of teams (Team A and Team B), evaluating both directions:
+    The tournament is conducted centrally on a server provided by the teaching team. Each team deploys their policy servers (which must be network-reachable from the tournament server) and submits the access URLs. The teaching team runs \texttt{phase2/compete.py} or the \texttt{phase2/tournament\_server.py} web console for every pair of teams (Team A and Team B), evaluating both directions:
     \begin{itemize}
         \item Team A's Shooter vs.\ Team B's Goalkeeper (10 trials)
         \item Team B's Shooter vs.\ Team A's Goalkeeper (10 trials)
@@ -212,21 +212,21 @@ The \texttt{train.py} script in \texttt{scripts/} serves as the training entrypo
 
 \subsection{Cross-Evaluation Competition}
 
-For Phase 2 cross-evaluation, teams deploy their policies as API servers and use \texttt{scripts/compete.py} to run matchups:
+For Phase 2 cross-evaluation, teams deploy their policies as API servers and use \texttt{phase2/compete.py} or the web console in \texttt{phase2/tournament\_server.py} to run matchups:
 
 \begin{verbatim}
 # Start policy servers (one per robot)
-python scripts/api_server.py --checkpoint <path> --port 8000 --task shooter
-python scripts/api_server.py --checkpoint <path> --port 8001 --task goalkeeper
+python phase2/api_server.py --checkpoint <path> --port 8000 --task shooter
+python phase2/api_server.py --checkpoint <path> --port 8001 --task goalkeeper
 
 # Run a matchup
-python scripts/compete.py \
+python phase2/compete.py \
     --shooter-api http://<team_a_ip>:8000 \
     --goalkeeper-api http://<team_b_ip>:8001 \
-    --headless --num-trials 10
+    --num-trials 10
 \end{verbatim}
 
-The script loads two G1 robots into a single MuJoCo scene, reads raw MuJoCo state (joint angles, root poses, ball position/velocity), and sends the same state dict to both teams' API servers. Each team's server computes its own observation tensor and returns an action. This design fully decouples observation spaces across teams. A reference API server with example observation computation is provided as \texttt{scripts/api\_server.py}.
+The script loads two G1 robots into a single MuJoCo scene, reads raw MuJoCo state (joint angles, root poses, ball position/velocity), and sends the same state dict to both teams' API servers. Each team's server computes its own observation tensor and returns an action. Each episode lasts 5 seconds. This design fully decouples observation spaces across teams. A reference API server with example observation computation is provided as \texttt{phase2/api\_server.py}.
 
 \subsection{Contributing and Reporting Issues}
 

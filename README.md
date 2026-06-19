@@ -46,22 +46,20 @@ python scripts/eval_naive_goalkeeper.py --headless --num-trials 50 --checkpoint 
 # --- Compete (Phase 2: cross-evaluation) ---
 
 # Start policy servers (one per robot)
-python scripts/api_server.py --checkpoint <shooter.pt> --port 8000 --task shooter
-python scripts/api_server.py --checkpoint <goalkeeper.pt> --port 8001 --task goalkeeper
+python phase2/api_server.py --checkpoint <shooter.pt> --port 8000 --task shooter
+python phase2/api_server.py --checkpoint <goalkeeper.pt> --port 8001 --task goalkeeper
 
-# Run headless batch (10 trials, Phase 2 default)
-python scripts/compete.py \
+# Run one match directly (10 trials, 5 s per episode)
+python phase2/compete.py \
     --shooter-api http://<team_a_ip>:8000 \
     --goalkeeper-api http://<team_b_ip>:8001 \
-    --headless --num-trials 10
+    --num-trials 10
 
-# Interactive viewer (debugging)
-python scripts/compete.py \
-    --shooter-api http://<team_a_ip>:8000 \
-    --goalkeeper-api http://<team_b_ip>:8001
+# Start the Phase 2 web console
+python phase2/tournament_server.py
 
 # Zero-agent baseline (no servers required)
-python scripts/compete.py --headless --num-trials 10
+python phase2/compete.py --num-trials 10
 ```
 
 ## Evaluation
@@ -97,17 +95,17 @@ Scene: G1 at goal line (0, 0, 0.8), yaw=0 faces +x. Ball launched via 6-region p
 Scene: two G1 robots in a shared MuJoCo simulation — shooter at (4, 0, 0.8) yaw=π
 faces -x toward the goal, goalkeeper at (0, 0, 0.8) yaw=0 faces +x.  Goal at
 (-0.5, 0, 0) behind the goalkeeper.  Ball at (3, 0, 0.1) in front of the shooter.
-Episode length: 10 s.
+Episode length: 5 s.
 
-``compete.py`` reads raw MuJoCo state (joint positions, root poses, ball pos/vel)
+``phase2/compete.py`` reads raw MuJoCo state (joint positions, root poses, ball pos/vel)
 and sends the same raw-state dict to each team's policy server via REST API.
 Teams compute their own observations from raw state — observation spaces are
 fully decoupled.
 
 **Win conditions** (mutually exclusive):
 - **Shooter wins** — ball crosses the goal plane (x ≤ -0.5, |y| ≤ 1.5 m, z ≤ 1.8 m)
-  at any point during the 10 s episode (trial ends immediately on goal).
-- **Goalkeeper wins** — the episode times out (10 s) without the ball ever
+  at any point during the 5 s episode (trial ends immediately on goal).
+- **Goalkeeper wins** — the episode times out (5 s) without the ball ever
   crossing the goal line.
 
 Falling over does **not** terminate the episode — the shooter may get back up
@@ -170,8 +168,11 @@ scripts/
   play.py                              # Interactive visualization
   eval_naive_shooter.py                # Shooter eval (headless stats or viewer)
   eval_naive_goalkeeper.py             # Goalkeeper eval (headless stats or viewer)
-  compete.py                           # Phase 2 cross-evaluation (two robots, two policies)
+phase2/
   api_server.py                        # Phase 2 REST API reference server
+  compete.py                           # Phase 2 cross-evaluation (two robots, two policies)
+  tournament_server.py                 # Phase 2 web console
+  phase2_config.yaml                   # Fixed Phase 2 public config
 ```
 
 ## For CS2810 Students
@@ -191,11 +192,11 @@ It provides:
 **You need to implement training yourself.** (*Jinxi's Note: actually you cannot get full 60% credit by just running the defined configs in this template, you need to understand the design and implement your own training pipeline.*)
 
 > **Phase 2 Note**: The tournament uses a standardized REST API. Each team
-> deploys their trained policy as a FastAPI server (`scripts/api_server.py`).
-> `compete.py` runs the simulation locally, reads raw MuJoCo state, and sends
+> deploys their trained policy as a FastAPI server (`phase2/api_server.py`).
+> `phase2/compete.py` runs the simulation locally, reads raw MuJoCo state, and sends
 > it to each team's API. Teams compute their own observation tensors from raw
 > state — observation spaces are fully decoupled. Customize the
-> ``compute_obs()`` functions in `api_server.py` to match your training setup.
+> ``compute_obs()`` functions in `phase2/api_server.py` to match your training setup.
 
 ## Settings (`config/settings.yaml`)
 
