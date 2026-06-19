@@ -9,7 +9,7 @@ import random
 import re
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -331,12 +331,120 @@ class CombinedPolicy:
 class PassiveViserViewer(ViserPlayViewer):
     """Viser viewer that renders the environment without stepping physics."""
 
+    def __init__(
+        self,
+        *args: Any,
+        scoreboard: "ScoreboardState | None" = None,
+        start_event: threading.Event | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self._scoreboard = scoreboard
+        self._start_event = start_event
+        self._scoreboard_html = None
+        self._start_button = None
+
+    def setup(self) -> None:
+        super().setup()
+        if self._scoreboard is not None:
+            import viser
+
+            with self._server.gui.add_folder("Match Scoreboard"):
+                if self._start_event is not None:
+                    self._start_button = self._server.gui.add_button(
+                        "Start Trials",
+                        icon=viser.Icon.PLAYER_PLAY,
+                        color="green",
+                    )
+
+                    @self._start_button.on_click
+                    def _(_) -> None:
+                        if self._start_event is None or self._start_event.is_set():
+                            return
+                        self._start_event.set()
+                        self._scoreboard.set_phase("starting")
+                        self._start_button.label = "Trials Started"
+                        self._start_button.disabled = True
+
+                self._scoreboard_html = self._server.gui.add_html("")
+            self._update_scoreboard_display()
+
     def _step_physics(self, dt: float) -> None:
         del dt
         return
 
     def reset_environment(self) -> None:
         return
+
+    def _update_scoreboard_display(self) -> None:
+        if self._scoreboard_html is None or self._scoreboard is None:
+            return
+        self._scoreboard_html.content = self._scoreboard.to_html()
+
+    def tick(self) -> bool:
+        rendered = super().tick()
+        self._update_scoreboard_display()
+        return rendered
+
+
+@dataclass
+class ScoreboardState:
+    shooter_team: str
+    goalkeeper_team: str
+    total_trials: int
+    current_trial: int = 0
+    phase: str = "initializing"
+    results: list[str] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def set_phase(self, phase: str, current_trial: int | None = None) -> None:
+        with self.lock:
+            self.phase = phase
+            if current_trial is not None:
+                self.current_trial = current_trial
+
+    def record(self, winner: str) -> None:
+        with self.lock:
+            self.results.append(winner)
+
+    def snapshot(self) -> tuple[int, str, list[str]]:
+        with self.lock:
+            return self.current_trial, self.phase, list(self.results)
+
+    def to_html(self) -> str:
+        current_trial, phase, results = self.snapshot()
+        shooter_wins = sum(1 for r in results if r == "shooter")
+        gk_wins = sum(1 for r in results if r == "goalkeeper")
+        symbols = []
+        for result in results:
+            if result == "shooter":
+                color, label = "#16a34a", "S"
+            elif result == "goalkeeper":
+                color, label = "#2563eb", "G"
+            else:
+                color, label = "#dc2626", "!"
+            symbols.append(
+                "<span style='display:inline-flex;align-items:center;justify-content:center;"
+                "width:22px;height:22px;border-radius:50%;margin:2px;color:white;"
+                f"font-weight:700;background:{color};'>{label}</span>"
+            )
+        for _ in range(max(0, self.total_trials - len(results))):
+            symbols.append(
+                "<span style='display:inline-flex;align-items:center;justify-content:center;"
+                "width:22px;height:22px;border-radius:50%;margin:2px;color:#6b7280;"
+                "font-weight:700;background:#e5e7eb;'>-</span>"
+            )
+        current = current_trial if current_trial > 0 else "-"
+        return f"""
+        <div style="font-size:0.9em;line-height:1.35;padding:0 1em 0.6em 1em;">
+          <strong>{self.shooter_team}</strong> vs <strong>{self.goalkeeper_team}</strong><br/>
+          <strong>Current trial:</strong> {current}/{self.total_trials}<br/>
+          <strong>Phase:</strong> {phase}<br/>
+          <strong>Score:</strong> Shooter {shooter_wins} - {gk_wins} Goalkeeper<br/>
+          <div style="margin-top:6px;">{''.join(symbols)}</div>
+          <div style="color:#6b7280;margin-top:4px;">S = shooter goal, G = goalkeeper save</div>
+        </div>
+        """
 
 
 def _ball_entered_goal(ball_pos: torch.Tensor, config: dict[str, Any]) -> bool:
@@ -382,7 +490,10 @@ def run_trial(
     max_steps: int,
     step_dt: float,
     realtime: bool,
+    scoreboard: ScoreboardState | None = None,
 ) -> dict[str, Any]:
+    if scoreboard is not None:
+        scoreboard.set_phase("running", trial_index)
     env.reset()
     shooter_policy.reset()
     goalkeeper_policy.reset()
@@ -430,6 +541,8 @@ def run_trial(
     winner = "shooter" if goal_scored else "goalkeeper"
     if error is not None:
         winner = "error"
+    if scoreboard is not None:
+        scoreboard.record(winner)
     ball_pos = ball.data.root_link_pos_w[0].cpu()
     return {
         "trial": trial_index,
@@ -450,6 +563,7 @@ def run_match(
     goalkeeper_policy: Any,
     max_steps: int,
     step_dt: float,
+    scoreboard: ScoreboardState | None = None,
 ) -> dict[str, Any]:
     print(f"[INFO] Running {cfg.num_trials} trials, max_steps={max_steps}", flush=True)
     trials: list[dict[str, Any]] = []
@@ -466,6 +580,7 @@ def run_match(
             max_steps,
             step_dt,
             cfg.realtime,
+            scoreboard,
         )
         trials.append(stats)
         if stats["goal_scored"]:
@@ -489,7 +604,25 @@ def run_match(
         "winner_decision": "shooter" if goals > cfg.num_trials / 2 else "goalkeeper",
     }
     print(f"[SUMMARY] {summary}", flush=True)
+    if scoreboard is not None:
+        scoreboard.set_phase("finished")
     return {"summary": summary, "trials": trials}
+
+
+def wait_for_start(
+    start_event: threading.Event,
+    scoreboard: ScoreboardState | None = None,
+    auto_start: bool = False,
+) -> None:
+    if auto_start:
+        start_event.set()
+    if scoreboard is not None:
+        scoreboard.set_phase("waiting for Start Trials", 0)
+    print("[INFO] Ready. Waiting for Start Trials.", flush=True)
+    start_event.wait()
+    if scoreboard is not None:
+        scoreboard.set_phase("starting", 0)
+    print("[INFO] Start Trials pressed; beginning official trials.", flush=True)
 
 
 def _default_results_path(cfg: "CompeteConfig", timestamp: str) -> Path:
@@ -568,9 +701,20 @@ def run_compete(cfg: CompeteConfig) -> dict[str, Any]:
         env = RslRlVecEnvWrapper(env_base, clip_actions=100.0)
         result_holder: dict[str, Any] = {}
         done_event = threading.Event()
+        start_event = threading.Event()
+        scoreboard = ScoreboardState(
+            shooter_team=cfg.shooter_team,
+            goalkeeper_team=cfg.goalkeeper_team,
+            total_trials=cfg.num_trials,
+        )
 
         def _worker() -> None:
             try:
+                wait_for_start(
+                    start_event,
+                    scoreboard,
+                    auto_start=cfg.no_viewer,
+                )
                 result_holder.update(
                     run_match(
                         cfg,
@@ -581,6 +725,7 @@ def run_compete(cfg: CompeteConfig) -> dict[str, Any]:
                         goalkeeper_policy,
                         max_steps,
                         step_dt,
+                        scoreboard,
                     )
                 )
             except Exception as exc:
@@ -595,6 +740,8 @@ def run_compete(cfg: CompeteConfig) -> dict[str, Any]:
                 result_holder["fatal_error"] = str(exc)
                 print(f"[FATAL] {exc}", flush=True)
             finally:
+                if "summary" not in result_holder:
+                    scoreboard.set_phase("failed")
                 done_event.set()
 
         worker = threading.Thread(target=_worker, name="phase2-match", daemon=True)
@@ -606,7 +753,13 @@ def run_compete(cfg: CompeteConfig) -> dict[str, Any]:
 
                 server = viser.ViserServer(host=cfg.viser_host, port=cfg.viser_port, label="phase2")
                 combined = CombinedPolicy(shooter_policy, goalkeeper_policy, env_base, device)
-                viewer = PassiveViserViewer(env, combined, viser_server=server)
+                viewer = PassiveViserViewer(
+                    env,
+                    combined,
+                    viser_server=server,
+                    scoreboard=scoreboard,
+                    start_event=start_event,
+                )
                 viewer.setup()
                 try:
                     while viewer.is_running() and not done_event.is_set():
@@ -617,6 +770,7 @@ def run_compete(cfg: CompeteConfig) -> dict[str, Any]:
                     viewer.close()
             except TypeError:
                 print("[WARN] ViserServer host/port signature mismatch; running without viewer.", flush=True)
+                start_event.set()
                 done_event.wait()
         else:
             done_event.wait()

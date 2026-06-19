@@ -45,21 +45,12 @@ python scripts/eval_naive_goalkeeper.py --headless --num-trials 50 --checkpoint 
 
 # --- Compete (Phase 2: cross-evaluation) ---
 
-# Start policy servers (one per robot)
+# Student/client side: start policy servers (one per robot)
 python phase2/api_server.py --checkpoint <shooter.pt> --port 8000 --task shooter
 python phase2/api_server.py --checkpoint <goalkeeper.pt> --port 8001 --task goalkeeper
 
-# Run one match directly (10 trials, 5 s per episode)
-python phase2/compete.py \
-    --shooter-api http://<team_a_ip>:8000 \
-    --goalkeeper-api http://<team_b_ip>:8001 \
-    --num-trials 10
-
-# Start the Phase 2 web console
-python phase2/tournament_server.py
-
-# Zero-agent baseline (no servers required)
-python phase2/compete.py --num-trials 10
+# See phase2/README_CLIENT.md for student API submission.
+# See phase2/README_SERVER.md for tournament-server deployment.
 ```
 
 ## Evaluation
@@ -197,6 +188,10 @@ It provides:
 > it to each team's API. Teams compute their own observation tensors from raw
 > state — observation spaces are fully decoupled. Customize the
 > ``compute_obs()`` functions in `phase2/api_server.py` to match your training setup.
+>
+> Phase 2 docs are split by role:
+> - Student/client API submission: `phase2/README_CLIENT.md`
+> - Teaching-team tournament server: `phase2/README_SERVER.md`
 
 ## Settings (`config/settings.yaml`)
 

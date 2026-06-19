@@ -109,7 +109,7 @@ Success rates below 80\% receive 0 points. At 80\% the score is 0, at 100\% the 
 
 Phase 2 is an all-to-all cross-evaluation tournament conducted centrally by the teaching team. The 30\% allocation is divided equally between shooting and goalkeeping (15\% each). After completing basic single-agent policies in Phase 1, teams continue to improve their agents---through adversarial training, self-play, or further single-agent optimization---and then compete against every other team.
 
-Because each team will design unique observation spaces, feature extractors, and neural network architectures, your codebases will be heterogeneous. To enable cross-evaluation without requiring teams to share code or checkpoints, the tournament adopts a standardized API interface: each team deploys their trained policy behind a lightweight server, and the competition script \texttt{phase2/compete.py} loads two G1 robots into a single MuJoCo scene and queries each team's server at every simulation step.
+Because each team will design unique observation spaces, feature extractors, and neural network architectures, your codebases will be heterogeneous. To enable cross-evaluation without requiring teams to share code or checkpoints, the tournament adopts a standardized API interface: each team deploys their trained policy behind a lightweight server and submits the server URLs to the teaching team's web console. The web console then launches the match executor, which loads two G1 robots into a single MuJoCo scene and queries each team's server at every simulation step.
 
 \subsubsection{API Protocol}
 
@@ -131,20 +131,20 @@ All teams must implement a policy server exposing the following two endpoints (a
     Response: {"status": "ok"}\end{verbatim}
 \end{itemize}
 
-\texttt{phase2/compete.py} sends the same raw state to both servers regardless of their role---each server extracts its own robot's data to compute observations.
+The tournament server sends the same raw state to both servers regardless of their role---each server extracts its own robot's data to compute observations.
 
 \subsubsection{Timeline and Milestones}
 \begin{itemize}
     \item \textbf{Weeks 13--16: Agent Development \& Improvement} \\
-    Teams first complete their basic single-agent shooting and goalkeeping policies (Phase 1). They then continuously improve their agents' capabilities through adversarial training, self-play, or further single-agent optimization. And this phase will continue until the end of week 16 (6.21).
+    Teams first complete their basic single-agent shooting and goalkeeping policies (Phase 1). They then continuously improve their agents' capabilities through adversarial training, self-play, or further single-agent optimization. And this phase will continue until 6.25.
 
-    \item \textbf{Week 17: Tournament \& Report Submission} \\
-    The tournament is conducted centrally on a server provided by the teaching team. Each team deploys their policy servers (which must be network-reachable from the tournament server) and submits the access URLs. The teaching team runs \texttt{phase2/compete.py} or the \texttt{phase2/tournament\_server.py} web console for every pair of teams (Team A and Team B), evaluating both directions:
+    \item \textbf{Week 17: Report Submission \& Cross Evaluation} \\
+    The final report and all required submission materials are due by June 26. By the same deadline, each team must deploy its policy servers (which must be network-reachable from the tournament server) and submit the access URLs. Cross evaluations will begin on June 26 and will be conducted centrally on a server provided by the teaching team. The teaching team uses the \texttt{phase2/tournament\_server.py} web console to start and monitor matchups. For each pair of teams (Team A and Team B), both directions are evaluated:
     \begin{itemize}
         \item Team A's Shooter vs.\ Team B's Goalkeeper (10 trials)
         \item Team B's Shooter vs.\ Team A's Goalkeeper (10 trials)
     \end{itemize}
-    The specific evaluation schedule will be announced before week 17. But notice that both the tournament results and the final report are due by the end of Week 17 (6.26).
+    The specific evaluation schedule will be announced before June 26.
 \end{itemize}
 
 \subsubsection{Scoring Mechanism}
@@ -212,21 +212,15 @@ The \texttt{train.py} script in \texttt{scripts/} serves as the training entrypo
 
 \subsection{Cross-Evaluation Competition}
 
-For Phase 2 cross-evaluation, teams deploy their policies as API servers and use \texttt{phase2/compete.py} or the web console in \texttt{phase2/tournament\_server.py} to run matchups:
+For Phase 2 cross-evaluation, teams deploy their policies as API servers and submit their API URLs through the teaching team's web console. The direct match executor \texttt{phase2/compete.py} is mainly a teaching-side implementation detail and debugging entrypoint; the expected workflow for students is to keep their API servers running and provide URLs that are reachable from the tournament server.
 
 \begin{verbatim}
 # Start policy servers (one per robot)
 python phase2/api_server.py --checkpoint <path> --port 8000 --task shooter
 python phase2/api_server.py --checkpoint <path> --port 8001 --task goalkeeper
-
-# Run a matchup
-python phase2/compete.py \
-    --shooter-api http://<team_a_ip>:8000 \
-    --goalkeeper-api http://<team_b_ip>:8001 \
-    --num-trials 10
 \end{verbatim}
 
-The script loads two G1 robots into a single MuJoCo scene, reads raw MuJoCo state (joint angles, root poses, ball position/velocity), and sends the same state dict to both teams' API servers. Each team's server computes its own observation tensor and returns an action. Each episode lasts 5 seconds. This design fully decouples observation spaces across teams. A reference API server with example observation computation is provided as \texttt{phase2/api\_server.py}.
+In the web console, the teaching team enters the shooter team name, shooter API URL, goalkeeper team name, goalkeeper API URL, and number of trials. The console displays a Viser URL for each running match; after opening that page, the match begins only after clicking \texttt{Start Trials}. The server then loads two G1 robots into a single MuJoCo scene, reads raw MuJoCo state (joint angles, root poses, ball position/velocity), and sends the same state dict to both teams' API servers. Each team's server computes its own observation tensor and returns an action. Each episode lasts 5 seconds. This design fully decouples observation spaces across teams. A reference API server with example observation computation is provided as \texttt{phase2/api\_server.py}. More detailed student-side instructions are provided in \texttt{phase2/README\_CLIENT.md}.
 
 \subsection{Contributing and Reporting Issues}
 

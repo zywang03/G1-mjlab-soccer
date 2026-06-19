@@ -1,7 +1,5 @@
 """Web console for launching CS2810 Phase 2 matches."""
 
-from __future__ import annotations
-
 import asyncio
 import json
 import os
@@ -231,8 +229,6 @@ class MatchManager:
         ]
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
-        env.setdefault("HOME", "/tmp")
-        env.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-cache")
         log_file = log_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
             cmd,
@@ -400,7 +396,7 @@ _INDEX_HTML = """
           <div><label>Goalkeeper Team</label><input id="goalkeeper_team" required></div>
           <div><label>Goalkeeper API URL</label><input id="goalkeeper_api" required placeholder="http://host:port"></div>
         </div>
-        <div class="row" style="margin-top:12px;">
+        <div class="row" style="margin-top:20px;">
           <div><label>Match ID (optional)</label><input id="match_id"></div>
           <div><label>Trials</label><input id="num_trials" type="number" min="1" value="10"></div>
           <button type="submit">Start Match</button>

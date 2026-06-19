@@ -8,8 +8,6 @@ Usage:
   python phase2/api_server.py --checkpoint goalkeeper.pt --port 8001 --task goalkeeper
 """
 
-from __future__ import annotations
-
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
