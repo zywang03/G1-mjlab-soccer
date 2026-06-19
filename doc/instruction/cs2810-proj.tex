@@ -103,6 +103,8 @@ Both tasks are scored with a linear formula applied to the success/block rate ov
 \]
 Success rates below 80\% receive 0 points. At 80\% the score is 0, at 100\% the score is 30, with linear interpolation in between.
 
+\textbf{Reproducibility.} The eval scripts (\texttt{eval\_naive\_shooter.py} and \texttt{eval\_naive\_goalkeeper.py}) support a \texttt{-\/-seed} flag (default: 2810) that seeds Python, NumPy, PyTorch, CUDA, and the environment RNGs, making each run fully reproducible. For your Phase~1 report, you must evaluate your policies with \textbf{three different seeds}: \texttt{42}, \texttt{2810}, and \texttt{202606}. Run 50 trials per seed, compute the mean success/block rate across the three runs, and apply the scoring formula above using this averaged rate. Reporting the mean over three independent seeds provides a more stable and fair metric than a single 50-trial run.
+
 \subsection{Phase 2: Cross-Evaluation Tournament (30\% of project score)}
 
 Phase 2 is an all-to-all cross-evaluation tournament conducted centrally by the teaching team. The 30\% allocation is divided equally between shooting and goalkeeping (15\% each). After completing basic single-agent policies in Phase 1, teams continue to improve their agents---through adversarial training, self-play, or further single-agent optimization---and then compete against every other team.
@@ -191,7 +193,8 @@ python scripts/play.py Unitree-G1-Goalkeeper --agent zero --viewer native
 
 \subsection{Evaluation}
 
-Use the eval scripts to benchmark trained policies:
+Use the eval scripts to benchmark trained policies. See Section~1.1 for the
+required seed and trial settings for Phase~1 scoring.
 
 \begin{verbatim}
 # Shooter

@@ -24,6 +24,7 @@ Usage:
 """
 
 import os
+import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -217,7 +218,15 @@ def run_eval(cfg: EvalConfig):
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
+  # Set random seed for reproducibility.
+  random.seed(cfg.seed)
+  np.random.seed(cfg.seed)
+  torch.manual_seed(cfg.seed)
+  if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(cfg.seed)
+
   env_cfg = load_env_cfg(cfg.task_id, play=False)
+  env_cfg.seed = cfg.seed
   env_cfg.scene.num_envs = 1
   env_cfg.viewer.height = cfg.video_height
   env_cfg.viewer.width = cfg.video_width
