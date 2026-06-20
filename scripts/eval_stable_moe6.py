@@ -35,6 +35,7 @@ class Cfg:
   seed: int = 2810
   z_low: float = 0.85
   z_up: float = 1.35
+  vz_low: float = -99.0
   land_x: float = 0.0
   latch_hi: float = 5.0
   final_ang_vel_xy: float = 3.0
@@ -140,9 +141,11 @@ def main(cfg: Cfg) -> None:
     t = torch.clamp(-(ball_x - cfg.land_x) / (vx - 1.0e-3), 0.0, 2.0)
     cross_y = ball_y + ball_vel[:, 1] * t
     cross_z = ball_pos[:, 2] + ball_vel[:, 2] * t - 0.5 * gravity * t * t
+    vz_cross = ball_vel[:, 2] - gravity * t
     base = torch.full_like(cross_y, 0, dtype=torch.long)
     base = torch.where(cross_z < cfg.z_low, torch.full_like(base, 4), base)
     base = torch.where(cross_z > cfg.z_up, torch.full_like(base, 2), base)
+    base = torch.where(vz_cross < cfg.vz_low, torch.full_like(base, 4), base)
     return base + (cross_y < 0).long(), valid
 
   total = blocked = stable = upright = 0
