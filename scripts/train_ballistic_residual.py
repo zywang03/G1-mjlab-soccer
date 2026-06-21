@@ -10,6 +10,7 @@ learns timing/reach corrections without destroying the base diving skill.
 from __future__ import annotations
 
 import copy
+import csv
 import os
 import sys
 from dataclasses import asdict, dataclass
@@ -77,6 +78,11 @@ class Cfg:
   bc_batch: int = 8192
   bc_max_frames_per_file: int = 0
   bc_max_frames: int = 0
+  failure_csv: str = ""
+  failure_regions: tuple[int, ...] = ()
+  failure_replay_ratio: float = 0.0
+  failure_pos_jitter: float = 0.02
+  failure_vel_jitter: float = 0.05
   w_conceded: float = 15.0
   w_intercept: float = 3.0
   w_body: float = 2.0
@@ -220,6 +226,39 @@ def _load_bc_data(cfg: Cfg) -> tuple[torch.Tensor, torch.Tensor] | None:
   return obs, act
 
 
+def _load_failure_bank(cfg: Cfg, device: str) -> dict | None:
+  if not cfg.failure_csv or cfg.failure_replay_ratio <= 0.0:
+    return None
+  starts, vels, regions = [], [], []
+  allowed = set(cfg.failure_regions)
+  with open(cfg.failure_csv, newline="") as f:
+    for row in csv.DictReader(f):
+      region = int(row["true_region"])
+      if allowed and region not in allowed:
+        continue
+      starts.append([float(row["start_x"]), float(row["start_y"]), float(row["start_z"])])
+      vels.append([float(row["vel_x"]), float(row["vel_y"]), float(row["vel_z"])])
+      regions.append(region)
+  if not starts:
+    raise ValueError(
+      f"failure_csv has no rows after region filter {cfg.failure_regions}: {cfg.failure_csv}"
+    )
+  bank = {
+    "start": torch.tensor(starts, dtype=torch.float32, device=device),
+    "vel": torch.tensor(vels, dtype=torch.float32, device=device),
+    "region": torch.tensor(regions, dtype=torch.long, device=device),
+    "ratio": float(cfg.failure_replay_ratio),
+    "pos_jitter": float(cfg.failure_pos_jitter),
+    "vel_jitter": float(cfg.failure_vel_jitter),
+  }
+  print(
+    f"[INFO] failure replay loaded {len(starts)} cases from {cfg.failure_csv} "
+    f"regions={cfg.failure_regions or 'all'} ratio={cfg.failure_replay_ratio}",
+    flush=True,
+  )
+  return bank
+
+
 def _configure_residual_init(cfg: Cfg) -> tuple[str, float, bool]:
   """Return frozen-base path, residual scale, and whether to load cfg.init as actor."""
   if not cfg.init:
@@ -299,6 +338,9 @@ def main(cfg: Cfg) -> None:
     ManagerBasedRlEnv(cfg=env_cfg, device=dev),
     clip_actions=100.0,
   )
+  failure_bank = _load_failure_bank(cfg, dev)
+  if failure_bank is not None:
+    setattr(env.unwrapped, "_gk_failure_bank", failure_bank)
   eval_steps = cfg.eval_steps
   max_steps = int(getattr(env.unwrapped, "max_episode_length", 0))
   if max_steps > 0 and eval_steps >= max_steps:

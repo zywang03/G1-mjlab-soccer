@@ -191,6 +191,51 @@ def reset_ball_with_parabolic_trajectory(
       t[env_ids] = val[env_ids].float(); setattr(env, key, t)
     return
 
+  # -- Failure-replay path (training only) ------------------------------------
+  # Scripts can attach a bank collected from real evaluation failures.  A subset
+  # of resets is then replaced by those exact ball starts/velocities while the
+  # rest of the batch keeps the official random distribution.
+  bank = getattr(env, "_gk_failure_bank", None)
+  if bank is not None and float(bank.get("ratio", 0.0)) > 0.0:
+    ratio = min(1.0, max(0.0, float(bank["ratio"])))
+    replay_mask = torch.rand(n, device=device) < ratio
+    if torch.any(replay_mask):
+      replay_ids = env_ids[replay_mask]
+      count = len(replay_ids)
+      sample = torch.randint(0, bank["start"].shape[0], (count,), device=device)
+      start_local = bank["start"][sample].clone()
+      vel_lin = bank["vel"][sample].clone()
+      region = bank["region"][sample].float()
+
+      pos_jitter = float(bank.get("pos_jitter", 0.0))
+      vel_jitter = float(bank.get("vel_jitter", 0.0))
+      if pos_jitter > 0.0:
+        start_local = start_local + torch.randn_like(start_local) * pos_jitter
+        start_local[:, 2].clamp_(min=0.05)
+      if vel_jitter > 0.0:
+        vel_lin = vel_lin + torch.randn_like(vel_lin) * vel_jitter
+
+      asset: Entity = env.scene[ball_cfg.name]
+      drs = asset.data.default_root_state
+      quat = drs[replay_ids, 3:7].clone()
+      pos = start_local + env.scene.env_origins[replay_ids]
+      vel = torch.cat([vel_lin, torch.zeros(count, 3, device=device)], dim=-1)
+      asset.write_root_link_pose_to_sim(torch.cat([pos, quat], dim=-1), env_ids=replay_ids)
+      asset.write_root_link_velocity_to_sim(vel, env_ids=replay_ids)
+
+      for key, val in (("_gk_region", region),
+                       ("_gk_ball_start_x", start_local[:, 0])):
+        t = getattr(env, key, None)
+        if t is None or t.shape[0] != env.num_envs:
+          t = torch.zeros(env.num_envs, dtype=torch.float32, device=device)
+        t[replay_ids] = val.float()
+        setattr(env, key, t)
+
+      env_ids = env_ids[~replay_mask]
+      n = len(env_ids)
+      if n == 0:
+        return
+
   num_regions = vel_cfg.num_regions
   assert num_regions > 0, "RegionBallVelCfg must have at least one region."
 
