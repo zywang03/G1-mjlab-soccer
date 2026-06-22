@@ -194,15 +194,55 @@ train_region() {
     --rollback-drop 0.004 \
     --seed "$seed" \
     --device cuda:0 > "$log" 2>&1 &
+  TRAIN_PIDS+=("$!")
+  TRAIN_LOGS+=("$log")
+  TRAIN_NAMES+=("sr${region}_${name}")
 }
 
 echo
 echo "===== Train failure-replay specialists ====="
+TRAIN_PIDS=()
+TRAIN_LOGS=()
+TRAIN_NAMES=()
 train_region 0 right_mid "${GPU_ARR[0]}" "4.0 1.5 1.5 1.5 0.5 0.5" 0.25 0.045 0.42 7310
 train_region 1 left_mid "${GPU_ARR[1]}" "1.0 4.0 1.5 1.5 0.5 0.5" 0.30 0.045 0.42 7311
 train_region 2 right_up "${GPU_ARR[2]}" "1.0 1.5 4.0 1.5 0.5 0.5" 0.35 0.045 0.42 7312
 train_region 3 left_up "${GPU_ARR[3]}" "1.0 1.5 1.5 4.0 0.5 0.5" 0.35 0.045 0.42 7313
-wait
+monitor_training() {
+  while :; do
+    sleep 120
+    local running=0
+    for pid in "${TRAIN_PIDS[@]}"; do
+      if ps -p "$pid" >/dev/null 2>&1; then
+        running=$((running + 1))
+      fi
+    done
+    [[ "$running" -eq 0 ]] && break
+    echo "[WAIT] $running specialist training jobs still running at $(date)"
+    for i in "${!TRAIN_LOGS[@]}"; do
+      echo "--- ${TRAIN_NAMES[$i]} tail ---"
+      grep -E "\[INFO\] failure replay|\[EVAL\].*(best|rollback|init)|saved ballistic|Traceback|RuntimeError" \
+        "${TRAIN_LOGS[$i]}" | tail -8 || true
+    done
+  done
+}
+
+monitor_training &
+MONITOR_PID="$!"
+failed=0
+for i in "${!TRAIN_PIDS[@]}"; do
+  pid="${TRAIN_PIDS[$i]}"
+  if ! wait "$pid"; then
+    echo "[FAIL] ${TRAIN_NAMES[$i]} pid=$pid"
+    tail -80 "${TRAIN_LOGS[$i]}" || true
+    failed=1
+  fi
+done
+kill "$MONITOR_PID" >/dev/null 2>&1 || true
+wait "$MONITOR_PID" >/dev/null 2>&1 || true
+if [[ "$failed" -ne 0 ]]; then
+  exit 1
+fi
 
 echo
 echo "===== Training summaries ====="
