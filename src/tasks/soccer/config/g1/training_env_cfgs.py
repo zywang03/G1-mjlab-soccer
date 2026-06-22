@@ -185,3 +185,107 @@ def unitree_g1_goalkeeper_training_env_cfg(play: bool = False) -> ManagerBasedRl
     cfg.events.pop("perturb_ball_vel", None)
 
   return cfg
+
+
+def unitree_g1_goalkeeper_lstm_ppo_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Goalkeeper env for pure recurrent PPO with a learnable curriculum."""
+  cfg = unitree_g1_goalkeeper_training_env_cfg(play=play)
+  if play:
+    return cfg
+
+  # From-scratch recurrent PPO needs a clean curriculum before full eval-speed
+  # randomization. Official scoring does not penalize falling after a save, so
+  # keep episodes alive and optimize the ball outcome directly.
+  cfg.events.pop("push_robot", None)
+  cfg.events.pop("perturb_ball_vel", None)
+  cfg.terminations.pop("fell_over", None)
+
+  from mjlab.managers.reward_manager import RewardTermCfg
+  from src.tasks.soccer.mdp.goalkeeper_rewards import (
+    goalkeeper_body_intercept,
+    goalkeeper_goal_conceded,
+    goalkeeper_intercept_point,
+  )
+
+  reset_ball = cfg.events["reset_ball"]
+  vel_cfg = reset_ball.params["vel_cfg"]
+  vel_cfg.curriculum_warmup_calls = 120_000
+  vel_cfg.speed_warmup_calls = 80_000
+  vel_cfg.difficulty_min = 0.15
+  vel_cfg.t_flight_slow_factor = 1.8
+
+  cfg.rewards["ee_reach"] = replace(
+    cfg.rewards["ee_reach"],
+    weight=15.0,
+    params={**cfg.rewards["ee_reach"].params, "std": 0.45, "planar": True},
+  )
+  cfg.rewards["stop_ball"] = replace(cfg.rewards["stop_ball"], weight=120.0)
+  cfg.rewards["goal_conceded"] = RewardTermCfg(
+    func=goalkeeper_goal_conceded,
+    weight=-50.0,
+  )
+  cfg.rewards["intercept_point"] = RewardTermCfg(
+    func=goalkeeper_intercept_point,
+    weight=15.0,
+    params={"std": 0.45},
+  )
+  cfg.rewards["body_intercept"] = RewardTermCfg(
+    func=goalkeeper_body_intercept,
+    weight=5.0,
+    params={"std": 0.35},
+  )
+  cfg.rewards["posture_orientation"] = replace(
+    cfg.rewards["posture_orientation"], weight=1.0
+  )
+  cfg.rewards["feet_slippage"] = replace(cfg.rewards["feet_slippage"], weight=-1.0)
+  cfg.rewards["ang_vel_xy"] = replace(cfg.rewards["ang_vel_xy"], weight=-0.02)
+  return cfg
+
+
+def _set_goalkeeper_region_weights(
+  cfg: ManagerBasedRlEnvCfg,
+  weights: tuple[float, ...],
+) -> None:
+  reset_ball = cfg.events.get("reset_ball")
+  if reset_ball is None:
+    raise KeyError("goalkeeper env is missing reset_ball event")
+  vel_cfg = reset_ball.params["vel_cfg"]
+  vel_cfg.region_weights = weights
+
+
+def unitree_g1_goalkeeper_lstm_midup_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Over-sample the current weak Mid/Up regions for recurrent PPO."""
+  cfg = unitree_g1_goalkeeper_lstm_ppo_env_cfg(play=play)
+  if not play:
+    # Regions: 0 Right-Mid, 1 Left-Mid, 2 Right-Up, 3 Left-Up, 4/5 Low.
+    _set_goalkeeper_region_weights(cfg, (1.5, 1.5, 2.0, 2.0, 0.75, 0.75))
+  return cfg
+
+
+def unitree_g1_goalkeeper_lstm_dive_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Allow aggressive dives by reducing upright/slip pressure."""
+  cfg = unitree_g1_goalkeeper_lstm_ppo_env_cfg(play=play)
+  if not play:
+    cfg.rewards["posture_orientation"] = replace(
+      cfg.rewards["posture_orientation"], weight=0.5
+    )
+    cfg.rewards["feet_slippage"] = replace(cfg.rewards["feet_slippage"], weight=-0.5)
+    cfg.rewards["ang_vel_xy"] = replace(cfg.rewards["ang_vel_xy"], weight=-0.02)
+    cfg.rewards["intercept_point"] = replace(
+      cfg.rewards["intercept_point"], weight=8.0
+    )
+  return cfg
+
+
+def unitree_g1_goalkeeper_lstm_block_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Put more PPO pressure on the actual block/concede objective."""
+  cfg = unitree_g1_goalkeeper_lstm_ppo_env_cfg(play=play)
+  if not play:
+    cfg.rewards["goal_conceded"] = replace(cfg.rewards["goal_conceded"], weight=-75.0)
+    cfg.rewards["stop_ball"] = replace(cfg.rewards["stop_ball"], weight=150.0)
+    cfg.rewards["intercept_point"] = replace(
+      cfg.rewards["intercept_point"],
+      weight=20.0,
+      params={"std": 0.35},
+    )
+  return cfg

@@ -10,10 +10,12 @@ learns timing/reach corrections without destroying the base diving skill.
 from __future__ import annotations
 
 import copy
+import csv
 import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -42,6 +44,8 @@ from src.tasks.soccer.mdp.goalkeeper_rewards import (
   goalkeeper_goal_conceded,
   goalkeeper_intercept_point,
   goalkeeper_no_retreat,
+  goalkeeper_post_save_action_rate,
+  goalkeeper_post_save_ang_vel,
   goalkeeper_posture_orientation,
   goalkeeper_recovery_upright,
   goalkeeper_stay_on_line,
@@ -60,10 +64,13 @@ class Cfg:
   block_iters: int = 20
   blocks: int = 40
   eval_resets: int = 3
+  eval_steps: int = 150
+  episode_length_s: float = 0.0
   lr: float = 1.0e-4
   std: float = 0.06
   residual_scale: float = 0.0
   region_weights: tuple[float, ...] = ()
+  train_regions: tuple[int, ...] = ()
   bc_data: tuple[str, ...] = ()
   bc_coef: float = 0.0
   bc_coef_final: float = 0.0
@@ -71,6 +78,11 @@ class Cfg:
   bc_batch: int = 8192
   bc_max_frames_per_file: int = 0
   bc_max_frames: int = 0
+  failure_csv: str = ""
+  failure_regions: tuple[int, ...] = ()
+  failure_replay_ratio: float = 0.0
+  failure_pos_jitter: float = 0.02
+  failure_vel_jitter: float = 0.05
   w_conceded: float = 15.0
   w_intercept: float = 3.0
   w_body: float = 2.0
@@ -81,12 +93,24 @@ class Cfg:
   w_no_retreat: float = 0.5
   w_feet_slip: float = 0.05
   w_ang_vel: float = 0.02
+  w_post_save_ang_vel: float = 0.06
+  post_save_action_rate: float = 0.04
   action_rate: float = 0.05
   clip_param: float = 0.08
   desired_kl: float = 0.004
   rollback_drop: float = 0.01
+  stable_save_weight: float = 0.75
+  upright_gravity_z: float = -0.35
+  final_ang_vel_xy: float = 3.0
   seed: int = 2810
   device: str = "cuda:0"
+
+
+class EvalStats(NamedTuple):
+  block_rate: float
+  upright_rate: float
+  stable_save_rate: float
+  score: float
 
 
 def _vel_cfg(env):
@@ -100,11 +124,39 @@ def _set_region_weights(env, weights: tuple[float, ...]) -> tuple[float, ...]:
   return old
 
 
-def _eval(env, policy, ball, n_steps: int = 150, n_resets: int = 3) -> float:
+def _restrict_train_regions(env_cfg, train_regions: tuple[int, ...]) -> None:
+  if not train_regions:
+    return
+  bad = [r for r in train_regions if r < 0 or r > 5]
+  if bad:
+    raise ValueError(f"train_regions must be in [0, 5], got {bad}")
+  import copy
+
+  reset_ball = env_cfg.events["reset_ball"]
+  vel_cfg = copy.copy(reset_ball.params["vel_cfg"])
+  vel_cfg.regions = [vel_cfg.regions[i] for i in train_regions]
+  vel_cfg.region_weights = ()
+  reset_ball.params["vel_cfg"] = vel_cfg
+  print(f"[INFO] specialist training on global regions {tuple(train_regions)}", flush=True)
+
+
+def _eval(
+  env,
+  policy,
+  ball,
+  n_steps: int = 150,
+  n_resets: int = 3,
+  stable_save_weight: float = 0.75,
+  upright_gravity_z: float = -0.35,
+  final_ang_vel_xy: float = 3.0,
+) -> EvalStats:
   old_weights = _set_region_weights(env, ())
   num_envs = env.unwrapped.num_envs
   origins = env.unwrapped.scene.env_origins
+  robot = env.unwrapped.scene["robot"]
   blocked = 0
+  upright = 0
+  stable_saves = 0
   total = 0
   try:
     with torch.inference_mode():
@@ -114,14 +166,30 @@ def _eval(env, policy, ball, n_steps: int = 150, n_resets: int = 3) -> float:
         for _ in range(n_steps):
           obs = env.step(policy(obs))[0]
           ball_pos = ball.data.root_link_pos_w
+          ball_x_rel = ball_pos[:, 0] - origins[:, 0]
           entered |= (
-            ((ball_pos[:, 0] - origins[:, 0]) <= -0.5)
+            (ball_x_rel <= -0.5)
             & ((ball_pos[:, 1] - origins[:, 1]).abs() <= 1.5)
             & (ball_pos[:, 2] <= 1.8)
           )
-        blocked += int((~entered).sum())
+        blocked_mask = ~entered
+        upright_mask = robot.data.projected_gravity_b[:, 2] < upright_gravity_z
+        final_ang_vel = torch.linalg.norm(robot.data.root_link_ang_vel_b[:, :2], dim=-1)
+        calm_mask = final_ang_vel < final_ang_vel_xy
+        blocked += int(blocked_mask.sum())
+        upright += int(upright_mask.sum())
+        stable_saves += int((blocked_mask & upright_mask & calm_mask).sum())
         total += num_envs
-    return blocked / max(1, total)
+    denom = max(1, total)
+    block_rate = blocked / denom
+    upright_rate = upright / denom
+    stable_save_rate = stable_saves / denom
+    stable_save_weight = min(1.0, max(0.0, stable_save_weight))
+    score = (
+      stable_save_weight * stable_save_rate
+      + (1.0 - stable_save_weight) * block_rate
+    )
+    return EvalStats(block_rate, upright_rate, stable_save_rate, score)
   finally:
     _set_region_weights(env, old_weights)
 
@@ -158,6 +226,39 @@ def _load_bc_data(cfg: Cfg) -> tuple[torch.Tensor, torch.Tensor] | None:
   return obs, act
 
 
+def _load_failure_bank(cfg: Cfg, device: str) -> dict | None:
+  if not cfg.failure_csv or cfg.failure_replay_ratio <= 0.0:
+    return None
+  starts, vels, regions = [], [], []
+  allowed = set(cfg.failure_regions)
+  with open(cfg.failure_csv, newline="") as f:
+    for row in csv.DictReader(f):
+      region = int(row["true_region"])
+      if allowed and region not in allowed:
+        continue
+      starts.append([float(row["start_x"]), float(row["start_y"]), float(row["start_z"])])
+      vels.append([float(row["vel_x"]), float(row["vel_y"]), float(row["vel_z"])])
+      regions.append(region)
+  if not starts:
+    raise ValueError(
+      f"failure_csv has no rows after region filter {cfg.failure_regions}: {cfg.failure_csv}"
+    )
+  bank = {
+    "start": torch.tensor(starts, dtype=torch.float32, device=device),
+    "vel": torch.tensor(vels, dtype=torch.float32, device=device),
+    "region": torch.tensor(regions, dtype=torch.long, device=device),
+    "ratio": float(cfg.failure_replay_ratio),
+    "pos_jitter": float(cfg.failure_pos_jitter),
+    "vel_jitter": float(cfg.failure_vel_jitter),
+  }
+  print(
+    f"[INFO] failure replay loaded {len(starts)} cases from {cfg.failure_csv} "
+    f"regions={cfg.failure_regions or 'all'} ratio={cfg.failure_replay_ratio}",
+    flush=True,
+  )
+  return bank
+
+
 def _configure_residual_init(cfg: Cfg) -> tuple[str, float, bool]:
   """Return frozen-base path, residual scale, and whether to load cfg.init as actor."""
   if not cfg.init:
@@ -181,8 +282,13 @@ def main(cfg: Cfg) -> None:
   env_cfg = load_env_cfg("Eval-Goalkeeper", play=False)
   env_cfg.scene.num_envs = cfg.num_envs
   env_cfg.seed = cfg.seed
+  if cfg.episode_length_s > 0.0:
+    env_cfg.episode_length_s = cfg.episode_length_s
+  if cfg.train_regions and cfg.region_weights:
+    raise ValueError("Use either train_regions or region_weights, not both.")
   if "fell_over" in env_cfg.terminations:
     env_cfg.terminations["fell_over"] = None
+  _restrict_train_regions(env_cfg, cfg.train_regions)
   env_cfg.rewards = {
     "goal_conceded": RewardTermCfg(
       func=goalkeeper_goal_conceded,
@@ -210,6 +316,14 @@ def main(cfg: Cfg) -> None:
     "no_retreat": RewardTermCfg(func=goalkeeper_no_retreat, weight=-cfg.w_no_retreat),
     "feet_slippage": RewardTermCfg(func=goalkeeper_feet_slippage, weight=-cfg.w_feet_slip),
     "ang_vel_xy": RewardTermCfg(func=goalkeeper_ang_vel_xy, weight=-cfg.w_ang_vel),
+    "post_save_ang_vel": RewardTermCfg(
+      func=goalkeeper_post_save_ang_vel,
+      weight=-cfg.w_post_save_ang_vel,
+    ),
+    "post_save_action_rate": RewardTermCfg(
+      func=goalkeeper_post_save_action_rate,
+      weight=-cfg.post_save_action_rate,
+    ),
     "action_rate": RewardTermCfg(func=action_rate_l2_clip, weight=-cfg.action_rate),
   }
   env_cfg.events["reset_gk_state"] = EventTermCfg(
@@ -224,6 +338,18 @@ def main(cfg: Cfg) -> None:
     ManagerBasedRlEnv(cfg=env_cfg, device=dev),
     clip_actions=100.0,
   )
+  failure_bank = _load_failure_bank(cfg, dev)
+  if failure_bank is not None:
+    setattr(env.unwrapped, "_gk_failure_bank", failure_bank)
+  eval_steps = cfg.eval_steps
+  max_steps = int(getattr(env.unwrapped, "max_episode_length", 0))
+  if max_steps > 0 and eval_steps >= max_steps:
+    eval_steps = max(1, max_steps - 1)
+    print(
+      f"[WARN] --eval-steps reached timeout ({max_steps}); using {eval_steps}. "
+      "Set --episode-length-s larger for long recovery eval.",
+      flush=True,
+    )
 
   import src.tasks.soccer.modules.gk_ballistic_residual as gkbr
 
@@ -275,9 +401,48 @@ def main(cfg: Cfg) -> None:
     with torch.no_grad():
       alg.actor.distribution.std_param.fill_(cfg.std)
 
-  best = _eval(env, policy, ball, n_resets=cfg.eval_resets)
+  best_stats = _eval(
+    env,
+    policy,
+    ball,
+    n_steps=eval_steps,
+    n_resets=cfg.eval_resets,
+    stable_save_weight=cfg.stable_save_weight,
+    upright_gravity_z=cfg.upright_gravity_z,
+    final_ang_vel_xy=cfg.final_ang_vel_xy,
+  )
+  best = best_stats.score
   best_state = copy.deepcopy(alg.actor.state_dict())
-  print(f"[EVAL] init block {100 * best:.1f}%", flush=True)
+
+  def _save_best(score: float) -> None:
+    alg.actor.load_state_dict(best_state)
+    os.makedirs(os.path.dirname(cfg.out), exist_ok=True)
+    saved = alg.save()
+    saved["iter"] = 0
+    saved["infos"] = {"env_state": {"common_step_counter": 0}}
+    saved["ballistic_residual"] = {
+      "base": base_ckpt,
+      "base_hidden": (1024, 512, 256),
+      "residual_scale": residual_scale,
+    }
+    saved["stable_save_eval"] = {
+      "score": score,
+      "stable_save_weight": cfg.stable_save_weight,
+      "upright_gravity_z": cfg.upright_gravity_z,
+      "final_ang_vel_xy": cfg.final_ang_vel_xy,
+    }
+    if cfg.train_regions:
+      saved["train_regions"] = tuple(cfg.train_regions)
+    torch.save(saved, cfg.out)
+
+  _save_best(best)
+  print(
+    f"[EVAL] init score {100 * best_stats.score:.1f}% "
+    f"stable {100 * best_stats.stable_save_rate:.1f}% "
+    f"block {100 * best_stats.block_rate:.1f}% "
+    f"upright {100 * best_stats.upright_rate:.1f}%",
+    flush=True,
+  )
   for block in range(cfg.blocks):
     if cfg.bc_coef > 0.0 and alg.bc_obs is not None:
       frac = block / max(1, cfg.blocks - 1)
@@ -285,33 +450,38 @@ def main(cfg: Cfg) -> None:
     runner.learn(num_learning_iterations=cfg.block_iters, init_at_random_ep_len=False)
     with torch.no_grad():
       alg.actor.distribution.std_param.clamp_(min=1.0e-3, max=cfg.std)
-    rate = _eval(env, policy, ball, n_resets=cfg.eval_resets)
+    stats = _eval(
+      env,
+      policy,
+      ball,
+      n_steps=eval_steps,
+      n_resets=cfg.eval_resets,
+      stable_save_weight=cfg.stable_save_weight,
+      upright_gravity_z=cfg.upright_gravity_z,
+      final_ang_vel_xy=cfg.final_ang_vel_xy,
+    )
     tag = ""
-    if rate >= best:
-      best = rate
+    if stats.score >= best:
+      best = stats.score
       best_state = copy.deepcopy(alg.actor.state_dict())
-      tag = " *best*"
-    elif rate < best - cfg.rollback_drop:
+      _save_best(best)
+      tag = " *best* (saved)"
+    elif stats.score < best - cfg.rollback_drop:
       alg.actor.load_state_dict(best_state)
       tag = " rollback"
     print(
-      f"[EVAL] block {block + 1}/{cfg.blocks}: {100 * rate:.1f}% "
-      f"(best {100 * best:.1f}%){tag}",
+      f"[EVAL] block {block + 1}/{cfg.blocks}: "
+      f"score {100 * stats.score:.1f}% "
+      f"stable {100 * stats.stable_save_rate:.1f}% "
+      f"block {100 * stats.block_rate:.1f}% "
+      f"upright {100 * stats.upright_rate:.1f}% "
+      f"(best score {100 * best:.1f}%){tag}",
       flush=True,
     )
 
   alg.actor.load_state_dict(best_state)
-  os.makedirs(os.path.dirname(cfg.out), exist_ok=True)
-  saved = alg.save()
-  saved["iter"] = 0
-  saved["infos"] = {"env_state": {"common_step_counter": 0}}
-  saved["ballistic_residual"] = {
-    "base": base_ckpt,
-    "base_hidden": (1024, 512, 256),
-    "residual_scale": residual_scale,
-  }
-  torch.save(saved, cfg.out)
-  print(f"[INFO] saved ballistic residual (best {100 * best:.1f}%) to {cfg.out}")
+  _save_best(best)
+  print(f"[INFO] saved ballistic residual (best score {100 * best:.1f}%) to {cfg.out}")
   env.close()
 
 

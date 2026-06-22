@@ -202,7 +202,15 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
     print(f"[INFO] Action dim: {env.num_actions}")
 
     if task_id == "Eval-Goalkeeper":
-        loaded = torch.load(checkpoint_path, map_location=device)
+        loaded = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        if isinstance(loaded, dict) and loaded.get("moe6"):
+            from src.tasks.soccer.modules.gk_moe6 import GoalkeeperMoE6Policy
+
+            print("[INFO] Detected MoE6 checkpoint bundle — loading mixture-of-experts.")
+            policy = GoalkeeperMoE6Policy(loaded, env, device)
+            print(f"[INFO] Policy loaded from: {checkpoint_path}")
+            return policy, env
 
         if "model_state_dict" in loaded:
             from src.tasks.soccer.config.g1.rl_cfg import (
@@ -222,7 +230,10 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
         else:
             from mjlab.rl import MjlabOnPolicyRunner
             from src.tasks.soccer.config.g1.gk_train_cfg import (
+                GoalkeeperRecurrentRunner,
                 goalkeeper_ballistic_residual_runner_cfg,
+                goalkeeper_lstm_ppo_runner_cfg,
+                goalkeeper_lstm_student_runner_cfg,
                 goalkeeper_train_runner_cfg,
             )
 
@@ -235,6 +246,24 @@ def _load_policy(checkpoint_path: str, task_id: str, device: str) -> Any:
                 gkbr.BASE_HIDDEN = tuple(meta.get("base_hidden", (1024, 512, 256)))
                 gkbr.RESIDUAL_SCALE = float(meta.get("residual_scale", 0.25))
                 agent_cfg = goalkeeper_ballistic_residual_runner_cfg()
+            elif loaded.get("goalkeeper_lstm_student"):
+                print("[INFO] Detected recurrent goalkeeper student checkpoint — loading.")
+                agent_cfg = goalkeeper_lstm_student_runner_cfg()
+            elif (
+                loaded.get("goalkeeper_lstm_ppo")
+                or "lstm" in str(checkpoint_path).lower()
+                or any(
+                    ".rnn." in key or key.startswith("rnn.")
+                    for key in loaded.get("actor_state_dict", {})
+                )
+            ):
+                print("[INFO] Detected pure recurrent goalkeeper PPO checkpoint — loading.")
+                agent_cfg = goalkeeper_lstm_ppo_runner_cfg()
+                runner = GoalkeeperRecurrentRunner(env, asdict(agent_cfg), device=device)
+                runner.load(checkpoint_path, load_cfg={"actor": True})
+                policy = runner.get_inference_policy(device=device)
+                print(f"[INFO] Policy loaded from: {checkpoint_path}")
+                return policy, env
             else:
                 print("[INFO] Detected native MLP goalkeeper checkpoint — loading.")
                 agent_cfg = goalkeeper_train_runner_cfg()
@@ -308,6 +337,9 @@ def create_app(checkpoint_path: str, task_id: str, device: str) -> FastAPI:
         stacked = stacked.to(device=device, dtype=torch.float32)
 
         with torch.inference_mode():
+            set_raw_ball_state = getattr(policy, "set_raw_ball_state", None)
+            if set_raw_ball_state is not None:
+                set_raw_ball_state(raw_state["ball"]["pos"], raw_state["ball"]["vel"])
             action = policy({"actor": stacked})
 
         return ActResponse(action=action.cpu().tolist())
