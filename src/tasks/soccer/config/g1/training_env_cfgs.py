@@ -11,10 +11,22 @@ from mjlab.sensor import ContactMatch, ContactSensorCfg
 from src.assets.robots import G1_ACTION_SCALE, get_g1_robot_cfg
 from src.assets.robots.unitree_g1.g1_constants import FULL_COLLISION, HOME_KEYFRAME
 from src.tasks.soccer.config.soccer_settings import SETTINGS
-from src.tasks.soccer.config.training.goalkeeper_env_cfg import make_goalkeeper_env_cfg
+from src.tasks.soccer.config.training.goalkeeper_env_cfg import (
+  configure_goalkeeper_idle_env_cfg,
+  configure_goalkeeper_polish_reward_env_cfg,
+  configure_goalkeeper_prepare_adversarial_env_cfg,
+  configure_goalkeeper_student_ppo_env_cfg,
+  make_goalkeeper_env_cfg,
+)
+from src.tasks.soccer.config.training.adversarial_env_cfg import (
+  make_goalkeeper_adversarial_env_cfg,
+  make_shooter_adversarial_env_cfg,
+)
 from src.tasks.soccer.config.training.stage1_env_cfg import make_stage1_env_cfg
 from src.tasks.soccer.config.training.stage2_env_cfg import make_stage2_env_cfg
 from src.tasks.soccer.config.training.stage3_env_cfg import make_stage3_env_cfg
+from src.tasks.soccer.config.training.stage4_env_cfg import make_stage4_env_cfg
+from src.tasks.soccer.config.training.stage5_env_cfg import make_stage5_env_cfg
 from src.tasks.soccer.mdp import MultiMotionSoccerCommandCfg
 
 import math
@@ -208,6 +220,70 @@ def unitree_g1_stage3_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   return cfg
 
 
+def unitree_g1_stage4_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 shooter Stage IV: high-speed goal-plane accuracy (target 10 m/s)."""
+  cfg = make_stage4_env_cfg()
+  cfg.scene.entities["robot"] = _g1_robot_at(tuple(SETTINGS.scene.shooter_pos), 0.0)
+  _setup_g1_training(cfg)
+
+  if play:
+    cfg.episode_length_s = int(1e9)
+    cfg.observations["actor"].enable_corruption = False
+    cfg.events.pop("push_robot", None)
+    for key in ("anchor_pos_z", "anchor_ori", "ee_body_pos"):
+      cfg.terminations.pop(key, None)
+    from src.tasks.soccer.mdp.shooter_commands import MultiMotionSoccerCommandCfg
+    motion_cmd = cfg.commands.get("motion")
+    if isinstance(motion_cmd, MultiMotionSoccerCommandCfg):
+      motion_cmd.debug_vis = True
+      motion_cmd.sampling_mode = "uniform"
+      motion_cmd.pose_range = {}
+      motion_cmd.velocity_range = {}
+      motion_cmd.joint_position_range = (0.0, 0.0)
+
+  return cfg
+
+
+def unitree_g1_stage5_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 shooter Stage V: compete-aligned coordinates + full-goal accuracy."""
+  cfg = make_stage5_env_cfg()
+  cfg.scene.entities["robot"] = _g1_robot_at((4.0, 0.0, 0.8), math.pi)
+  _setup_g1_training(cfg)
+
+  if play:
+    cfg.episode_length_s = int(1e9)
+    for key in ("anchor_pos_z", "anchor_ori", "ee_body_pos"):
+      cfg.terminations.pop(key, None)
+    from src.tasks.soccer.mdp.shooter_commands import MultiMotionSoccerCommandCfg
+    motion_cmd = cfg.commands.get("motion")
+    if isinstance(motion_cmd, MultiMotionSoccerCommandCfg):
+      motion_cmd.debug_vis = True
+      motion_cmd.sampling_mode = "uniform"
+
+  return cfg
+
+
+def unitree_g1_stage6_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 shooter Stage VI: high-speed compete-aligned kicking."""
+  from src.tasks.soccer.config.training.stage6_env_cfg import make_stage6_env_cfg
+
+  cfg = make_stage6_env_cfg()
+  cfg.scene.entities["robot"] = _g1_robot_at((4.0, 0.0, 0.8), math.pi)
+  _setup_g1_training(cfg)
+
+  if play:
+    cfg.episode_length_s = int(1e9)
+    for key in ("anchor_pos_z", "anchor_ori", "ee_body_pos"):
+      cfg.terminations.pop(key, None)
+    from src.tasks.soccer.mdp.shooter_commands import MultiMotionSoccerCommandCfg
+    motion_cmd = cfg.commands.get("motion")
+    if isinstance(motion_cmd, MultiMotionSoccerCommandCfg):
+      motion_cmd.debug_vis = True
+      motion_cmd.sampling_mode = "uniform"
+
+  return cfg
+
+
 def unitree_g1_student_shooter_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """G1 shooter student: motion-free observation and PPO rewards."""
   from src.tasks.soccer.config.training.student_shooter_env_cfg import make_student_shooter_env_cfg
@@ -270,4 +346,44 @@ def unitree_g1_goalkeeper_training_env_cfg(play: bool = False) -> ManagerBasedRl
     cfg.events.pop("push_robot", None)
     cfg.events.pop("perturb_ball_vel", None)
 
+  return cfg
+
+
+def unitree_g1_shooter_adversarial_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 shooter adversarial training with a real frozen goalkeeper opponent."""
+  cfg = unitree_g1_stage3_env_cfg(play=play)
+  return make_shooter_adversarial_env_cfg(cfg)
+
+
+def unitree_g1_goalkeeper_adversarial_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 goalkeeper adversarial training with a real frozen shooter opponent."""
+  cfg = unitree_g1_goalkeeper_training_env_cfg(play=play)
+  return make_goalkeeper_adversarial_env_cfg(cfg)
+
+
+def unitree_g1_goalkeeper_expert_adversarial_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 MoE regular expert training with a frozen shooter but no shooter obs."""
+  cfg = unitree_g1_goalkeeper_training_env_cfg(play=play)
+  cfg = configure_goalkeeper_polish_reward_env_cfg(cfg)
+  return make_goalkeeper_adversarial_env_cfg(cfg, add_opponent_obs=False)
+
+
+def unitree_g1_goalkeeper_student_ppo_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 conditioned goalkeeper student PPO fine-tuning without an opponent."""
+  cfg = unitree_g1_goalkeeper_training_env_cfg(play=play)
+  return configure_goalkeeper_student_ppo_env_cfg(cfg)
+
+
+def unitree_g1_goalkeeper_idle_training_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 goalkeeper prepare/idle expert training with the original keeper env."""
+  cfg = unitree_g1_goalkeeper_training_env_cfg(play=play)
+  return configure_goalkeeper_idle_env_cfg(cfg)
+
+
+def unitree_g1_goalkeeper_idle_adversarial_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """G1 goalkeeper idle expert training with a real frozen shooter opponent."""
+  cfg = unitree_g1_goalkeeper_training_env_cfg(play=play)
+  cfg = configure_goalkeeper_prepare_adversarial_env_cfg(cfg)
+  cfg = make_goalkeeper_adversarial_env_cfg(cfg)
+  cfg.scene.entities["opponent"] = _g1_robot_at((4.0, 0.0, 0.8), math.pi)
   return cfg

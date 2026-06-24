@@ -11,7 +11,7 @@ from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
 from src.tasks.soccer.config.g1.gk_train_cfg import goalkeeper_train_runner_cfg
 
-_REGION = ["Right-Mid", "Left-Mid", "Right-Up", "Left-Up", "Right-Low", "Left-Low"]
+_REGION = ["Right-Mid", "Left-Mid", "Right-Up", "Left-Up", "Right-Low", "Left-Low", "Prepare"]
 
 
 def _load(env, ckpt, dev):
@@ -34,10 +34,13 @@ class Cfg:
   vz_low: float = -99.0         # if ball vz at crossing < this (steep descent) -> route Low
   latch_hi: float = 3.5         # latch the gate once bx drops below this (raise -> latch earlier)
   default_ckpt: str = ""        # generalist policy used BEFORE latching (avoids a wrong early commit)
+  idle_ckpt: str = ""           # optional prepare/idle expert, used before incoming-ball latch
   perfect_gate: bool = False    # route by TRUE region (upper bound)
   gate: str = ""                # learned gate checkpoint (ball pos+vel -> region)
   use_bundle_gate: bool = True  # read gate params (z_low/z_up/vz_low/latch_hi) from the bundle; set False to sweep via CLI
   mirror_map: str = ""          # replace experts via L/R mirror, e.g. "2:3" => expert2 := mirror(expert3)
+  idle_speed_threshold: float = 0.5
+  idle_incoming_vx_threshold: float = -0.5
   device: str = "cuda:0"
 
 
@@ -55,8 +58,13 @@ def main(cfg: Cfg):
       cfg.z_low = bd.get("z_low", cfg.z_low); cfg.z_up = bd.get("z_up", cfg.z_up)
       cfg.vz_low = bd.get("vz_low", cfg.vz_low); cfg.latch_hi = bd.get("latch_hi", cfg.latch_hi)
       if not cfg.mirror_map: cfg.mirror_map = bd.get("mirror_map", "")
+      cfg.idle_speed_threshold = bd.get("idle_speed_threshold", cfg.idle_speed_threshold)
+      cfg.idle_incoming_vx_threshold = bd.get("idle_incoming_vx_threshold", cfg.idle_incoming_vx_threshold)
     cfg.dir = tempfile.mkdtemp(prefix="moe6_"); cfg.prefix = "_moe6_"  # unique per process (no parallel collision)
     for r in range(6): torch.save(bd["sr"][r], f"{cfg.dir}/_moe6_{r}.pt")
+    idle_state = next((bd[k] for k in ("idle", "prepare", "idle_expert") if k in bd), None)
+    if idle_state is not None:
+      torch.save(idle_state, f"{cfg.dir}/_moe6_6.pt"); cfg.idle_ckpt = f"{cfg.dir}/_moe6_6.pt"
   experts = [_load(env, f"{cfg.dir}/{cfg.prefix}{r}.pt", dev) for r in range(6)]  # idx = region
   if cfg.mirror_map:  # exploit L/R symmetry: use a strong side's expert (mirrored) for the weak side
     from src.tasks.soccer.modules.symmetry import mirror_obs, mirror_action
@@ -68,6 +76,11 @@ def main(cfg: Cfg):
     for pair in cfg.mirror_map.split(","):
       dst, src = (int(x) for x in pair.split(":"))
       experts[dst] = _mir(base_experts[src]); print(f"[INFO] expert {dst} := mirror(expert {src})", flush=True)
+  idle_expert_index = None
+  if cfg.idle_ckpt:
+    idle_expert_index = len(experts)
+    experts.append(_load(env, cfg.idle_ckpt, dev))
+    print(f"[INFO] prepare/idle expert loaded as class {idle_expert_index}", flush=True)
   default_policy = _load(env, cfg.default_ckpt, dev) if cfg.default_ckpt else None
   ball = env.unwrapped.scene["ball"]; org = env.unwrapped.scene.env_origins
   N = cfg.num_envs; g = 9.81
@@ -75,11 +88,14 @@ def main(cfg: Cfg):
   gnet = gmean = gstd = None
   if cfg.gate:
     gd = torch.load(cfg.gate, map_location=dev, weights_only=False)
+    num_classes = int(gd.get("num_classes", gd["state"]["4.weight"].shape[0]))
     gnet = torch.nn.Sequential(torch.nn.Linear(6, 128), torch.nn.ReLU(),
                                torch.nn.Linear(128, 128), torch.nn.ReLU(),
-                               torch.nn.Linear(128, 6)).to(dev)
+                               torch.nn.Linear(128, num_classes)).to(dev)
     gnet.load_state_dict(gd["state"]); gnet.eval()
     gmean = gd["mean"].to(dev); gstd = gd["std"].to(dev)
+    if gd.get("idle_class") is not None and idle_expert_index is None:
+      print("[WARN] gate has an idle class but no --idle-ckpt/bundle idle expert was provided", flush=True)
 
   def gate_region():
     bp = ball.data.root_link_pos_w; bv = ball.data.root_link_lin_vel_w
@@ -88,6 +104,8 @@ def main(cfg: Cfg):
     if gnet is not None:
       f = torch.cat([torch.stack([bx, bp[:, 1] - org[:, 1], bp[:, 2]], -1), bv], -1)
       region = gnet((f - gmean) / gstd).argmax(1)
+      if idle_expert_index is None:
+        region = region.clamp(max=5)
       return region, valid
     t = torch.clamp(-(bx - cfg.land_x) / (vx - 1e-3), 0.0, 2.0)
     cy = (bp[:, 1] - org[:, 1]) + bv[:, 1] * t
@@ -111,11 +129,16 @@ def main(cfg: Cfg):
       for _ in range(150):
         reg, valid = gate_region()
         newl = valid & (latched < 0); latched = torch.where(newl, reg, latched)
+        speed = torch.norm(ball.data.root_link_lin_vel_w, dim=-1)
+        idle = (speed < cfg.idle_speed_threshold) | (ball.data.root_link_lin_vel_w[:, 0] >= cfg.idle_incoming_vx_threshold)
         if cfg.perfect_gate and truereg is not None:
           use = truereg
         else:
-          use = torch.where(latched < 0, torch.zeros_like(latched), latched)
-        acts = torch.stack([e(obs) for e in experts], 0)   # (6,N,29)
+          default_use = torch.zeros_like(latched)
+          if idle_expert_index is not None:
+            default_use = torch.where(idle, torch.full_like(default_use, idle_expert_index), default_use)
+          use = torch.where(latched < 0, default_use, latched).clamp(max=len(experts) - 1)
+        acts = torch.stack([e(obs) for e in experts], 0)
         a = acts[use, torch.arange(N, device=dev)]
         if default_policy is not None and not cfg.perfect_gate:  # pre-latch: neutral generalist (no wrong early commit)
           a = torch.where((latched < 0).unsqueeze(1), default_policy(obs), a)

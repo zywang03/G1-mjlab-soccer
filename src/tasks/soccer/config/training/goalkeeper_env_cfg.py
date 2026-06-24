@@ -36,7 +36,24 @@ from src.tasks.soccer.soccer_env_cfg import _add_soccer_scene_postproc
 
 from src.tasks.soccer.mdp.goalkeeper_rewards import (
   _reset_gk_state,
+  goalkeeper_active_action_rate,
+  goalkeeper_active_body_intercept,
+  goalkeeper_active_condition_target_reach,
+  goalkeeper_active_goal_conceded,
+  goalkeeper_active_intercept_point,
+  goalkeeper_active_stop_ball,
+  goalkeeper_ball_started,
+  goalkeeper_idle_action_rate,
+  goalkeeper_idle_base_height_band,
+  goalkeeper_body_intercept,
+  goalkeeper_idle_timeout,
   goalkeeper_ee_reach,
+  goalkeeper_goal_conceded,
+  goalkeeper_idle_fall_penalty,
+  goalkeeper_idle_alive,
+  goalkeeper_idle_leg_ready_pose,
+  goalkeeper_idle_low_base_height,
+  goalkeeper_intercept_point,
   goalkeeper_stop_ball,
   goalkeeper_stay_on_line,
   goalkeeper_no_retreat,
@@ -56,8 +73,13 @@ from src.tasks.soccer.mdp.goalkeeper_obs import (
   gk_last_action,
   gk_lin_vel,
 )
+from src.tasks.soccer.mdp.goalkeeper_student_obs import goalkeeper_student_obs
 from src.tasks.soccer.mdp.shooter_rewards import action_rate_l2_clip
-from src.tasks.soccer.mdp.goalkeeper_ball_reset import RegionBallVelCfg, reset_ball_with_parabolic_trajectory
+from src.tasks.soccer.mdp.goalkeeper_ball_reset import (
+  RegionBallVelCfg,
+  reset_ball_static_for_goalkeeper_idle,
+  reset_ball_with_parabolic_trajectory,
+)
 
 
 def make_goalkeeper_env_cfg() -> ManagerBasedRlEnvCfg:
@@ -326,3 +348,186 @@ def make_goalkeeper_env_cfg() -> ManagerBasedRlEnvCfg:
     decimation=4,
     episode_length_s=SETTINGS.goalkeeper_episode_length_s,  # 3s, matches paper
   )
+
+
+def configure_goalkeeper_polish_reward_env_cfg(
+  cfg: ManagerBasedRlEnvCfg,
+  *,
+  idle_fall_penalty_weight: float | None = None,
+  posture_weight: float = 0.0,
+  action_rate_weight: float = -0.1,
+  ang_vel_xy_weight: float | None = None,
+  gate_active_rewards: bool = False,
+  idle_alive_weight: float | None = None,
+  idle_action_rate_weight: float | None = None,
+) -> ManagerBasedRlEnvCfg:
+  """Use the train_polish-style save/concede reward set."""
+  goal_conceded_func = goalkeeper_active_goal_conceded if gate_active_rewards else goalkeeper_goal_conceded
+  intercept_func = goalkeeper_active_intercept_point if gate_active_rewards else goalkeeper_intercept_point
+  body_func = goalkeeper_active_body_intercept if gate_active_rewards else goalkeeper_body_intercept
+  stop_ball_func = goalkeeper_active_stop_ball if gate_active_rewards else goalkeeper_stop_ball
+  action_rate_func = goalkeeper_active_action_rate if gate_active_rewards else action_rate_l2_clip
+  cfg.rewards = {
+    "goal_conceded": RewardTermCfg(
+      func=goal_conceded_func,
+      weight=-10.0,
+      params={},
+    ),
+    "intercept": RewardTermCfg(
+      func=intercept_func,
+      weight=2.0,
+      params={"std": 0.4},
+    ),
+    "condition_target_reach": RewardTermCfg(
+      func=goalkeeper_active_condition_target_reach,
+      weight=1.0,
+      params={"std": 0.35, "ball_switch_x": 0.5},
+    ),
+    "body": RewardTermCfg(
+      func=body_func,
+      weight=2.0,
+      params={"std": 0.35},
+    ),
+    "stop_ball": RewardTermCfg(
+      func=stop_ball_func,
+      weight=1.0,
+      params={"velocity_drop_threshold": 2.0, "goal_x": -0.5},
+    ),
+    "posture": RewardTermCfg(
+      func=goalkeeper_posture_orientation,
+      weight=posture_weight,
+    ),
+    "action_rate": RewardTermCfg(func=action_rate_func, weight=action_rate_weight),
+  }
+  if idle_fall_penalty_weight is not None:
+    cfg.rewards["idle_fall_penalty"] = RewardTermCfg(
+      func=goalkeeper_idle_fall_penalty,
+      weight=idle_fall_penalty_weight,
+    )
+  if idle_alive_weight is not None:
+    cfg.rewards["idle_alive"] = RewardTermCfg(
+      func=goalkeeper_idle_alive,
+      weight=idle_alive_weight,
+    )
+  if idle_action_rate_weight is not None:
+    cfg.rewards["idle_action_rate"] = RewardTermCfg(
+      func=goalkeeper_idle_action_rate,
+      weight=idle_action_rate_weight,
+    )
+  if ang_vel_xy_weight is not None:
+    cfg.rewards["ang_vel_xy"] = RewardTermCfg(
+      func=goalkeeper_ang_vel_xy,
+      weight=ang_vel_xy_weight,
+    )
+  return cfg
+
+
+def configure_goalkeeper_student_ppo_env_cfg(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
+  """Train the 964D position-conditioned LSTM goalkeeper student with PPO."""
+  cfg.observations["actor"] = ObservationGroupCfg(
+    terms={"student": ObservationTermCfg(func=goalkeeper_student_obs)},
+    concatenate_terms=True,
+    enable_corruption=False,
+    history_length=1,
+  )
+  configure_goalkeeper_polish_reward_env_cfg(
+    cfg,
+    idle_fall_penalty_weight=-2000.0,
+    posture_weight=2.0,
+    gate_active_rewards=True,
+    idle_alive_weight=0.1,
+    idle_action_rate_weight=-0.05,
+  )
+  cfg.rewards["idle_low_base_height"] = RewardTermCfg(
+    func=goalkeeper_idle_low_base_height,
+    weight=-20.0,
+    params={"target_z": 0.73},
+  )
+  cfg.rewards["idle_base_height_band"] = RewardTermCfg(
+    func=goalkeeper_idle_base_height_band,
+    weight=5.0,
+    params={"target_z": 0.72, "tolerance": 0.05, "low_margin": 0.08},
+  )
+  cfg.rewards["idle_leg_ready_pose"] = RewardTermCfg(
+    func=goalkeeper_idle_leg_ready_pose,
+    weight=-5.0,
+  )
+  return cfg
+
+
+def configure_goalkeeper_idle_env_cfg(cfg: ManagerBasedRlEnvCfg) -> ManagerBasedRlEnvCfg:
+  """Turn a goalkeeper interception cfg into an adversarial idle-expert cfg."""
+  _BALL_CFG = SceneEntityCfg("ball")
+
+  cfg.events["reset_ball"] = EventTermCfg(
+    func=reset_ball_static_for_goalkeeper_idle,
+    mode="reset",
+    params={
+      "ball_pos": (3.0, 0.0, SETTINGS.ball.radius),
+      "idle_wait_range_s": (8.0, 12.0),
+      "ball_cfg": _BALL_CFG,
+    },
+  )
+  cfg.events.pop("push_robot", None)
+  cfg.events.pop("perturb_ball_vel", None)
+
+  cfg.rewards = {
+    "idle_fall_penalty": RewardTermCfg(func=goalkeeper_idle_fall_penalty, weight=-2000.0),
+    "idle_low_base_height": RewardTermCfg(
+      func=goalkeeper_idle_low_base_height,
+      weight=-20.0,
+      params={"target_z": 0.72},
+    ),
+    "idle_base_height_band": RewardTermCfg(
+      func=goalkeeper_idle_base_height_band,
+      weight=5.0,
+      params={"target_z": 0.72, "tolerance": 0.05, "low_margin": 0.08},
+    ),
+  }
+
+  cfg.terminations["time_out"] = TerminationTermCfg(func=goalkeeper_idle_timeout, time_out=True)
+  cfg.terminations["ball_started"] = TerminationTermCfg(
+    func=goalkeeper_ball_started,
+    params={"speed_threshold": 0.5, "incoming_vx_threshold": -0.5},
+  )
+  cfg.episode_length_s = 12.0
+  return cfg
+
+
+def configure_goalkeeper_prepare_adversarial_env_cfg(
+  cfg: ManagerBasedRlEnvCfg,
+) -> ManagerBasedRlEnvCfg:
+  """Prepare expert: polish reward plus a waiting-phase fall penalty."""
+  _BALL_CFG = SceneEntityCfg("ball")
+
+  cfg.events["reset_ball"] = EventTermCfg(
+    func=reset_ball_static_for_goalkeeper_idle,
+    mode="reset",
+    params={
+      "ball_pos": (3.0, 0.0, SETTINGS.ball.radius),
+      "idle_wait_range_s": (8.0, 12.0),
+      "ball_cfg": _BALL_CFG,
+    },
+  )
+  cfg.events.pop("push_robot", None)
+  cfg.events.pop("perturb_ball_vel", None)
+  configure_goalkeeper_polish_reward_env_cfg(
+    cfg,
+    idle_fall_penalty_weight=-2000.0,
+    posture_weight=2.0,
+    action_rate_weight=-0.5,
+    ang_vel_xy_weight=-0.5,
+  )
+  cfg.rewards["idle_low_base_height"] = RewardTermCfg(
+    func=goalkeeper_idle_low_base_height,
+    weight=-20.0,
+    params={"target_z": 0.73},
+  )
+  cfg.rewards["idle_leg_ready_pose"] = RewardTermCfg(
+    func=goalkeeper_idle_leg_ready_pose,
+    weight=-5.0,
+  )
+  cfg.terminations["time_out"] = TerminationTermCfg(func=mdp.time_out, time_out=True)
+  cfg.terminations.pop("ball_started", None)
+  cfg.episode_length_s = 12.0
+  return cfg

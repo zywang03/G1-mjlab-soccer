@@ -58,6 +58,7 @@ class EvalConfig:
   video_height: int = 480
   video_width: int = 640
   summary_json: str | None = None
+  save_npz: str | None = None
 
 
 class ZeroPolicy:
@@ -85,25 +86,26 @@ def _load_policy(checkpoint_path: str, env, device: str):
 # -- Vectorised metrics -------------------------------------------------------
 
 
-def _is_goal(ball_pos: torch.Tensor) -> torch.Tensor:
+def _is_goal(ball_pos: torch.Tensor, goal_idx: int, goal_val: float) -> torch.Tensor:
   """Return bool mask: ball has crossed the goal plane inside the frame."""
+  lateral_idx = 1 if goal_idx == 0 else 0
   return (
-    (ball_pos[:, 1] <= _GOAL_Y)
-    & (torch.abs(ball_pos[:, 0]) <= _GOAL_HALF_WIDTH)
+    (ball_pos[:, goal_idx] <= goal_val)
+    & (torch.abs(ball_pos[:, lateral_idx]) <= _GOAL_HALF_WIDTH)
     & (ball_pos[:, 2] >= 0.0)
     & (ball_pos[:, 2] <= _GOAL_HEIGHT)
   )
 
 
-def _kick_accuracy_vec(ball_vel: torch.Tensor, ball_pos: torch.Tensor) -> torch.Tensor:
+def _kick_accuracy_vec(ball_vel: torch.Tensor, ball_pos: torch.Tensor, goal_center: list[float]) -> torch.Tensor:
   """Cosine similarity between ball vel (XY) and ball→goal-centre vector.
 
   Batched: each row is one environment.
   """
   v_xy = ball_vel[:, :2]
   target_xy = torch.stack([
-    _GOAL_CENTER[0] - ball_pos[:, 0],
-    _GOAL_CENTER[1] - ball_pos[:, 1],
+    goal_center[0] - ball_pos[:, 0],
+    goal_center[1] - ball_pos[:, 1],
   ], dim=-1)
   v_norm = torch.linalg.vector_norm(v_xy, dim=-1)
   t_norm = torch.linalg.vector_norm(target_xy, dim=-1)
@@ -118,6 +120,10 @@ def _run_batch(env, policy, max_steps: int, num_envs: int) -> dict[str, torch.Te
 
   Uses local coords (ball_world - env_origins) for goal-line checks so
   multi-env parallel eval is correct.
+
+  Auto-detects goal-plane geometry from the command config:
+  ``destination_lateral_axis`` determines which axis is the attack
+  direction and which is lateral.
   """
   obs = env.reset()
   if isinstance(obs, tuple):
@@ -131,7 +137,16 @@ def _run_batch(env, policy, max_steps: int, num_envs: int) -> dict[str, torch.Te
   env_origins = base_env.scene.env_origins
 
   command = base_env.command_manager.get_term("motion")
-  target_x = command.target_destination_pos[:, 0].detach().clone()
+
+  # Detect goal-plane geometry from command config.
+  if hasattr(command.cfg, "destination_lateral_axis") and command.cfg.destination_lateral_axis == "y":
+    goal_idx, goal_val, lateral_idx = 0, -0.5, 1   # x-coord for goal plane, y for lateral
+  else:
+    goal_idx, goal_val, lateral_idx = 1, -5.0, 0   # y-coord for goal plane, x for lateral
+
+  target_lateral = command.target_destination_pos[:, lateral_idx].detach().clone()
+  goal_center = [0.0, 0.0, 0.9]
+  goal_center[goal_idx] = goal_val
 
   kicked = torch.zeros(num_envs, dtype=torch.bool, device=device)
   kick_speed = torch.zeros(num_envs, dtype=torch.float32, device=device)
@@ -172,26 +187,26 @@ def _run_batch(env, policy, max_steps: int, num_envs: int) -> dict[str, torch.Te
     if torch.any(new_kick):
       kicked[new_kick] = True
       kick_speed[new_kick] = speed[new_kick]
-      kick_acc[new_kick] = _kick_accuracy_vec(ball_vel, ball_local)[new_kick]
+      kick_acc[new_kick] = _kick_accuracy_vec(ball_vel, ball_local, goal_center)[new_kick]
       abs_z_speed[new_kick] = ball_vel[new_kick, 2].abs()
 
-    new_goal = step_active & _is_goal(ball_local)
+    new_goal = step_active & _is_goal(ball_local, goal_idx, goal_val)
     if torch.any(new_goal):
       goal_scored[new_goal] = True
 
-    ball_final_y[step_active] = ball_local[:, 1][step_active]
+    ball_final_y[step_active] = ball_local[:, goal_idx][step_active]
 
     # Goal-plane crossing detection (local coords).
     can_cross = step_active & (~cross_recorded)
     if torch.any(can_cross):
-      crossed = can_cross & (prev_ball_local[:, 1] > _GOAL_Y) & (ball_local[:, 1] <= _GOAL_Y)
+      crossed = can_cross & (prev_ball_local[:, goal_idx] > goal_val) & (ball_local[:, goal_idx] <= goal_val)
       if torch.any(crossed):
-        dy = ball_local[:, 1] - prev_ball_local[:, 1]
-        safe = torch.where(dy >= 0, torch.tensor(1e-6, device=device),
+        dg = ball_local[:, goal_idx] - prev_ball_local[:, goal_idx]
+        safe = torch.where(dg >= 0, torch.tensor(1e-6, device=device),
                            torch.tensor(-1e-6, device=device))
-        alpha = ((_GOAL_Y - prev_ball_local[:, 1]) / (dy + safe)).clamp(0.0, 1.0).unsqueeze(-1)
+        alpha = ((goal_val - prev_ball_local[:, goal_idx]) / (dg + safe)).clamp(0.0, 1.0).unsqueeze(-1)
         cross_pos = prev_ball_local + alpha * (ball_local - prev_ball_local)
-        target_error[crossed] = (cross_pos[crossed, 0] - target_x[crossed]).abs()
+        target_error[crossed] = (cross_pos[crossed, lateral_idx] - target_lateral[crossed]).abs()
         cross_pos_z[crossed] = cross_pos[crossed, 2]
         cross_recorded[crossed] = True
 
@@ -218,6 +233,7 @@ def _run_batch(env, policy, max_steps: int, num_envs: int) -> dict[str, torch.Te
     "cross_recorded": cross_recorded.cpu(),
     "target_error": target_error.cpu(),
     "cross_pos_z": cross_pos_z.cpu(),
+    "_goal_val": goal_val,
   }
 
 
@@ -240,7 +256,8 @@ def _summarise(metrics: dict[str, torch.Tensor]) -> dict:
     mean_speed = 0.0
     mean_abs_z = 0.0
 
-  ball_past = int((metrics["ball_final_y"] <= _GOAL_Y).sum().item())
+  goal_val = metrics.get("_goal_val", _GOAL_Y)
+  ball_past = int((metrics["ball_final_y"] <= goal_val).sum().item())
   crossed = int(metrics["cross_recorded"].sum().item())
 
   finite = torch.isfinite(metrics["target_error"])
@@ -370,7 +387,7 @@ def run_eval(cfg: EvalConfig):
     env_base.seed = cfg.seed + trial_offset  # unique seed per batch for diversity
     take = min(num_envs, remaining)
     metrics = _run_batch(env, policy, max_steps=500, num_envs=num_envs)
-    metrics = {k: v[:take] for k, v in metrics.items()}
+    metrics = {k: v[:take] for k, v in metrics.items() if k != "_goal_val"}
     for k, v in metrics.items():
       all_metrics.setdefault(k, []).append(v)
 
@@ -388,6 +405,10 @@ def run_eval(cfg: EvalConfig):
 
     trial_offset += take
     remaining -= take
+
+    import gc
+    torch.cuda.empty_cache()
+    gc.collect()
 
   merged = {k: torch.cat(v, dim=0) for k, v in all_metrics.items()}
   summary = _summarise(merged)
@@ -414,6 +435,22 @@ def run_eval(cfg: EvalConfig):
     out = Path(cfg.summary_json)
     out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"[INFO] Wrote summary to: {out.resolve()}")
+
+  if cfg.save_npz:
+    import numpy as np
+    from pathlib import Path
+    npz_path = Path(cfg.save_npz)
+    npz_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(npz_path,
+      kick_speed=merged["kick_speed"].numpy(),
+      target_error=merged["target_error"].numpy(),
+      goal_scored=merged["goal"].numpy(),
+      cross_recorded=merged["cross_recorded"].numpy(),
+      kick_accuracy=merged["kick_accuracy"].numpy(),
+      cross_pos_z=merged["cross_pos_z"].numpy(),
+      abs_z_speed=merged["abs_z_speed"].numpy(),
+    )
+    print(f"[INFO] Saved per-trial metrics to: {npz_path.resolve()}")
 
   env.close()
 

@@ -73,6 +73,14 @@ class GoalkeeperActorCritic(nn.Module):
     init_noise_std=1.0,
     **kwargs,
   ):
+    hidden_dims = kwargs.pop("hidden_dims", None)
+    _ = kwargs.pop("obs_normalization", None)
+    distribution_cfg = kwargs.pop("distribution_cfg", None)
+    if hidden_dims is not None:
+      actor_hidden_dims = tuple(hidden_dims)
+      critic_hidden_dims = tuple(hidden_dims)
+    if isinstance(distribution_cfg, dict):
+      init_noise_std = distribution_cfg.get("init_std", init_noise_std)
     if kwargs:
       print(
         "GoalkeeperActorCritic.__init__ got unexpected arguments: "
@@ -102,6 +110,7 @@ class GoalkeeperActorCritic(nn.Module):
     self.num_critic_obs = num_critic_obs
     self.num_one_step_obs = num_one_step_obs
     self.actor_history_length = actor_history_length
+    self.group_name = group_name
     self.num_actions = num_actions
     self.history_latent_dim = 16
     self.estimate_ball_dim = 6
@@ -175,7 +184,7 @@ class GoalkeeperActorCritic(nn.Module):
     self.distribution = None
     self.estimate_ball = None
     self.estimate_region = None
-    Normal.set_default_validate_args = False
+    Normal.set_default_validate_args(False)
 
     print(f"Actor MLP: {self.actor}")
     print(f"Critic MLP: {self.critic}")
@@ -184,6 +193,15 @@ class GoalkeeperActorCritic(nn.Module):
     print(f"Region MLP: {self.region_estimator}")
 
   def reset(self, dones=None):
+    pass
+
+  def get_hidden_state(self):
+    return None
+
+  def detach_hidden_state(self, dones=None):
+    pass
+
+  def update_normalization(self, obs):
     pass
 
   def _extract_tensor(self, obs, group="actor"):
@@ -223,10 +241,14 @@ class GoalkeeperActorCritic(nn.Module):
       chunks.append(block.view(B, self._HISTORY_LEN, sz))
       offset += self._HISTORY_LEN * sz
     # (B, 10, 3+3+3+29+29+29) = (B, 10, 96) → (B, 960)
-    return torch.cat(chunks, dim=-1).reshape(B, -1)
+    return torch.cat(chunks, dim=-1).reshape(B, self._HISTORY_LEN * self._ONE_STEP_DIM)
 
-  def forward(self, obs, **kwargs):
-    return self.act_inference(self._extract_tensor(obs), **kwargs)
+  def forward(self, obs, masks=None, hidden_state=None, stochastic_output=False):
+    if self.group_name == "critic":
+      return self.evaluate(obs)
+    x = self._extract_tensor(obs, group="actor")
+    self.update_distribution(x)
+    return self.distribution.sample() if stochastic_output else self.distribution.mean
 
   @property
   def action_mean(self):
@@ -263,6 +285,34 @@ class GoalkeeperActorCritic(nn.Module):
 
   def get_actions_log_prob(self, actions):
     return self.distribution.log_prob(actions).sum(dim=-1)
+
+  def get_output_log_prob(self, actions):
+    return self.get_actions_log_prob(actions)
+
+  @property
+  def output_mean(self):
+    return self.distribution.mean
+
+  @property
+  def output_std(self):
+    return self.distribution.stddev
+
+  @property
+  def output_entropy(self):
+    return self.distribution.entropy().sum(dim=-1)
+
+  @property
+  def output_distribution_params(self):
+    return (self.distribution.mean, self.distribution.stddev)
+
+  def get_kl_divergence(self, old_params, new_params):
+    old_mean, old_std = old_params
+    new_mean, new_std = new_params
+    return (
+      torch.log(new_std / old_std)
+      + (old_std.pow(2) + (old_mean - new_mean).pow(2)) / (2.0 * new_std.pow(2))
+      - 0.5
+    ).sum(dim=-1)
 
   def act_inference(self, obs_history, observations=None):
     """Deterministic inference — used at eval/play time."""

@@ -85,16 +85,33 @@ class TrainConfig:
   video_interval: int = 2000
   enable_nan_guard: bool = False
   load_actor_only: bool = False
+  load_model_only: bool = False
   load_checkpoint_path: str | None = None
+  frozen_opponent_checkpoint_path: str | None = None
+  frozen_opponent_role: Literal["shooter", "goalkeeper"] | None = None
+  frozen_opponent_task_id: str | None = None
   torchrunx_log_dir: str | None = None
   gpu_ids: list[int] | Literal["all"] | None = field(default_factory=lambda: [0])
   ball_speed_std: float | None = None
+  actor_std_override: float | None = None
+  init_at_random_ep_len: bool = True
 
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
     env_cfg = load_env_cfg(task_id)
     agent_cfg = load_rl_cfg(task_id)
     return TrainConfig(env=env_cfg, agent=agent_cfg)
+
+
+def _override_actor_std(runner, std: float) -> None:
+  actor = getattr(getattr(runner, "alg", None), "actor", None)
+  distribution = getattr(actor, "distribution", None)
+  std_param = getattr(distribution, "std_param", None)
+  if std_param is None:
+    raise AttributeError("actor distribution does not expose std_param")
+  with torch.no_grad():
+    std_param.fill_(float(std))
+  print(f"[INFO] Overriding loaded actor action std: {float(std):.4f}")
 
 
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
@@ -204,6 +221,31 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     print("[INFO] Recording videos during training.")
 
   env = RslRlVecEnvWrapper(env, clip_actions=cfg.agent.clip_actions)
+  if cfg.frozen_opponent_checkpoint_path:
+    if cfg.frozen_opponent_role is None or cfg.frozen_opponent_task_id is None:
+      raise ValueError(
+        "frozen_opponent_role and frozen_opponent_task_id must be set with "
+        "frozen_opponent_checkpoint_path"
+      )
+    from src.tasks.soccer.adversarial import (
+      FrozenOpponentSpec,
+      FrozenOpponentVecEnvWrapper,
+      build_frozen_opponent_policy,
+    )
+
+    opponent_spec = FrozenOpponentSpec(
+      role=cfg.frozen_opponent_role,
+      checkpoint=cfg.frozen_opponent_checkpoint_path,
+      task_id=cfg.frozen_opponent_task_id,
+    )
+    opponent_policy = build_frozen_opponent_policy(
+      opponent_spec, device=device, num_envs=env.num_envs,
+    )
+    env = FrozenOpponentVecEnvWrapper(
+      env,
+      opponent_policy=opponent_policy,
+      opponent_role=cfg.frozen_opponent_role,
+    )
 
   agent_cfg = asdict(cfg.agent)
   env_cfg = asdict(cfg.env)
@@ -223,8 +265,15 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
         str(resume_path),
         load_cfg={"actor": True, "critic": False, "optimizer": False, "iteration": False},
       )
+    elif cfg.load_model_only:
+      runner.load(
+        str(resume_path),
+        load_cfg={"actor": True, "critic": True, "optimizer": False, "iteration": False},
+      )
     else:
       runner.load(str(resume_path))
+    if cfg.actor_std_override is not None:
+      _override_actor_std(runner, cfg.actor_std_override)
 
   # Only write config files from rank 0 to avoid race conditions.
   if rank == 0:
@@ -232,7 +281,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     dump_yaml(log_dir / "params" / "agent.yaml", agent_cfg)
 
   runner.learn(
-    num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True
+    num_learning_iterations=cfg.agent.max_iterations,
+    init_at_random_ep_len=cfg.init_at_random_ep_len,
   )
 
   env.close()

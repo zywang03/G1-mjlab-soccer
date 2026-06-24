@@ -83,8 +83,7 @@ class MultiMotionLoader:
 
   def __init__(self, motion_dir: str, body_indexes: torch.Tensor, device: str = "cpu",
                motion_glob: str = "*.npz"):
-    pattern = os.path.join(motion_dir, motion_glob)
-    files = sorted(glob.glob(pattern))
+    pattern, files = _find_motion_files(motion_dir, motion_glob)
     if not files:
       raise FileNotFoundError(f"No files matching {pattern}")
     self.num_files = len(files)
@@ -169,6 +168,12 @@ class MultiMotionLoader:
   def get_last_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int, motion_length: int) -> torch.Tensor:
     last = max(0, motion_length - 1)
     return self._body_pos_w[motion_idx, last, anchor_body_idx]
+
+
+def _find_motion_files(motion_dir: str, motion_glob: str = "*.npz") -> tuple[str, list[str]]:
+  pattern = os.path.join(glob.escape(motion_dir), motion_glob)
+  files = sorted(glob.glob(pattern))
+  return pattern, files
 
 
 class MultiMotionSoccerCommand(CommandTerm):
@@ -644,7 +649,7 @@ class MultiMotionSoccerCommand(CommandTerm):
     """
     if self.cfg.fixed_ball_pos is not None:
       fp = torch.tensor(self.cfg.fixed_ball_pos, device=self.device)
-      self.soccer_ball_pos[env_ids] = fp - self._env.scene.env_origins[env_ids]
+      self.soccer_ball_pos[env_ids] = fp
       return
 
     arc_limit = float(self._target_arc_angle)
@@ -795,7 +800,7 @@ class MultiMotionSoccerCommandCfg(CommandTermCfg):
   soccer_ball_init_lin_vel_range: dict[str, tuple[float, float]] | None = None
 
   fixed_ball_pos: tuple[float, float, float] | None = None
-  """If set, ball is always placed at this fixed world position (eval mode)."""
+  """If set, ball is always placed at this fixed env-local position."""
 
   motion_origin_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
   """XYZ offset added to the motion root position (eval: shift from origin to world)."""
@@ -805,3 +810,277 @@ class MultiMotionSoccerCommandCfg(CommandTermCfg):
 
   def build(self, env: ManagerBasedRlEnv) -> MultiMotionSoccerCommand:
     return MultiMotionSoccerCommand(self, env)
+
+
+# -- Stage 3: adaptive goal-plane target sampling --------------------------------
+
+
+@dataclass(kw_only=True)
+class Stage3SoccerCommandCfg(MultiMotionSoccerCommandCfg):
+  """Stage 3 command config with adaptive goal-plane target bin sampling.
+
+  Inherits all Stage 2 fields.  Adds error-weighted adaptive target
+  selection so that poorly-hit x-regions are sampled more often.
+  Stage 2 behaviour is completely unaffected — only Stage 3 tasks
+  use this config class.
+  """
+
+  adaptive_target: bool = True
+  """If True, sample target_x bins weighted by historical EMA crossing error."""
+
+  target_bins: int = 11
+  """Number of equal-width bins across destination_length (default 11 × 0.2m)."""
+
+  target_alpha: float = 0.3
+  """EMA decay for per-bin error histogram."""
+
+  destination_lateral_axis: Literal["x", "y"] = "x"
+  """Which axis of destination_center to sample laterally.
+  'x' = vary x, keep y fixed (Stage 3/4 default, -y attack).
+  'y' = vary y, keep x fixed (Stage 5, -x attack)."""
+
+  def build(self, env: ManagerBasedRlEnv) -> "Stage3SoccerCommand":
+    return Stage3SoccerCommand(self, env)
+
+
+class Stage3SoccerCommand(MultiMotionSoccerCommand):
+  """Stage 3 command term: adaptive goal-plane target point sampling.
+
+  Maintains a per-bin EMA failure histogram (binary: did the crossing
+  error exceed 0.3 m?) and biases ``target_x`` sampling toward
+  regions that haven't been mastered yet.  Once a bin's EMA drops
+  below the other bins, attention shifts to the next weakest region.
+
+  This mirrors Stage I's adaptive motion-phase sampling: binary
+  success/failure signal + EMA decay = natural attention shift.
+  """
+
+  cfg: Stage3SoccerCommandCfg
+
+  def __init__(self, cfg: Stage3SoccerCommandCfg, env: ManagerBasedRlEnv):
+    # Init adaptive state BEFORE super().__init__ — the parent calls
+    # _update_destination_points which dispatches to the overridden method.
+    self._device = env.device
+    self._num_envs = env.num_envs
+    self.destination_length = cfg.destination_length
+    self.destination_center = torch.tensor(cfg.destination_center, device=self._device)
+
+    half_len = self.destination_length / 2.0
+    self._bin_edges = torch.linspace(
+      -half_len, half_len, cfg.target_bins + 1, device=self._device,
+    )
+    self._bin_centers = (self._bin_edges[:-1] + self._bin_edges[1:]) / 2.0
+
+    # All bins start at 1.0 → equal probability → broad exploration.
+    self.target_error_hist = torch.full(
+      (cfg.target_bins,), 1.0, dtype=torch.float32, device=self._device,
+    )
+    self.target_bin_per_env = torch.full((self._num_envs,), -1, dtype=torch.long, device=self._device)
+
+    super().__init__(cfg, env)
+
+  def _record_previous_errors(self, env_ids: torch.Tensor):
+    """Save EMA from the just-completed episode BEFORE new bins are assigned.
+
+    Reads the cached ``goal_cross_cache_target_error`` (set by the
+    goal-plane crossing helper in ``shooter_rewards.py``) and updates
+    the bin histogram with a binary signal: 1.0 if error > 0.3 m,
+    0.0 otherwise.  EMA decay naturally shifts probability away from
+    bins that the policy has mastered.
+    """
+    target_err_name = self.kick_contact_tracker._tensor_name("goal_cross_cache_target_error")
+    target_err = getattr(self._env, target_err_name, None)
+    if target_err is None:
+      return
+
+    old_bins = self.target_bin_per_env[env_ids]
+    valid = old_bins >= 0
+    if not torch.any(valid):
+      return
+
+    b = old_bins[valid]
+    e = target_err[env_ids][valid].to(torch.float32)
+    # Binary signal: error > 0.3 m → "not yet mastered" (cf. curriculum pass criterion).
+    signal = (e > 0.3).to(torch.float32)
+
+    for i in range(len(b)):
+      idx = int(b[i].item())
+      self.target_error_hist[idx] = (
+        self.cfg.target_alpha * signal[i]
+        + (1.0 - self.cfg.target_alpha) * self.target_error_hist[idx]
+      )
+
+  def _update_destination_points(self, env_ids: torch.Tensor):
+    # 1. Record errors from the episode that just finished.
+    self._record_previous_errors(env_ids)
+
+    n = len(env_ids)
+    dev = self._device
+
+    if self.cfg.adaptive_target:
+      # Probabilities directly from EMA histogram (initial 1.0 → broad exploration).
+      probs = (self.target_error_hist + 1e-12) / (self.target_error_hist.sum() + self.target_error_hist.numel() * 1e-12)
+      bins = torch.multinomial(probs, n, replacement=True)
+      target_lateral = self._bin_centers[bins]
+      self.target_bin_per_env[env_ids] = bins
+    else:
+      target_lateral = (torch.rand(n, device=dev) - 0.5) * self.destination_length
+
+    if self.cfg.destination_lateral_axis == "y":
+      dest = self.destination_center.expand(n, -1) + torch.stack(
+        [torch.zeros(n, device=dev),
+         target_lateral,
+         torch.zeros(n, device=dev)], dim=1,
+      )
+    else:
+      dest = self.destination_center.expand(n, -1) + torch.stack(
+        [target_lateral,
+         torch.zeros(n, device=dev),
+         torch.zeros(n, device=dev)], dim=1,
+      )
+    self.target_destination_pos[env_ids] = dest
+
+
+# -- Stage 5: compete-aligned coordinates ----------------------------------------
+
+
+@dataclass(kw_only=True)
+class Stage5CompeteSoccerCommandCfg(Stage3SoccerCommandCfg):
+  """Stage 5 command config: compete coordinates (robot faces -x, ball at 3,0, goal at -0.5).
+
+  Transforms motion data so the robot operates in the same coordinate
+  system as ``scripts/compete.py``: shooter at (4,0,0.8) facing -x,
+  ball at (3,0,0.1), goal plane at x=-0.5.
+  """
+
+  compete_yaw_offset: float = -1.5707963267948966  # -π/2
+  """Yaw rotation applied to motion data: -y facing → -x facing."""
+
+  compete_origin_offset: tuple[float, float, float] = (4.0, 0.1, 0.0)
+  """Translation applied after rotation to motion positions."""
+
+  def build(self, env: ManagerBasedRlEnv) -> "Stage5CompeteSoccerCommand":
+    return Stage5CompeteSoccerCommand(self, env)
+
+
+class Stage5CompeteSoccerCommand(Stage3SoccerCommand):
+  """Stage 5 command: motion references transformed to compete coordinates.
+
+  Overrides body/vel property accessors so every consumer (tracking
+  rewards, observation functions, robot reset) sees compete-frame
+  values.  No callers need to know about the transform.
+  """
+
+  cfg: Stage5CompeteSoccerCommandCfg
+
+  def __init__(self, cfg: Stage5CompeteSoccerCommandCfg, env: ManagerBasedRlEnv):
+    yaw = cfg.compete_yaw_offset
+    c, s = math.cos(yaw), math.sin(yaw)
+    self._compete_R = torch.tensor(
+      [[c, -s, 0], [s, c, 0], [0, 0, 1]],
+      dtype=torch.float32, device=env.device,
+    )
+    ox, oy, oz = cfg.compete_origin_offset
+    self._compete_T = torch.tensor([ox, oy, oz], dtype=torch.float32, device=env.device)
+    super().__init__(cfg, env)
+
+  def _rot_pos(self, pos: torch.Tensor) -> torch.Tensor:
+    """Rotate then translate a position tensor.  pos shape (N, 3) or (N, B, 3)."""
+    return pos @ self._compete_R.T + self._compete_T
+
+  def _rot_vel(self, vel: torch.Tensor) -> torch.Tensor:
+    """Rotate a velocity tensor (no translation for vel)."""
+    return vel @ self._compete_R.T
+
+  @property
+  def body_pos_w(self) -> torch.Tensor:
+    raw = self.motion.body_pos_w[self.motion_idx, self.time_steps]
+    return self._rot_pos(raw) + self._env.scene.env_origins[:, None, :]
+
+  @property
+  def body_quat_w(self) -> torch.Tensor:
+    raw = self.motion.body_quat_w[self.motion_idx, self.time_steps]
+    yaw_q = quat_from_euler_xyz(
+      torch.tensor(0.0, device=self.device),
+      torch.tensor(0.0, device=self.device),
+      torch.tensor(self.cfg.compete_yaw_offset, device=self.device),
+    )
+    return quat_mul(yaw_q.expand_as(raw), raw)
+
+  @property
+  def body_lin_vel_w(self) -> torch.Tensor:
+    raw = self.motion.body_lin_vel_w[self.motion_idx, self.time_steps]
+    return self._rot_vel(raw)
+
+  @property
+  def body_ang_vel_w(self) -> torch.Tensor:
+    raw = self.motion.body_ang_vel_w[self.motion_idx, self.time_steps]
+    return self._rot_vel(raw)
+
+  def _resample_command(self, env_ids: torch.Tensor):
+    """Same as parent but WITHOUT motion_origin_offset/motion_yaw_offset.
+
+    Reference properties are already in compete coordinates, so the extra
+    offset+rotation would double-transform the robot position.
+    """
+    if env_ids.numel() == 0:
+      return
+
+    if self.cfg.sampling_mode == "start":
+      self.time_steps[env_ids] = 0
+      return
+
+    self._sample_soccer_offset(env_ids)
+    if self.cfg.sampling_mode == "adaptive":
+      self._adaptive_sampling(env_ids)
+    elif self.cfg.sampling_mode == "uniform":
+      self._uniform_sampling(env_ids)
+    else:
+      self._uniform_sampling(env_ids)
+
+    self._compute_soccer_ball_positions(env_ids)
+    self._update_soccer_ball(env_ids)
+    self._update_target_points(env_ids)
+    self._update_destination_points(env_ids)
+
+    root_pos = self.body_pos_w[:, 0].clone()
+    root_ori = self.body_quat_w[:, 0].clone()
+    root_lin_vel = self.body_lin_vel_w[:, 0].clone()
+    root_ang_vel = self.body_ang_vel_w[:, 0].clone()
+
+    range_list = [self.cfg.pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+    ranges = torch.tensor(range_list, device=self.device)
+    rand = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
+    root_pos[env_ids] += rand[:, 0:3]
+    orient_delta = quat_from_euler_xyz(rand[:, 3], rand[:, 4], rand[:, 5])
+    root_ori[env_ids] = quat_mul(orient_delta, root_ori[env_ids])
+
+    range_list = [self.cfg.velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+    ranges = torch.tensor(range_list, device=self.device)
+    rand = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
+    root_lin_vel[env_ids] += rand[:, :3]
+    root_ang_vel[env_ids] += rand[:, 3:]
+
+    jp = self.joint_pos.clone()
+    jv = self.joint_vel.clone()
+    jp += sample_uniform(self.cfg.joint_position_range[0], self.cfg.joint_position_range[1],
+                          jp.shape, device=jp.device)
+    limits = self.robot.data.soft_joint_pos_limits[env_ids]
+    jp[env_ids] = torch.clamp(jp[env_ids], limits[:, :, 0], limits[:, :, 1])
+
+    self.robot.write_joint_state_to_sim(jp[env_ids], jv[env_ids], env_ids=env_ids)
+    root_state = torch.cat([root_pos[env_ids], root_ori[env_ids],
+                            root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1)
+    self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
+    self.robot.clear_state(env_ids=env_ids)
+
+    self._compute_relative_transforms()
+
+    action_term = self._env.action_manager._terms.get("joint_pos")
+    if action_term is not None and hasattr(action_term, "_offset"):
+      action_term._offset[env_ids] = jp[env_ids]
+
+    if hasattr(self, "kick_contact_tracker"):
+      flags = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+      flags[env_ids] = True
+      self.kick_contact_tracker._handle_resample(flags)

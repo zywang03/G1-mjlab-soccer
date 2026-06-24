@@ -275,17 +275,16 @@ def make_compete_env_cfg() -> ManagerBasedRlEnvCfg:
     }
 
     # -- Terminations ---------------------------------------------------------
+    # Only time_out terminates the episode.  Falling over does NOT end the
+    # trial — the shooter may get up and keep playing, and the goalkeeper
+    # may dive without being penalised for hitting the ground.
+
+    # Only time_out terminates the episode.  Falling over does NOT end the
+    # trial — the shooter may get up and keep playing, and the goalkeeper
+    # may dive without being penalised for hitting the ground.
 
     terminations: dict[str, TerminationTermCfg] = {
         "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
-        "shooter_fell": TerminationTermCfg(
-            func=mdp.bad_orientation,
-            params={"asset_cfg": _SHOOTER_CFG, "limit_angle": math.radians(70.0)},
-        ),
-        "goalkeeper_fell": TerminationTermCfg(
-            func=mdp.bad_orientation,
-            params={"asset_cfg": _GK_CFG, "limit_angle": math.radians(70.0)},
-        ),
     }
 
     # -- Rewards (placeholder — unused at inference) --------------------------
@@ -340,10 +339,12 @@ def make_compete_env_cfg() -> ManagerBasedRlEnvCfg:
         sim=SimulationCfg(
             nconmax=256,
             njmax=3000,
+            contact_sensor_maxmatch=500,
             mujoco=MujocoCfg(
                 timestep=MUJOCO_TIMESTEP,
                 iterations=10,
                 ls_iterations=20,
+                ccd_iterations=500,
             ),
         ),
         decimation=CONTROL_DECIMATION,
@@ -424,11 +425,12 @@ class ApiPolicy:
     def reset(self) -> None:
         """Signal the remote server to reset its policy state."""
         try:
-            requests.post(
+            resp = requests.post(
                 f"{self._url}/reset", json={}, timeout=self._timeout,
             )
+            resp.raise_for_status()
         except requests.RequestException:
-            pass  # best-effort reset
+            print(f"[WARN] API policy reset failed: {self._url}/reset")
 
 
 # =============================================================================
@@ -451,8 +453,10 @@ class CombinedPolicy:
         self._device = device
         self._prev_action_s = torch.zeros(1, 29, device=device)
         self._prev_action_g = torch.zeros(1, 29, device=device)
+        self._last_episode_length = 0
 
     def __call__(self, _obs: dict) -> torch.Tensor:
+        self._reset_if_env_wrapped_episode()
         raw = _build_raw_state(
             self._env_base, self._prev_action_s, self._prev_action_g,
         )
@@ -463,33 +467,41 @@ class CombinedPolicy:
         self._prev_action_g = g_act.detach().clone()
         return action
 
+    def _reset_if_env_wrapped_episode(self) -> None:
+        episode_length_buf = getattr(self._env_base, "episode_length_buf", None)
+        if episode_length_buf is None:
+            return
+        episode_length = int(episode_length_buf[0].item())
+        if episode_length == 0 and self._last_episode_length > 0:
+            self.reset()
+        self._last_episode_length = episode_length
+
     def reset(self) -> None:
         self._shooter.reset()
         self._goalkeeper.reset()
         self._prev_action_s.zero_()
         self._prev_action_g.zero_()
+        self._last_episode_length = 0
 
 
 # =============================================================================
 # Competition metrics
 # =============================================================================
+#
+# Win conditions (mutually exclusive):
+#   - Shooter wins:  ball crosses the goal plane (x <= -0.5) inside the
+#                    3.0 m × 1.8 m frame at any point during the episode.
+#   - Goalkeeper wins: the 10 s episode times out without the ball ever
+#                      crossing the goal line.
+#
+# Falling over does NOT terminate the episode — the shooter can get back
+# up and try again, and the goalkeeper is free to dive.
 
 def _ball_entered_goal(ball_pos: torch.Tensor) -> bool:
     """Ball has crossed the goal plane (x <= GOAL_X) inside the goal frame."""
     x, y, z = ball_pos[0].item(), ball_pos[1].item(), ball_pos[2].item()
     return x <= GOAL_X and abs(y) <= GOAL_HALF_WIDTH and z <= GOAL_HEIGHT
 
-
-def _ball_blocked(
-    ball_vel: torch.Tensor,
-    ball_pos: torch.Tensor,
-    prev_speed: float,
-    threshold: float = 2.0,
-) -> bool:
-    """Ball was blocked if its speed dropped by > threshold m/s behind GK."""
-    speed = float(torch.norm(ball_vel))
-    behind_gk = ball_pos[0].item() <= GK_POS[0]
-    return behind_gk and (prev_speed - speed) > threshold
 
 
 # =============================================================================
@@ -505,8 +517,14 @@ def run_trial(
 ) -> dict[str, Any]:
     """Run one competition episode using raw state protocol.
 
+    Win conditions (mutually exclusive):
+      - Shooter wins: ball crosses the goal plane (x <= -0.5) inside the frame
+        at any point during the episode.
+      - Goalkeeper wins: the episode times out (10 s) without the ball
+        crossing the goal line.
+
     Returns a dict with keys:
-      goal_scored, blocked, steps, ball_final_x, early_termination
+      goal_scored, steps, ball_final_x
     """
     env.reset()
     shooter_policy.reset()
@@ -518,10 +536,7 @@ def run_trial(
 
     ball = env.unwrapped.scene["ball"]
     goal_scored = False
-    blocked = False
-    prev_ball_speed = 0.0
     steps = 0
-    early_termination = False
 
     for _ in range(max_steps):
         with torch.inference_mode():
@@ -537,16 +552,10 @@ def run_trial(
         prev_action_g = g_act.detach().clone()
 
         ball_pos = ball.data.root_link_pos_w[0].cpu()
-        ball_vel = ball.data.root_link_vel_w[0, :3].cpu()
-        ball_speed = float(torch.norm(ball_vel))
 
         if _ball_entered_goal(ball_pos):
             goal_scored = True
-
-        if _ball_blocked(ball_vel, ball_pos, prev_ball_speed):
-            blocked = True
-
-        prev_ball_speed = ball_speed
+            break  # Shooter wins immediately — no need to continue.
 
         terminated = result[2]
         if hasattr(terminated, "item"):
@@ -554,16 +563,12 @@ def run_trial(
         else:
             terminated = bool(terminated)
         if terminated:
-            if steps < max_steps - 1:
-                early_termination = True
-            break
+            break  # time_out — goalkeeper wins (ball never crossed).
 
     return {
         "goal_scored": goal_scored,
-        "blocked": blocked,
         "steps": steps,
         "ball_final_x": float(ball.data.root_link_pos_w[0, 0].cpu()),
-        "early_termination": early_termination,
     }
 
 
@@ -582,46 +587,39 @@ def run_headless_eval(
     print(f"\n[INFO] Running {num_trials} headless competition trials ...\n")
 
     goals = 0
-    blocks = 0
-    early_terminations = 0
     ball_crossed_goal_line = 0
 
     for trial in range(num_trials):
         stats = run_trial(env, env_base, shooter_policy, goalkeeper_policy)
         if stats["goal_scored"]:
             goals += 1
-        if stats["blocked"]:
-            blocks += 1
-        if stats["early_termination"]:
-            early_terminations += 1
         if stats["ball_final_x"] <= GOAL_X:
             ball_crossed_goal_line += 1
 
         interval = 1 if num_trials <= 10 else (num_trials // 10)
         if (trial + 1) % interval == 0 or trial == 0:
+            winner = "shooter" if stats["goal_scored"] else "goalkeeper"
             print(
                 f"  Trial {trial + 1:3d}/{num_trials}: "
+                f"winner={winner}, "
                 f"goal={stats['goal_scored']}, "
-                f"blocked={stats['blocked']}, "
-                f"early_term={stats['early_termination']}, "
                 f"steps={stats['steps']}"
             )
 
     total = num_trials
+    goalkeeper_wins = total - goals
     print(f"\n{'=' * 60}")
     print(f"  Competition Summary  ({total} trials)")
     print(f"{'=' * 60}")
-    print(f"  Shooter goals:          {goals}/{total}  ({goals / total * 100:.1f}%)")
-    print(f"  Goalkeeper blocks:      {blocks}/{total}  ({blocks / total * 100:.1f}%)")
-    print(f"  Early terminations:     {early_terminations}/{total}")
+    print(f"  Shooter wins:           {goals}/{total}  ({goals / total * 100:.1f}%)")
+    print(f"  Goalkeeper wins:        {goalkeeper_wins}/{total}  ({goalkeeper_wins / total * 100:.1f}%)")
     print(f"  Ball crossed goal line: {ball_crossed_goal_line}/{total}")
     print(f"{'=' * 60}\n")
 
     return {
         "num_trials": total,
         "goals": goals,
-        "blocks": blocks,
-        "early_terminations": early_terminations,
+        "goalkeeper_wins": goalkeeper_wins,
         "ball_crossed_goal_line": ball_crossed_goal_line,
     }
 

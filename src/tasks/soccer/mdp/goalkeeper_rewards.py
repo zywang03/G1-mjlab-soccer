@@ -17,9 +17,20 @@ import torch
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.utils.lab_api.math import quat_apply_inverse
 
+from src.tasks.soccer.mdp.goalkeeper_obs import _REF_DEFAULT_DOF_POS
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.entity import Entity
+
+
+MILD_READY_JOINT_POS: dict[str, float] = {
+  "left_hip_pitch_joint": -0.18,
+  "left_knee_joint": 0.45,
+  "left_ankle_pitch_joint": -0.27,
+  "right_hip_pitch_joint": -0.18,
+  "right_knee_joint": 0.45,
+  "right_ankle_pitch_joint": -0.27,
+}
 
 
 def _gk_get_or_init_state(
@@ -40,6 +51,49 @@ def _resolve_ee_indices(
     robot.find_bodies(ee_body_names, preserve_order=True)[0],
     device=robot.data.body_link_pos_w.device,
   )
+
+
+def _resolve_joint_indices(
+  robot: Entity,
+  joint_names: tuple[str, ...],
+  device: torch.device,
+) -> torch.Tensor:
+  return torch.as_tensor(
+    robot.find_joints(joint_names, preserve_order=True)[0],
+    dtype=torch.long,
+    device=device,
+  )
+
+
+def _idle_wait_mask(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  speed_threshold: float = 0.5,
+  incoming_vx_threshold: float = -0.5,
+) -> torch.Tensor:
+  launched = getattr(env, "_gk_delayed_ball_launched", None)
+  if launched is not None and launched.shape[0] == env.num_envs:
+    return ~launched.to(device=env.device, dtype=torch.bool)
+
+  ball: Entity = env.scene[ball_cfg.name]
+  ball_vel = ball.data.root_link_lin_vel_w
+  speed = torch.norm(ball_vel, dim=-1)
+  return (speed < speed_threshold) | (ball_vel[:, 0] >= incoming_vx_threshold)
+
+
+def _active_ball_mask(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  return ~_idle_wait_mask(env, ball_cfg)
+
+
+def _apply_active_ball_mask(
+  env: ManagerBasedRlEnv,
+  reward: torch.Tensor,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  return reward * _active_ball_mask(env, ball_cfg).to(dtype=reward.dtype)
 
 
 # -- Reset event ---------------------------------------------------------------
@@ -139,6 +193,16 @@ def goalkeeper_body_intercept(
   return torch.exp(-d2.min(dim=1).values / (std * std))
 
 
+def goalkeeper_active_body_intercept(
+  env: ManagerBasedRlEnv,
+  std: float = 0.35,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  reward = goalkeeper_body_intercept(env, std=std, ball_cfg=ball_cfg, robot_cfg=robot_cfg)
+  return _apply_active_ball_mask(env, reward, ball_cfg)
+
+
 def goalkeeper_intercept_point(
   env: ManagerBasedRlEnv,
   std: float = 0.4,
@@ -181,6 +245,106 @@ def goalkeeper_intercept_point(
   body = robot.data.body_link_pos_w                   # (B,L,3)
   d2 = (body - cross.unsqueeze(1)).pow(2).sum(dim=-1)  # (B,L)
   return torch.exp(-d2.min(dim=1).values / (std * std))
+
+
+def goalkeeper_active_intercept_point(
+  env: ManagerBasedRlEnv,
+  std: float = 0.4,
+  ee_body_names: tuple[str, ...] = (
+    "left_wrist_yaw_link", "right_wrist_yaw_link",
+    "left_ankle_roll_link", "right_ankle_roll_link",
+  ),
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  reward = goalkeeper_intercept_point(
+    env,
+    std=std,
+    ee_body_names=ee_body_names,
+    ball_cfg=ball_cfg,
+    robot_cfg=robot_cfg,
+  )
+  return _apply_active_ball_mask(env, reward, ball_cfg)
+
+
+def _selected_condition_ee_indices(
+  target_yz: torch.Tensor,
+  ee_count: int,
+) -> torch.Tensor:
+  """Choose a body-link slot from target side/height when no true region is exposed."""
+  if ee_count <= 1:
+    return torch.zeros(target_yz.shape[0], dtype=torch.long, device=target_yz.device)
+  z = target_yz[:, 1]
+  y = target_yz[:, 0]
+  high = z > 1.25
+  low = z < 0.75
+  right = y >= 0.0
+  # Default body order is left hand, right hand, left foot, right foot. This
+  # mirrors the reference mapping where region 0 (positive-y side in our reset
+  # convention) is matched against the left hand.
+  left_hand = torch.zeros_like(y, dtype=torch.long)
+  right_hand = torch.ones_like(left_hand).clamp(max=ee_count - 1)
+  left_foot = torch.full_like(left_hand, min(2, ee_count - 1))
+  right_foot = torch.full_like(left_hand, min(3, ee_count - 1))
+  hand = torch.where(right, left_hand, right_hand)
+  foot = torch.where(right, left_foot, right_foot)
+  return torch.where(low & ~high, foot, hand)
+
+
+def goalkeeper_active_condition_target_reach(
+  env: ManagerBasedRlEnv,
+  std: float = 0.35,
+  ball_switch_x: float = 0.5,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  ee_body_names: tuple[str, ...] = (
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+  ),
+) -> torch.Tensor:
+  """Active dense reward tied directly to the student's landing condition.
+
+  Far from the keeper, the target is the predicted crossing/landing ``(y, z)``.
+  When the ball is close to the keeper plane, the target switches to the live
+  ball position, matching the paper's position-conditioned task reward shape.
+  """
+  ball: Entity = env.scene[ball_cfg.name]
+  robot: Entity = env.scene[robot_cfg.name]
+  from src.tasks.soccer.mdp.goalkeeper_student_obs import (
+    GOALKEEPER_CONDITION_Y_SCALE,
+    GOALKEEPER_CONDITION_Z_CENTER,
+    GOALKEEPER_CONDITION_Z_SCALE,
+    goalkeeper_prediction_condition,
+  )
+
+  condition = goalkeeper_prediction_condition(env)
+  pred_y = condition[:, 0] * GOALKEEPER_CONDITION_Y_SCALE
+  pred_z = condition[:, 1] * GOALKEEPER_CONDITION_Z_SCALE + GOALKEEPER_CONDITION_Z_CENTER
+  target_yz = torch.stack([pred_y, pred_z], dim=-1)
+
+  ball_pos_b = quat_apply_inverse(
+    robot.data.root_link_quat_w,
+    ball.data.root_link_pos_w - robot.data.root_link_pos_w,
+  )
+  near = ball_pos_b[:, 0].abs() <= ball_switch_x
+  target_yz = torch.where(near.unsqueeze(-1), ball_pos_b[:, 1:3], target_yz)
+
+  ee_indices = _resolve_ee_indices(robot, ee_body_names)
+  ee_pos_w = robot.data.body_link_pos_w[:, ee_indices]
+  num_ee = ee_pos_w.shape[1]
+  ee_delta = ee_pos_w - robot.data.root_link_pos_w.unsqueeze(1)
+  ee_pos_b = quat_apply_inverse(
+    robot.data.root_link_quat_w.unsqueeze(1).expand(-1, num_ee, -1).reshape(-1, 4),
+    ee_delta.reshape(-1, 3),
+  ).view(env.num_envs, num_ee, 3)
+  selected = _selected_condition_ee_indices(target_yz, ee_pos_b.shape[1])
+  batch = torch.arange(env.num_envs, device=env.device)
+  selected_yz = ee_pos_b[batch, selected, 1:3]
+  d2 = torch.sum((selected_yz - target_yz) ** 2, dim=-1)
+  reward = torch.exp(-d2 / (std * std))
+  return _apply_active_ball_mask(env, reward, ball_cfg)
 
 
 def goalkeeper_stop_ball(
@@ -242,6 +406,25 @@ def goalkeeper_stop_ball(
   return reward
 
 
+def goalkeeper_active_stop_ball(
+  env: ManagerBasedRlEnv,
+  velocity_drop_threshold: float = 2.0,
+  behind_robot_x_threshold: float = 0.0,
+  goal_x: float = -0.5,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  reward = goalkeeper_stop_ball(
+    env,
+    velocity_drop_threshold=velocity_drop_threshold,
+    behind_robot_x_threshold=behind_robot_x_threshold,
+    goal_x=goal_x,
+    ball_cfg=ball_cfg,
+    robot_cfg=robot_cfg,
+  )
+  return _apply_active_ball_mask(env, reward, ball_cfg)
+
+
 def goalkeeper_goal_conceded(
   env: ManagerBasedRlEnv,
   goal_x: float = -0.5,
@@ -276,6 +459,67 @@ def goalkeeper_goal_conceded(
     conceded[ids] = 1.0
     setattr(env, "_gk_conceded", conceded)
   return reward
+
+
+def goalkeeper_active_goal_conceded(
+  env: ManagerBasedRlEnv,
+  goal_x: float = -0.5,
+  goal_half_width: float = 1.5,
+  goal_height: float = 1.8,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  reward = goalkeeper_goal_conceded(
+    env,
+    goal_x=goal_x,
+    goal_half_width=goal_half_width,
+    goal_height=goal_height,
+    ball_cfg=ball_cfg,
+  )
+  return _apply_active_ball_mask(env, reward, ball_cfg)
+
+
+def goalkeeper_active_action_rate(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  from src.tasks.soccer.mdp.shooter_rewards import action_rate_l2_clip
+
+  reward = action_rate_l2_clip(env)
+  return _apply_active_ball_mask(env, reward, ball_cfg)
+
+
+def goalkeeper_active_upright(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Reward staying upright after launch so active RL has a dense stability signal."""
+  reward = goalkeeper_posture_orientation(env, robot_cfg=robot_cfg)
+  return _apply_active_ball_mask(env, reward, ball_cfg)
+
+
+def goalkeeper_active_fall_penalty(
+  env: ManagerBasedRlEnv,
+  limit_angle: float = 1.2217304763960306,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """One-step fall indicator after launch, complementing idle fall penalty."""
+  robot: Entity = env.scene[robot_cfg.name]
+  upright = torch.clamp(-robot.data.projected_gravity_b[:, 2], 0.0, 1.0)
+  limit_cos = torch.cos(torch.tensor(limit_angle, dtype=torch.float32, device=env.device))
+  fallen = upright < limit_cos
+  return fallen.float() * _active_ball_mask(env, ball_cfg).to(dtype=upright.dtype)
+
+
+def goalkeeper_idle_action_rate(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  from src.tasks.soccer.mdp.shooter_rewards import action_rate_l2_clip
+
+  reward = action_rate_l2_clip(env)
+  return reward * _idle_wait_mask(env, ball_cfg).to(dtype=reward.dtype)
 
 
 def goalkeeper_stay_on_line(
@@ -385,3 +629,145 @@ def goalkeeper_ang_vel_xy(
   robot: Entity = env.scene[robot_cfg.name]
   ang_vel = robot.data.root_link_ang_vel_b[:, :2]  # (B, 2)
   return torch.sum(ang_vel * ang_vel, dim=-1)  # (B,)
+
+
+def goalkeeper_idle_joint_pose(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Penalize deviation from the goalkeeper ready pose while the ball is idle."""
+  robot: Entity = env.scene[robot_cfg.name]
+  default = torch.tensor(_REF_DEFAULT_DOF_POS, device=env.device, dtype=torch.float32)
+  err = robot.data.joint_pos - default.view(1, -1)
+  return torch.sum(err * err, dim=-1) * _idle_wait_mask(env, ball_cfg).float()
+
+
+def goalkeeper_idle_low_base_height(
+  env: ManagerBasedRlEnv,
+  target_z: float = 0.73,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Penalize a tall base during the prepare wait window."""
+  robot: Entity = env.scene[robot_cfg.name]
+  base_z = robot.data.root_link_pos_w[:, 2] - env.scene.env_origins[:, 2]
+  high = torch.clamp(base_z - target_z, min=0.0)
+  return high * high * _idle_wait_mask(env, ball_cfg).float()
+
+
+def goalkeeper_idle_base_height_band(
+  env: ManagerBasedRlEnv,
+  target_z: float = 0.72,
+  tolerance: float = 0.05,
+  low_margin: float = 0.08,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Reward a slightly lower but not collapsed base height while waiting."""
+  robot: Entity = env.scene[robot_cfg.name]
+  base_z = robot.data.root_link_pos_w[:, 2] - env.scene.env_origins[:, 2]
+  distance = torch.abs(base_z - target_z)
+  reward = 1.0 - distance / max(tolerance, 1e-6)
+  too_low = base_z < (target_z - low_margin)
+  reward = torch.where(too_low, -1.0 - (target_z - low_margin - base_z), reward)
+  return reward * _idle_wait_mask(env, ball_cfg).float()
+
+
+def goalkeeper_idle_leg_ready_pose(
+  env: ManagerBasedRlEnv,
+  target_joint_pos: dict[str, float] | None = None,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Softly bias only hip/knee/ankle pitch joints toward a crouched ready pose."""
+  robot: Entity = env.scene[robot_cfg.name]
+  target_joint_pos = target_joint_pos or MILD_READY_JOINT_POS
+  joint_names = tuple(target_joint_pos.keys())
+  cache_key = "_gk_idle_leg_ready_joint_ids"
+  joint_ids = getattr(env, cache_key, None)
+  if joint_ids is None or joint_ids.numel() != len(joint_names):
+    joint_ids = _resolve_joint_indices(robot, joint_names, env.device)
+    setattr(env, cache_key, joint_ids)
+  target = torch.tensor(
+    [target_joint_pos[name] for name in joint_names],
+    dtype=torch.float32,
+    device=env.device,
+  )
+  err = robot.data.joint_pos[:, joint_ids] - target.view(1, -1)
+  return torch.sum(err * err, dim=-1) * _idle_wait_mask(env, ball_cfg).float()
+
+
+def goalkeeper_idle_base_still(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Penalize root drift/spin while waiting for the shooter to kick."""
+  robot: Entity = env.scene[robot_cfg.name]
+  lin = torch.sum(robot.data.root_link_lin_vel_w[:, :2] ** 2, dim=-1)
+  ang = torch.sum(robot.data.root_link_ang_vel_w[:, :2] ** 2, dim=-1)
+  return (lin + ang) * _idle_wait_mask(env, ball_cfg).float()
+
+
+def goalkeeper_idle_upright(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Dense prepare-stage upright reward so falls receive signal before the threshold."""
+  reward = goalkeeper_posture_orientation(env, robot_cfg=robot_cfg)
+  return reward * _idle_wait_mask(env, ball_cfg).float()
+
+
+def goalkeeper_idle_fall_penalty(
+  env: ManagerBasedRlEnv,
+  limit_angle: float = 1.2217304763960306,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """One-step fall indicator used as an extra idle-stage penalty."""
+  robot: Entity = env.scene[robot_cfg.name]
+  upright = torch.clamp(-robot.data.projected_gravity_b[:, 2], 0.0, 1.0)
+  limit_cos = torch.cos(torch.tensor(limit_angle, dtype=torch.float32, device=env.device))
+  fallen = upright < limit_cos
+  return fallen.float() * _idle_wait_mask(env, ball_cfg).float()
+
+
+def goalkeeper_idle_alive(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  """Reward staying alive while waiting for a real incoming ball."""
+  alive = ~env.termination_manager.terminated
+  return alive.float() * _idle_wait_mask(env, ball_cfg).float()
+
+
+def goalkeeper_idle_timeout_success(
+  env: ManagerBasedRlEnv,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  """Reward completing the idle waiting window without falling or ball threat."""
+  success = env.termination_manager.time_outs & ~env.termination_manager.terminated
+  return success.float() * _idle_wait_mask(env, ball_cfg).float()
+
+
+def goalkeeper_idle_timeout(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """End each idle episode after its sampled prepare window."""
+  cfg = getattr(env, "cfg", None)
+  wait_s = _gk_get_or_init_state(env, "_gk_idle_timeout_s", float(getattr(cfg, "episode_length_s", 4.0)))
+  wait_steps = torch.clamp((wait_s / float(env.step_dt)).round().long(), min=1)
+  return env.episode_length_buf >= wait_steps
+
+
+def goalkeeper_ball_started(
+  env: ManagerBasedRlEnv,
+  speed_threshold: float = 0.5,
+  incoming_vx_threshold: float = -0.5,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  """Terminate the idle expert episode once the ball becomes an incoming threat."""
+  ball: Entity = env.scene[ball_cfg.name]
+  ball_vel = ball.data.root_link_lin_vel_w
+  speed = torch.norm(ball_vel, dim=-1)
+  return (speed >= speed_threshold) & (ball_vel[:, 0] < incoming_vx_threshold)

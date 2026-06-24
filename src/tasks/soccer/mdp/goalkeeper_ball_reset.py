@@ -46,6 +46,7 @@ def reset_ball_with_goal_velocity(
   env_ids: torch.Tensor | None,
   vel_cfg: GoalkeeperBallVelCfg,
   ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  fixed_start_local: tuple[float, float, float] | None = None,
 ) -> None:
   """Reset ball position and apply a randomized velocity toward goal (legacy)."""
   if env_ids is None:
@@ -57,6 +58,9 @@ def reset_ball_with_goal_velocity(
   root_states = default_root_state[env_ids].clone()
 
   positions = root_states[:, 0:3] + env.scene.env_origins[env_ids]
+  fixed_start = _fixed_start_tensor(fixed_start_local, len(env_ids), env.device)
+  if fixed_start is not None:
+    positions = fixed_start + env.scene.env_origins[env_ids]
 
   speeds = (
     vel_cfg.speed_min
@@ -83,6 +87,7 @@ def reset_ball_with_goal_velocity(
   velocities = torch.cat(
     [torch.stack([vx, vy, vz], dim=-1), ang_vel], dim=-1
   )
+  _store_sampled_ball_velocity(env, env_ids, velocities)
 
   orientations = root_states[:, 3:7]
 
@@ -146,11 +151,47 @@ class RegionBallVelCfg:
     return len(self.regions)
 
 
+@dataclass
+class GroundBallVelCfg:
+  """Configuration for a low rolling/sliding goalkeeper eval ball."""
+
+  ball_start_x_range: tuple[float, float] = (3.0, 5.0)
+  ball_end_x_range: tuple[float, float] = (0.1, 0.6)
+  speed_range: tuple[float, float] = (4.0, 6.0)
+  y_range: tuple[float, float] = (-1.5, 1.5)
+  ball_start_z: float = 0.1
+
+
+def _store_sampled_ball_velocity(env: ManagerBasedRlEnv, env_ids: torch.Tensor, velocity: torch.Tensor) -> None:
+  cache = getattr(env, "_gk_sampled_ball_velocity", None)
+  if (
+    cache is None
+    or cache.shape[0] != env.num_envs
+    or cache.shape[1] != velocity.shape[1]
+    or cache.device != velocity.device
+    or cache.dtype != velocity.dtype
+  ):
+    cache = torch.zeros(env.num_envs, velocity.shape[1], dtype=velocity.dtype, device=velocity.device)
+  cache[env_ids] = velocity
+  setattr(env, "_gk_sampled_ball_velocity", cache)
+
+
+def _fixed_start_tensor(
+  fixed_start_local: tuple[float, float, float] | None,
+  n: int,
+  device: str | torch.device,
+) -> torch.Tensor | None:
+  if fixed_start_local is None:
+    return None
+  return torch.tensor(fixed_start_local, dtype=torch.float32, device=device).view(1, 3).expand(n, -1)
+
+
 def reset_ball_with_parabolic_trajectory(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor | None,
   vel_cfg: RegionBallVelCfg,
   ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  fixed_start_local: tuple[float, float, float] | None = None,
 ) -> None:
   """Reset ball with a region-conditioned parabolic trajectory toward the robot.
 
@@ -180,6 +221,7 @@ def reset_ball_with_parabolic_trajectory(
     quat = drs[env_ids, 3:7].clone()
     pos = forced["start"][env_ids]
     vel = torch.cat([forced["vel"][env_ids], torch.zeros(n, 3, device=device)], dim=-1)
+    _store_sampled_ball_velocity(env, env_ids, vel)
     asset.write_root_link_pose_to_sim(torch.cat([pos, quat], dim=-1), env_ids=env_ids)
     asset.write_root_link_velocity_to_sim(vel, env_ids=env_ids)
     for key, val in (("_gk_region", forced["region"]),
@@ -233,6 +275,9 @@ def reset_ball_with_parabolic_trajectory(
   start_y = start_y * difficulty
   start_z = z_center + (start_z - z_center) * difficulty
   ball_start_local = torch.stack([start_x, start_y, start_z], dim=-1)
+  fixed_start = _fixed_start_tensor(fixed_start_local, n, device)
+  if fixed_start is not None:
+    ball_start_local = fixed_start
 
   # Sample ball end within chosen region (behind robot, -y).
   region_height_low = torch.tensor(
@@ -268,6 +313,13 @@ def reset_ball_with_parabolic_trajectory(
   end_y = end_y * difficulty
   end_z = z_center + (end_z - z_center) * difficulty
   ball_end_local = torch.stack([end_x, end_y, end_z], dim=-1)
+
+  end_pos = getattr(env, "_gk_ball_end_pos", None)
+  if end_pos is None or end_pos.shape != (env.num_envs, 3):
+    end_pos = torch.zeros(env.num_envs, 3, dtype=torch.float32, device=device)
+    setattr(env, "_gk_ball_end_pos", end_pos)
+  end_pos[env_ids] = ball_end_local
+  setattr(env, "_gk_ball_end_pos", end_pos)
 
   # Convert to world frame (env_origins at robot base x=0).
   ball_start_w = ball_start_local + env.scene.env_origins[env_ids]
@@ -313,7 +365,7 @@ def reset_ball_with_parabolic_trajectory(
   if sx is None or sx.shape[0] != env.num_envs:
     sx = torch.full((env.num_envs,), 4.0, dtype=torch.float32, device=device)
     setattr(env, "_gk_ball_start_x", sx)
-  sx[env_ids] = start_x
+  sx[env_ids] = ball_start_local[:, 0]
   setattr(env, "_gk_ball_start_x", sx)
 
   # Ball orientation unchanged from default.
@@ -326,8 +378,187 @@ def reset_ball_with_parabolic_trajectory(
   # Full velocity: 6-DOF (lin_vel + ang_vel). No initial spin.
   ang_vel = torch.zeros(n, 3, device=device)
   velocities = torch.cat([ball_vel, ang_vel], dim=-1)
+  _store_sampled_ball_velocity(env, env_ids, velocities)
 
   asset.write_root_link_pose_to_sim(
     torch.cat([ball_start_w, orientations], dim=-1), env_ids=env_ids
   )
   asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
+
+
+def reset_ball_with_ground_trajectory(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  vel_cfg: GroundBallVelCfg,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  fixed_start_local: tuple[float, float, float] | None = None,
+) -> None:
+  """Reset a low ball that travels mostly along the ground toward the keeper."""
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
+  n = len(env_ids)
+  device = env.device
+
+  start_x = vel_cfg.ball_start_x_range[0] + torch.rand(n, device=device) * (
+    vel_cfg.ball_start_x_range[1] - vel_cfg.ball_start_x_range[0]
+  )
+  y = vel_cfg.y_range[0] + torch.rand(n, device=device) * (
+    vel_cfg.y_range[1] - vel_cfg.y_range[0]
+  )
+  z = torch.full((n,), vel_cfg.ball_start_z, dtype=torch.float32, device=device)
+  ball_start_local = torch.stack([start_x, y, z], dim=-1)
+  fixed_start = _fixed_start_tensor(fixed_start_local, n, device)
+  if fixed_start is not None:
+    ball_start_local = fixed_start
+
+  target_x = -(
+    vel_cfg.ball_end_x_range[0] + torch.rand(n, device=device) * (
+      vel_cfg.ball_end_x_range[1] - vel_cfg.ball_end_x_range[0]
+    )
+  )
+  ball_end_local = torch.stack([target_x, y, ball_start_local[:, 2]], dim=-1)
+  direction = ball_end_local - ball_start_local
+  direction[:, 2] = 0.0
+  direction = direction / torch.clamp(torch.norm(direction, dim=-1, keepdim=True), min=1e-6)
+
+  speed = vel_cfg.speed_range[0] + torch.rand(n, device=device) * (
+    vel_cfg.speed_range[1] - vel_cfg.speed_range[0]
+  )
+  ball_vel = direction * speed.unsqueeze(-1)
+  ball_vel[:, 2] = 0.0
+
+  asset: Entity = env.scene[ball_cfg.name]
+  default_root_state = asset.data.default_root_state
+  assert default_root_state is not None
+  orientations = default_root_state[env_ids, 3:7].clone()
+  positions = ball_start_local + env.scene.env_origins[env_ids]
+
+  ang_vel = torch.zeros(n, 3, dtype=torch.float32, device=device)
+  ang_vel[:, 1] = ball_vel[:, 0] / max(vel_cfg.ball_start_z, 1e-3)
+  velocities = torch.cat([ball_vel, ang_vel], dim=-1)
+  _store_sampled_ball_velocity(env, env_ids, velocities)
+
+  asset.write_root_link_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
+  asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
+
+  region = torch.where(y < 0.0, torch.full_like(y, 5.0), torch.full_like(y, 4.0))
+  for key, value in (("_gk_region", region), ("_gk_ball_start_x", ball_start_local[:, 0])):
+    t = getattr(env, key, None)
+    if t is None or t.shape[0] != env.num_envs:
+      t = torch.zeros(env.num_envs, dtype=torch.float32, device=device)
+    t[env_ids] = value
+    setattr(env, key, t)
+
+
+def reset_ball_staged_delayed_launch(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  sampler_func,
+  sampler_params: dict,
+  ball_pos: tuple[float, float, float] = (3.0, 0.0, 0.1),
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> None:
+  """Sample a launch, then hold the ball still at a fixed compete-like start."""
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
+  sampler_func(env, env_ids, **sampler_params)
+
+  asset: Entity = env.scene[ball_cfg.name]
+  sampled_cache = getattr(env, "_gk_sampled_ball_velocity", None)
+  if sampled_cache is not None and sampled_cache.shape[0] == env.num_envs:
+    sampled_vel = sampled_cache[env_ids].clone()
+  else:
+    sampled_vel = asset.data.root_link_vel_w[env_ids].clone()
+  pending = getattr(env, "_gk_delayed_ball_velocity", None)
+  if pending is None or pending.shape[0] != env.num_envs:
+    pending = torch.zeros(env.num_envs, 6, dtype=torch.float32, device=env.device)
+  pending[env_ids] = sampled_vel
+  setattr(env, "_gk_delayed_ball_velocity", pending)
+
+  launched = getattr(env, "_gk_delayed_ball_launched", None)
+  if launched is None or launched.shape[0] != env.num_envs:
+    launched = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+  launched[env_ids] = False
+  setattr(env, "_gk_delayed_ball_launched", launched)
+
+  default_root_state = asset.data.default_root_state
+  assert default_root_state is not None
+  orientations = default_root_state[env_ids, 3:7].clone()
+  local_pos = torch.tensor(ball_pos, dtype=torch.float32, device=env.device).view(1, 3).expand(len(env_ids), -1)
+  positions = local_pos + env.scene.env_origins[env_ids]
+  zero_vel = torch.zeros(len(env_ids), 6, dtype=torch.float32, device=env.device)
+  asset.write_root_link_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
+  asset.write_root_link_velocity_to_sim(zero_vel, env_ids=env_ids)
+
+  sx = getattr(env, "_gk_ball_start_x", None)
+  if sx is None or sx.shape[0] != env.num_envs:
+    sx = torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+  sx[env_ids] = float(ball_pos[0])
+  setattr(env, "_gk_ball_start_x", sx)
+
+
+def launch_staged_ball_after_delay(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None = None,
+  wait_s: float = 3.0,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> None:
+  """Apply the staged sampled velocity once the initial wait has elapsed."""
+  del env_ids
+  pending = getattr(env, "_gk_delayed_ball_velocity", None)
+  launched = getattr(env, "_gk_delayed_ball_launched", None)
+  if pending is None or launched is None:
+    return
+  launch_step = max(1, int(round(wait_s / env.step_dt)))
+  ready = (env.episode_length_buf >= launch_step) & ~launched
+  env_ids = ready.nonzero(as_tuple=False).squeeze(-1)
+  if len(env_ids) == 0:
+    return
+
+  asset: Entity = env.scene[ball_cfg.name]
+  asset.write_root_link_velocity_to_sim(pending[env_ids], env_ids=env_ids)
+  launched[env_ids] = True
+  setattr(env, "_gk_delayed_ball_launched", launched)
+
+
+def reset_ball_static_for_goalkeeper_idle(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None,
+  ball_pos: tuple[float, float, float] = (3.0, 0.0, 0.10),
+  idle_wait_range_s: tuple[float, float] = (1.0, 4.0),
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> None:
+  """Place a stationary ball in the shared shooter/keeper scene.
+
+  This is for the idle goalkeeper expert: the frozen shooter and active keeper
+  are both present, but the keeper is rewarded only for staying ready before the
+  ball becomes a real incoming threat.
+  """
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
+  n = len(env_ids)
+  device = env.device
+  asset: Entity = env.scene[ball_cfg.name]
+  default_root_state = asset.data.default_root_state
+  assert default_root_state is not None
+  orientations = default_root_state[env_ids, 3:7].clone()
+  local_pos = torch.tensor(ball_pos, dtype=torch.float32, device=device).view(1, 3).expand(n, -1)
+  positions = local_pos + env.scene.env_origins[env_ids]
+  velocities = torch.zeros(n, 6, dtype=torch.float32, device=device)
+
+  asset.write_root_link_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
+  asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
+
+  for key, value in (("_gk_region", 0.0), ("_gk_ball_start_x", float(ball_pos[0]))):
+    t = getattr(env, key, None)
+    if t is None or t.shape[0] != env.num_envs:
+      t = torch.zeros(env.num_envs, dtype=torch.float32, device=device)
+    t[env_ids] = value
+    setattr(env, key, t)
+
+  wait_low, wait_high = idle_wait_range_s
+  wait = getattr(env, "_gk_idle_timeout_s", None)
+  if wait is None or wait.shape[0] != env.num_envs:
+    wait = torch.zeros(env.num_envs, dtype=torch.float32, device=device)
+  wait[env_ids] = wait_low + torch.rand(n, dtype=torch.float32, device=device) * (wait_high - wait_low)
+  setattr(env, "_gk_idle_timeout_s", wait)

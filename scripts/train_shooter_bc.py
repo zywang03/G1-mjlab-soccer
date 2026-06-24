@@ -262,6 +262,11 @@ def _forward_rnn_chunk(
     pred:         (valid_in_chunk, action_dim)  — MLP output at valid timesteps
     new_hs:       detached hidden state at chunk end, for the next chunk
   """
+  if hasattr(actor, "forward_bc_chunk"):
+    if hidden_state is None:
+      hidden_state = _latin_hidden_state(actor, obs_chunk.shape[1], obs_chunk.device)
+    return actor.forward_bc_chunk(obs_chunk, masks_chunk, hidden_state)
+
   # Step 1: concat observation groups + normalize (same as MLPModel.get_latent)
   obs_list = [obs_chunk]  # single group "student"
   latent = torch.cat(obs_list, dim=-1)            # (L, B, obs_dim)
