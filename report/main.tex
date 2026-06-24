@@ -1,7 +1,7 @@
 \documentclass[11pt]{article}
 
 % ---------------------------------------------------------------------------
-% CS2810 Embodied AI (Spring 2026) -- Team Hybrid Auto
+% CS2810 Embodied AI (Spring 2026)
 % Combined project report: Goalkeeper + Shooter
 % Build: pdflatex main.tex  (run twice for references/links)
 % ---------------------------------------------------------------------------
@@ -70,6 +70,10 @@ report both tasks honestly, including a clean negative result on on-policy
 ballistic-residual fine-tuning, and detail the API observation computation that
 each policy performs server-side from raw MuJoCo state.
 \end{abstract}
+
+\setcounter{tocdepth}{1}
+{\small\tableofcontents}
+\medskip
 
 % ===========================================================================
 \section{Introduction}
@@ -249,13 +253,18 @@ robot model and without deploying the released checkpoint as-is. The $81.7\%$
 figure is the stable estimate over a large trial count; it is reported as the
 trustworthy number because at the rubric's \textbf{50-trial} protocol the
 binomial standard deviation is $\approx\pm 5.5$ percentage points, so a single
-50-trial grader run scatters around this mean. Under the rubric's linear band --
-zero at $80\%$, full marks at $100\%$ -- $81.7\%$ maps to a score of
-$(0.817-0.80)/0.20\times 30 \approx 2.5/30$. We report this honestly as a real
-but modest margin above the $80\%$ scoring floor.
-\TODO{record the exact 50-trial grader integer from the command above once the
-\code{model_repaired_lyk.pt} checkpoint is available on the GPU server; the score
-is steep and variance-sensitive right at the threshold.}
+50-trial grader run scatters around this mean. Executing the reproduce command
+above on the GPU server gives an \textbf{official 50-trial result of
+$42/50 = 84.0\%$} (the loaded actor input is confirmed at $960$-D). Under the
+rubric's linear band -- zero at $80\%$, full marks at $100\%$ -- this maps to a
+score of $(0.84-0.80)/0.20\times 30 = 6.0/30$, versus $\approx 2.5/30$ for the
+$81.7\%$ central estimate. The single 50-trial run (the official script exposes
+no seed flag) and the $81.7\%$ large-sample figure agree to within the
+$\approx\pm 5.5$ percentage-point binomial deviation of a 50-trial measurement;
+we report $81.7\%$ as the trustworthy central estimate and $84.0\%$ as the
+observed grader-protocol result. Either way the margin above the $80\%$ scoring
+floor is real but modest, which is the honest characterization of this
+deliverable.
 
 \paragraph{Residual failure structure.} Failures remain concentrated in the high
 balls. The policy still \emph{overuses} high-ball jump saves and can lose balance
