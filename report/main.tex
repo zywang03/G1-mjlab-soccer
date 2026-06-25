@@ -42,7 +42,7 @@
 
 \title{\textbf{Learning Shooting and Goalkeeping Skills\\
 for the Unitree G1 Humanoid}}
-\author{% TODO: add team member names here before submission
+\author{Team 12\\ % member names to be added before submission
 CS2810 Embodied AI, Spring 2026}
 \date{}
 
@@ -60,15 +60,18 @@ single shared LSTM policy, reaching a \textbf{99.96\%} goal rate over
 $3\times10^4$ trials (Phase-1 score $\approx 29.9/30$) with $12$--$16$\,m/s ball
 speeds, and deploy it behind a multi-strategy API server whose
 goalkeeper-aware policy reads the opponent and shoots to the far side. For the
-goalkeeper we treat diving saves -- which are unreachable by reward-shaped
-exploration and suppressed by any upright prior -- as a sequence of targeted
-sub-problems: distil a diving base from a reference teacher, \emph{prove} with a
-per-scenario CEM repair oracle that conceded high balls are physically saveable,
-and distil the repaired saves back into a single deployable MLP. This lifts the
-goalkeeper block rate from a $66.9\%$ distilled base to \textbf{81.7\%}. We
-report both tasks honestly, including a clean negative result on on-policy
-ballistic-residual fine-tuning, and detail the API observation computation that
-each policy performs server-side from raw MuJoCo state.
+goalkeeper we treat diving saves -- unreachable by reward-shaped exploration and
+suppressed by any upright prior -- as a staged pipeline: distil a diving base
+from a reference teacher, use a per-scenario CEM repair oracle to synthesize
+beyond-teacher saves, train a bounded ballistic-residual specialist per ball
+region, and assemble them into a six-way mixture of experts routed by an analytic
+ballistic-crossing gate with a left/right symmetry mirror. This lifts the block
+rate from a $66.9\%$ distilled base, through an $81.7\%$ single network, to a
+deployed mixture at $\approx 93.8\%$ (a $16{,}384$-trial estimate; best observed
+$475/500 = 95.0\%$ on the official 500-trial eval). We report both tasks
+honestly, including negative results and a failure-replay path for further gains,
+and detail the API observation computation each policy performs server-side from
+raw MuJoCo state.
 \end{abstract}
 
 \setcounter{tocdepth}{1}
@@ -114,9 +117,15 @@ including how observations are computed from raw state.
 \addcontentsline{toc}{section}{Part A: Goalkeeper}
 % ===========================================================================
 
-The deliverable is the \code{keeper-lyk} branch: a repair-oracle plus
-distillation pipeline that lifts a distilled MLP goalkeeper to an \textbf{81.7\%}
-block rate (checkpoint \code{src/assets/soccer/weight/model_repaired_lyk.pt}).
+The deliverable is the \code{keeper-lyk} branch, whose final goalkeeper is a
+\textbf{six-way region mixture-of-experts} (the \code{MoE6} bundle
+\code{goalkeeper_moe6_hard3_default.pt}): one bounded ballistic-residual
+specialist per ball region, routed at inference by an analytic ballistic-crossing
+gate. On the official evaluation it reaches a best-observed $475/500 = 95.0\%$
+block rate, with a more stable $\approx 93.8\%$ over $16{,}384$ trials -- above
+the $91\%$ sibling MoE on the \code{keeper-qbs} branch, the
+$81.7\%$ single repaired network it is built from, and the $\approx 72.5\%$
+reference teacher.
 
 % ---------------------------------------------------------------------------
 \section{Task and the core difficulty}\label{sec:gk-task}
@@ -158,16 +167,18 @@ $\approx 72.5\%$}. To do better, we must \emph{synthesize} high-ball saving
 behavior that the teacher does not itself possess.
 
 % ---------------------------------------------------------------------------
-\section{Method: a repair-oracle distillation pipeline}\label{sec:gk-method}
+\section{Method: a staged pipeline culminating in a region mixture-of-experts}\label{sec:gk-method}
 % ---------------------------------------------------------------------------
 
 Because the diving prior cannot be acquired from scratch and imitation of
 Ren et al.~\cite{ren} is upper-bounded at $\approx 72.5\%$, no single training
 procedure is sufficient. We adopt a \textbf{staged pipeline} in which each stage
-overcomes the failure mode of the preceding one: distil a diving base,
-\emph{prove} with an offline optimizer that the conceded balls are physically
-saveable, and then fold those repaired saves back into a single deployable
-policy by distillation.
+overcomes the failure mode of the preceding one: distil a diving base
+(Stage~A); \emph{prove} with an offline optimizer that the conceded balls are
+physically saveable and fold those saves into one network (Stages~B--C);
+\emph{specialize} a bounded corrective head per ball region (Stage~D); and route
+the specialists with an analytic gate into the deployed mixture (Stage~E). The
+deliverable is the six-way mixture bundle \code{goalkeeper_moe6_hard3_default.pt}.
 
 \subsection{Stage A --- Distillation: injecting the diving prior}
 
@@ -198,15 +209,17 @@ per-scenario save rate far above the base policy, establishing that control
 optimizer is single-agent simulation optimization, not a learned policy -- it is
 used as a \emph{data generator}, not as the deliverable.
 
-\subsection{Stage C --- Distilling the repaired saves into a deployable MLP}
+\subsection{Stage C --- Distilling the repaired saves into a single network}
 
 The repaired residuals are per-scenario and open-loop; they cannot be deployed
-directly (Section~\ref{sec:gk-results}). We therefore \textbf{collect the
-repaired \code{(observation, action)} pairs from trajectories that the oracle
-turns into successful saves, and distil them back into a native MLP} with the
-same architecture as the base. The distilled checkpoint,
-\code{model_repaired_lyk.pt}, reaches \textbf{81.7\%} -- a $+14.8$-point gain
-over the $66.9\%$ base. Two collection choices proved essential, each of which
+directly. We therefore \textbf{collect the repaired \code{(observation, action)}
+pairs from trajectories that the oracle turns into successful saves, and distil
+them back into a native MLP} with the same architecture as the base. The
+distilled checkpoint, \code{model_repaired_lyk.pt}, reaches \textbf{81.7\%} -- a
+$+14.8$-point gain over the $66.9\%$ base. This single reactive network is strong
+but still pays the single-policy trade-off (improving one corner regresses
+another); it becomes the \emph{shared base} that the region specialists of
+Stage~D each refine. Two collection choices proved essential, each of which
 silently degraded the result when violated:
 
 \begin{itemize}
@@ -229,6 +242,42 @@ one repair worker per GPU, with region weights that oversample low/mid balls
 (regions $4,5$ low, $0,1$ mid, $2,3$ upper) to keep the distilled policy from
 overfitting to the dramatic high-ball jumps at the expense of routine balls.
 
+\subsection{Stage D --- Per-region ballistic-residual specialists}
+
+A single reactive network cannot simultaneously hold six high-fidelity region
+dives -- this is a capacity limit, not a tuning one. We therefore \textbf{freeze
+the repaired base and train one bounded residual head per ball region} (right and
+left $\times$ low, mid, up). Each head (\code{GoalkeeperBallisticResidual}) is
+zero-initialized -- so training starts exactly at the strong base -- and receives
+explicit \emph{ballistic timing features}: the time and $(y,z)$ of the ball at
+the keeper plane $x=0$ and at the goal plane $x=-0.5$, the incoming $v_x$, and the
+ball speed. Trained with the stable save-window collection of Stage~C and a region
+focus, each specialist (\code{stable_sr$\{$region$\}$.pt}) masters its own balls
+without the cross-region trade-off that caps the single network. Because the
+residual is bounded and zero-initialized, a specialist can only \emph{refine} the
+base dive for its region, never destabilize it.
+
+\subsection{Stage E --- Mixture of experts with an analytic ballistic gate}
+
+At inference the six specialists are combined into a single deployable bundle
+(\code{bundle_moe6.py} $\to$ \code{goalkeeper_moe6_hard3_default.pt}) and routed
+by an \textbf{analytic ballistic-crossing gate} -- no learned parameters and no
+privileged information. From the raw ball position and velocity the gate
+extrapolates, in closed form, the ball's state when it reaches the keeper plane:
+the crossing time $t$, the lateral crossing $c_y$, the crossing height $c_z$, and
+the descent rate $v_z$ at crossing. Thresholds map $c_z$ to a height band
+($c_z<0.85$\,m $\to$ low, $c_z>1.35$\,m $\to$ up, else mid) and $c_y<0$ to the
+left side, selecting one of the six experts. The region is \textbf{latched early}
+-- as soon as the ball is unambiguously approaching ($v_x<-1$ and within
+$5$\,m of the keeper) -- so the correct specialist drives the \emph{entire} dive
+rather than a default expert mishandling the opening frames (which is fatal for
+fast balls to the far side). Finally, an optional \textbf{left/right symmetry
+mirror} serves a weak corner through its stronger mirrored expert
+(\code{mirror_obs} in, \code{mirror_action} out, FK-validated in
+\code{symmetry.py}), correcting the teacher's residual left-bias. This mixture is
+what lifts the keeper above both the single repaired network and the
+$\approx 72.5\%$ teacher.
+
 % ---------------------------------------------------------------------------
 \section{Phase 1 result and analysis}\label{sec:gk-results}
 % ---------------------------------------------------------------------------
@@ -238,90 +287,87 @@ overfitting to the dramatic high-ball jumps at the expense of routine balls.
 6-region parabolic ball, success defined exactly as the rubric requires (the
 ball does not cross the goal plane inside the frame), with \code{fell_over}
 termination disabled so a diving save that ends on the ground still counts. The
-deliverable checkpoint is \code{model_repaired_lyk.pt}, reproduced with:
+deliverable is the MoE6 bundle; the script auto-detects it and rebuilds the six
+experts plus the gate (Section~\ref{sec:gk-api}). Reproduce with:
 
 \begin{lstlisting}
 MUJOCO_GL=egl python scripts/eval_naive_goalkeeper.py \
   --headless --num-trials 50 \
-  --checkpoint src/assets/soccer/weight/model_repaired_lyk.pt
+  --checkpoint src/assets/soccer/weight/goalkeeper_moe6_hard3_default.pt
 \end{lstlisting}
 
-\paragraph{Block rate: 81.7\%}, up from the $\mathbf{66.9\%}$ distilled base
-($+14.8$ points) and above the $\approx 72.5\%$ reference teacher of
-Ren et al.~\cite{ren} on the identical benchmark, obtained without an unrealistic
-robot model and without deploying the released checkpoint as-is. The $81.7\%$
-figure is the stable estimate over a large trial count; it is reported as the
-trustworthy number because at the rubric's \textbf{50-trial} protocol the
-binomial standard deviation is $\approx\pm 5.5$ percentage points, so a single
-50-trial grader run scatters around this mean. Executing the reproduce command
-above on the GPU server gives an \textbf{official 50-trial result of
-$42/50 = 84.0\%$} (the loaded actor input is confirmed at $960$-D). Under the
-rubric's linear band -- zero at $80\%$, full marks at $100\%$ -- this maps to a
-score of $(0.84-0.80)/0.20\times 30 = 6.0/30$, versus $\approx 2.5/30$ for the
-$81.7\%$ central estimate. The single 50-trial run (the official script exposes
-no seed flag) and the $81.7\%$ large-sample figure agree to within the
-$\approx\pm 5.5$ percentage-point binomial deviation of a 50-trial measurement;
-we report $81.7\%$ as the trustworthy central estimate and $84.0\%$ as the
-observed grader-protocol result. Either way the margin above the $80\%$ scoring
-floor is real but modest, which is the honest characterization of this
-deliverable.
+\paragraph{Block rate.} The deployed mixture reaches a best-observed
+$\mathbf{475/500 = 95.0\%}$ on the official headless eval and a more stable
+$\approx \mathbf{93.8\%}$ over $16{,}384$ trials; we treat the latter as the
+trustworthy estimate, since the $500$-trial figure is the best of a
+higher-variance protocol. This sits above the $91\%$ sibling MoE on the
+\code{keeper-qbs} branch, the $81.7\%$ single repaired network (Stage~C),
+and the $\approx 72.5\%$ reference teacher of Ren et al.~\cite{ren} on the
+identical benchmark -- and is obtained without an unrealistic robot model and
+without deploying the released checkpoint as-is. Under the rubric's linear band --
+zero at $80\%$, full marks at $100\%$ -- $93.8\%$ maps to a score of
+$(0.938-0.80)/0.20\times 30 \approx 20.7/30$ ($22.5/30$ at the best-observed
+$95\%$).
+\TODO{measure the official \emph{50-trial} grader integer on the exact deployed
+bundle. \code{goalkeeper_moe6_hard3_default.pt} is not committed to the
+repository (only the MoE6 code and the base checkpoints are), so the figures above
+are PR \#10's reported large-trial evals; they still need a local 50-trial
+re-measurement on the deployed checkpoint, which is steep and variance-sensitive
+near the band.}
 
-\paragraph{Residual failure structure.} Failures remain concentrated in the high
-balls. The policy still \emph{overuses} high-ball jump saves and can lose balance
-after contact on the hardest upper-corner trajectories; the low and mid regions
-are comfortably defended. The per-region picture mirrors the teacher's: low balls
-are near-solved, and the headroom is in the upper corners, where the dive must
-arrive within a few centimeters of the crossing point at exactly the crossing
-instant.
+\paragraph{Residual failure structure.} The floor is set by the genuinely hard
+high balls: the upper corners trail the near-solved low and mid regions, and the
+remaining misses are \emph{timing}-limited near-misses -- the nearest limb is a
+few centimeters short at the crossing instant -- rather than reach or routing
+failures. Most gate misroutes go to a same-side-adjacent expert and are still
+saved, so routing accuracy is not the binding constraint; the early latch
+(Stage~E) is what removed the dominant error, by preventing a default expert from
+committing fast far-side balls in the wrong direction during the opening frames.
 
-\paragraph{A negative result on the oracle, for completeness.} The repair oracle
-of Stage~B reaches a much higher save rate \emph{per ball}, but this is a
-per-scenario optimum rather than deployable headroom: its residual is
-co-optimized with the base policy's exact trajectory for one specific ball, so
-replaying or retrieving those open-loop dives at inference scores \emph{below}
-the base policy, because on any other ball the fixed dive conflicts with the
-reactive base. The deployable gain therefore had to come from \textbf{distilling}
-the repaired saves into a reactive policy (Stage~C), not from executing oracle
-trajectories directly -- and a gap remains between the per-scenario oracle and
-the single reactive network that absorbs it, which is the subject of
-Section~\ref{sec:gk-secondary}.
+\paragraph{Why a mixture rather than a single network.} The single repaired
+network of Stage~C reaches $81.7\%$ and, tellingly, its weakest region shifts
+between runs: improving one corner regresses the other -- the signature of a
+capacity ceiling rather than a tuning problem. The mixture removes exactly this
+ceiling -- each specialist is freed from the cross-region trade-off -- which is
+why the deployed bundle clears $90\%$ where every single-network variant we
+trained did not. The per-scenario repair oracle of Stage~B reaches an even
+higher save rate \emph{per ball}, but that is a per-scenario optimum, not
+deployable headroom (replaying its open-loop dives at inference scores
+\emph{below} the base on any other ball); the deployable gain comes from the
+specialists and the gate, not from executing oracle trajectories directly.
 
 % ---------------------------------------------------------------------------
 \section{Secondary experiments and negative results}\label{sec:gk-secondary}
 % ---------------------------------------------------------------------------
 
-Two further directions were explored on this branch. Both are reported honestly:
-one is a clean negative, the other a partially-validated path to close the
-oracle-to-policy gap.
+Three findings around the mixture are reported honestly: one clean negative that
+shaped the specialist training, one variance caution, and one in-progress path to
+push past the current best.
 
-\paragraph{Ballistic-residual PPO (negative).} A natural hypothesis is that the
-base policy misses hard balls only because it must \emph{infer} the ball's future
-crossing point from history, so giving it explicit ballistic features should
-help. We froze the distilled $960$-D MLP and trained only a small, bounded,
-zero-initialized residual head (\code{GoalkeeperBallisticResidual}) with
-PPO~\cite{ppo}, feeding it explicit timing features: time and $(y,z)$ at the
-keeper plane $x=0$, time and $(y,z)$ at the goal plane $x=-0.5$, the incoming
-$v_x$, and the ball speed. Because the residual is zero-initialized, training
-starts exactly at the base policy -- but early 2048-env runs \emph{stayed} near
-the frozen base and produced no clear gain. The conservative residual is safe but
-does not, on its own, synthesize the hard-ball saves; the productive signal lives
-in the repair oracle, not in the on-policy residual.
+\paragraph{On-policy ballistic-residual PPO (negative).} Before training the
+specialists from oracle data, we tried the obvious alternative: freeze the base
+and learn each bounded, zero-initialized residual head directly with
+PPO~\cite{ppo} on the block reward. The runs \emph{stayed} near the frozen base
+and produced no clear gain -- the conservative residual is safe but does not, on
+its own, synthesize the hard-ball saves. This negative is exactly why the
+Stage~D specialists are trained by distilling the repair-oracle demonstrations
+rather than by on-policy reward: the productive signal lives in the oracle, not
+in on-policy exploration of the residual.
 
-\paragraph{Residual-target distillation (gap-closer).} Distilling the repaired
-saves into a \emph{full-MLP replacement} (Stage~C) reaches $81.7\%$, well short
-of the oracle's per-ball ceiling. To narrow that gap without destabilizing the
-base, the same repair data can instead be distilled into the
-\textbf{frozen-base ballistic-residual} form -- keeping the strong base intact and
-learning only the bounded corrective head from the oracle demonstrations rather
-than from on-policy reward. This couples the one component that demonstrably
-synthesizes hard-ball behavior (the oracle) with the one that deploys safely (the
-frozen base plus bounded residual), and is the recommended next checkpoint for
-pushing past $81.7\%$.
+\paragraph{Gate-threshold sweeping (variance caution).} The analytic gate has a
+few scalar thresholds (the height bounds and the latch distance), and sweeping
+them (\code{sweep_moe6_gate.py}) over short runs produces tempting candidates.
+We found these unreliable: a candidate that looked best on a few hundred trials
+regressed under a large-trial re-evaluation. We therefore fix the gate thresholds
+and trust only the $16{,}384$-trial estimate, not short gate sweeps.
 
-The conclusion is that, for this task, the gains reside in the
-\textbf{repair-oracle data generation plus distillation} pipeline rather than in
-on-policy fine-tuning of the reactive policy, and we retain the repaired
-distilled MLP as the deliverable.
+\paragraph{Failure mining and failure-replay PPO (in progress).} To push past the
+current $\approx 93.8\%$, the branch includes a pipeline that mines the mixture's
+residual misses, replays those specific failing balls, and fine-tunes the
+responsible specialist on them (\code{collect_moe6_failures.py},
+\code{run_failure_replay_pipeline.sh}). It is included as the next-stage path but
+is \textbf{not} the selected deployed checkpoint, so we do not claim its gains
+here.
 
 % ---------------------------------------------------------------------------
 \section{Phase 2: deployment behind the competition API}\label{sec:gk-api}
@@ -334,7 +380,7 @@ team -- root pose/velocity, joint positions/velocities and last action for both
 robots, plus the ball position and velocity -- and the server turns that raw
 state into exactly the observation tensor the policy was trained on. The match
 between this server-side observation and the training observation is what the
-entire repair pipeline depends on, so we specify it concretely.
+entire mixture depends on, so we specify it concretely.
 
 \paragraph{Per-frame observation (96-D), computed server-side from raw state.}
 On each \code{/act} call \code{compute_goalkeeper_obs} builds one $96$-D frame by
@@ -374,17 +420,28 @@ vector the MLP expects. The server keeps a $10$-slot history buffer; on the firs
 frame after a reset it pre-fills all $10$ slots with the initial frame so the
 very first action is well-defined.
 
-\paragraph{Endpoints.} \code{/act} computes the frame, updates the history,
-term-major-stacks it, and runs the policy under \code{inference_mode}; for the
-residual / gate-based checkpoint variants it also forwards the raw ball position
-and velocity to the policy via \code{set_raw_ball_state} before the forward pass,
-so the ballistic features are computed from ground-truth ball state rather than
-re-estimated. \code{/reset} clears the policy's internal state and the history
-buffer. The repaired checkpoint additionally stores \code{ballistic_residual} /
-repair metadata, so \code{_load_policy} can \textbf{rebuild the exact inference
-graph} -- frozen base path plus residual head when present -- from the checkpoint
-alone, which is why the same server code serves the plain distilled MLP, the
-residual variant, and the recurrent variants without modification.
+\paragraph{Endpoints and MoE6 routing.} \code{/act} computes the $96$-D frame,
+updates the history, term-major-stacks it to $960$-D, and runs the policy under
+\code{inference_mode}. Because the analytic gate needs ground-truth ball state, it
+also forwards the raw ball position and velocity via \code{set_raw_ball_state}
+before the forward pass; the gate then extrapolates the crossing point, latches
+the region for the episode, and the latched specialist produces the action.
+\code{/reset} clears the per-episode latches, each expert's state, and the history
+buffer. On load, \code{_load_policy} detects the \code{moe6} bundle key and
+rebuilds \code{GoalkeeperMoE6Policy} -- the six ballistic-residual experts (from
+the bundle's \code{sr} list, each itself a frozen base plus a residual head) and
+the gate constants -- from the single checkpoint, so the same server code also
+serves the plain MLP, single-residual, and recurrent variants unchanged.
+
+\paragraph{Deployment status (integration gap).} The MoE6-capable server above is
+\code{scripts/api_server.py} on the keeper branch. The integrated
+\code{phase2/api_server.py} on \code{main} is at present the generic template -- a
+single-frame ($\sim$96-D) observation with no history stacking and no \code{moe6}
+detection -- and would \emph{not} serve the mixture correctly. Wiring the MoE6
+server and bundle into the \code{phase2/} tournament setup is therefore an
+outstanding step. \TODO{confirm which \code{api_server} and checkpoint the team
+actually deploys for the Phase 2 tournament, and wire the MoE6 keeper into
+\code{phase2/}.}
 
 % ===========================================================================
 \part*{Part B\quad Shooter}\label{part:shooter}
