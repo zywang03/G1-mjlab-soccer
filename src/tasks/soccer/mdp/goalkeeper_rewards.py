@@ -11,6 +11,7 @@ dedicated reset event.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,6 +32,24 @@ MILD_READY_JOINT_POS: dict[str, float] = {
   "right_knee_joint": 0.45,
   "right_ankle_pitch_joint": -0.27,
 }
+
+GOALKEEPER_MOTION_PRIOR_FILES: tuple[str, ...] = (
+  "lefthand.pt",
+  "righthand.pt",
+  "leftjump.pt",
+  "rightjump.pt",
+  "leftstep.pt",
+  "rightstep.pt",
+)
+
+GOALKEEPER_REGION_MOTION_PRIOR_FILES: tuple[str, ...] = (
+  "righthand.pt",  # Right-Mid
+  "lefthand.pt",  # Left-Mid
+  "rightjump.pt",  # Right-Up
+  "leftjump.pt",  # Left-Up
+  "rightstep.pt",  # Right-Low
+  "leftstep.pt",  # Left-Low
+)
 
 
 def _gk_get_or_init_state(
@@ -63,6 +82,58 @@ def _resolve_joint_indices(
     dtype=torch.long,
     device=device,
   )
+
+
+def _load_goalkeeper_motion_prior(
+  env: ManagerBasedRlEnv,
+  motion_dir: str,
+  robot: Entity,
+  motion_names: tuple[str, ...] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  cache_key = "_gk_motion_prior_joint_pose_cache"
+  cached = getattr(env, cache_key, None)
+  selected_motion_names = tuple(motion_names or GOALKEEPER_MOTION_PRIOR_FILES)
+  cache_id = (motion_dir, selected_motion_names, str(env.device))
+  if cached is not None and cached[0] == cache_id:
+    return cached[1], cached[2], cached[3]
+
+  path = Path(motion_dir)
+  joint_lines = (path / "joint_id.txt").read_text(encoding="utf-8").splitlines()
+  joint_names: list[str] = []
+  for line in joint_lines:
+    parts = line.strip().split()
+    if len(parts) >= 2:
+      joint_names.append(parts[1])
+  if not joint_names:
+    raise ValueError(f"No joint names found in goalkeeper motion prior: {path / 'joint_id.txt'}")
+
+  motion_tensors: list[torch.Tensor] = []
+  lengths: list[int] = []
+  max_len = 0
+  for name in selected_motion_names:
+    motion_path = path / name
+    if not motion_path.exists():
+      continue
+    data = torch.load(motion_path, map_location=env.device)
+    joint_pos = data["joint_position"].to(device=env.device, dtype=torch.float32)
+    if joint_pos.ndim != 2 or joint_pos.shape[1] != len(joint_names):
+      raise ValueError(
+        f"{motion_path} joint_position must have shape (T, {len(joint_names)}), got {tuple(joint_pos.shape)}"
+      )
+    motion_tensors.append(joint_pos)
+    lengths.append(int(joint_pos.shape[0]))
+    max_len = max(max_len, int(joint_pos.shape[0]))
+  if not motion_tensors:
+    raise FileNotFoundError(f"No goalkeeper motion prior .pt files found in {path}")
+
+  padded = torch.zeros(len(motion_tensors), max_len, len(joint_names), device=env.device)
+  for idx, motion in enumerate(motion_tensors):
+    padded[idx, : motion.shape[0]] = motion
+    padded[idx, motion.shape[0] :] = motion[-1]
+  length_tensor = torch.tensor(lengths, dtype=torch.long, device=env.device)
+  joint_ids = _resolve_joint_indices(robot, tuple(joint_names), env.device)
+  setattr(env, cache_key, (cache_id, padded, length_tensor, joint_ids))
+  return padded, length_tensor, joint_ids
 
 
 def _idle_wait_mask(
@@ -510,6 +581,69 @@ def goalkeeper_active_fall_penalty(
   limit_cos = torch.cos(torch.tensor(limit_angle, dtype=torch.float32, device=env.device))
   fallen = upright < limit_cos
   return fallen.float() * _active_ball_mask(env, ball_cfg).to(dtype=upright.dtype)
+
+
+def goalkeeper_active_motion_prior_joint_pose(
+  env: ManagerBasedRlEnv,
+  motion_dir: str = "src/assets/soccer/motions/goalkeeper",
+  motion_names: tuple[str, ...] | None = None,
+  route_mode: str = "all",
+  std: float = 0.5,
+  launch_delay_s: float = 3.0,
+  dt: float | None = None,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+  """Reward active-stage joint poses that stay close to the goalkeeper motion prior.
+
+  The six goalkeeper motions are state trajectories, not observation-action
+  pairs, so this is a pose-tracking regularizer rather than an RL-stage BC loss.
+  """
+  robot: Entity = env.scene[robot_cfg.name]
+  route_mode = route_mode.lower()
+  if route_mode not in {"all", "region"}:
+    raise ValueError(f"Unknown goalkeeper motion-prior route_mode: {route_mode!r}")
+  selected_motion_names = motion_names
+  if route_mode == "region":
+    selected_motion_names = motion_names or GOALKEEPER_REGION_MOTION_PRIOR_FILES
+    if len(selected_motion_names) != len(GOALKEEPER_REGION_MOTION_PRIOR_FILES):
+      raise ValueError(
+        "route_mode='region' requires exactly six motion prior files ordered as "
+        "Right-Mid, Left-Mid, Right-Up, Left-Up, Right-Low, Left-Low"
+      )
+  motion_joint_pos, motion_lengths, joint_ids = _load_goalkeeper_motion_prior(
+    env, motion_dir, robot, motion_names=selected_motion_names
+  )
+  if dt is None:
+    dt = float(getattr(env, "step_dt", 0.02))
+  launch_delay_steps = int(round(max(launch_delay_s, 0.0) / max(float(dt), 1e-6)))
+  episode_steps = getattr(env, "episode_length_buf", None)
+  if episode_steps is None:
+    active_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+  else:
+    active_steps = (episode_steps.to(device=env.device, dtype=torch.long) - launch_delay_steps).clamp_min(0)
+
+  current = robot.data.joint_pos[:, joint_ids].to(dtype=torch.float32)
+  if route_mode == "region":
+    region = getattr(env, "_gk_region", None)
+    if region is None or region.shape[0] != env.num_envs:
+      region_idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    else:
+      region_idx = region.to(device=env.device, dtype=torch.long).clamp(0, motion_joint_pos.shape[0] - 1)
+    frame_idx = torch.minimum(active_steps, motion_lengths[region_idx] - 1)
+    reference = motion_joint_pos[region_idx, frame_idx]
+    best_err = torch.mean((current - reference) ** 2, dim=-1)
+  else:
+    motion_idx = torch.arange(motion_joint_pos.shape[0], device=env.device).view(1, -1)
+    frame_idx = torch.minimum(
+      active_steps.view(-1, 1),
+      (motion_lengths - 1).view(1, -1),
+    )
+    reference = motion_joint_pos[motion_idx, frame_idx]  # (B, M, J)
+    err = torch.mean((current.unsqueeze(1) - reference) ** 2, dim=-1)
+    best_err = torch.min(err, dim=1).values
+  reward = torch.exp(-best_err / max(std * std, 1e-6))
+  return _apply_active_ball_mask(env, reward, ball_cfg)
 
 
 def goalkeeper_idle_action_rate(

@@ -362,6 +362,12 @@ def _moe_bundle_from_checkpoint(loaded: Any) -> dict[str, Any] | None:
         return None
     if "sr" in loaded:
         return loaded
+    if loaded.get("moe6_residual") and isinstance(loaded.get("base_moe6"), dict):
+        bundle = dict(loaded["base_moe6"])
+        for key in ("idle", "prepare", "idle_expert", "gate", "idle_speed_threshold", "idle_incoming_vx_threshold"):
+            if key in loaded:
+                bundle[key] = loaded[key]
+        return bundle
     actor_state = loaded.get("actor_state_dict")
     if isinstance(actor_state, dict) and "sr" in actor_state:
         return actor_state

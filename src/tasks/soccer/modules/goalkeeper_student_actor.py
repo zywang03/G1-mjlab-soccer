@@ -1,4 +1,4 @@
-"""LSTM goalkeeper student actor with FiLM prediction conditioning."""
+"""LSTM goalkeeper student actor with phase-aware task conditioning."""
 
 from __future__ import annotations
 
@@ -13,17 +13,16 @@ from rsl_rl.utils import unpad_trajectories
 from tensordict import TensorDict
 
 from src.tasks.soccer.mdp.goalkeeper_student_obs import (
-  GOALKEEPER_PREDICTION_CONDITION_DIM,
+  GOALKEEPER_TASK_CONTEXT_DIM,
   GOALKEEPER_TEACHER_ACTOR_OBS_DIM,
 )
 
 
 class GoalkeeperStudentFiLMActor(nn.Module):
-  """Recurrent student actor conditioned by predicted ball crossing features.
+  """Recurrent student actor conditioned by explicit goalkeeper task context.
 
-  The LSTM only sees the normal 960D goalkeeper actor observation history.  The
-  4D prediction condition ``[pred_y, pred_z, time_norm, idle]`` is encoded
-  separately and used to FiLM-modulate the LSTM latent before the action head.
+  The LSTM only sees the normal 960D goalkeeper actor observation history.
+  A separate task context controls phase-specific prepare/active action heads.
   """
 
   is_recurrent = True
@@ -54,7 +53,7 @@ class GoalkeeperStudentFiLMActor(nn.Module):
     super().__init__()
     self.obs_groups = obs_groups[obs_set]
     self.obs_dim = sum(int(obs[group].shape[-1]) for group in self.obs_groups)
-    expected_dim = GOALKEEPER_TEACHER_ACTOR_OBS_DIM + GOALKEEPER_PREDICTION_CONDITION_DIM
+    expected_dim = GOALKEEPER_TEACHER_ACTOR_OBS_DIM + GOALKEEPER_TASK_CONTEXT_DIM
     if self.obs_dim != expected_dim:
       raise ValueError(f"Goalkeeper student obs dim must be {expected_dim}, got {self.obs_dim}")
 
@@ -73,13 +72,30 @@ class GoalkeeperStudentFiLMActor(nn.Module):
       rnn_num_layers,
       rnn_type,
     )
-    self.condition_encoder = nn.Sequential(
-      nn.Linear(GOALKEEPER_PREDICTION_CONDITION_DIM, condition_hidden_dim),
+    self.phase_encoder = nn.Sequential(
+      nn.Linear(4, condition_hidden_dim),
       nn.ELU(),
       nn.Linear(condition_hidden_dim, condition_hidden_dim),
       nn.ELU(),
     )
-    self.film = nn.Linear(condition_hidden_dim, 2 * rnn_hidden_dim)
+    self.ball_encoder = nn.Sequential(
+      nn.Linear(6, condition_hidden_dim),
+      nn.ELU(),
+      nn.Linear(condition_hidden_dim, condition_hidden_dim),
+      nn.ELU(),
+    )
+    self.target_encoder = nn.Sequential(
+      nn.Linear(9, condition_hidden_dim),
+      nn.ELU(),
+      nn.Linear(condition_hidden_dim, condition_hidden_dim),
+      nn.ELU(),
+    )
+    self.context_fusion = nn.Sequential(
+      nn.Linear(rnn_hidden_dim + 3 * condition_hidden_dim, rnn_hidden_dim),
+      nn.ELU(),
+      nn.Linear(rnn_hidden_dim, rnn_hidden_dim),
+      nn.ELU(),
+    )
     self.region_estimator = nn.Sequential(
       nn.Linear(rnn_hidden_dim, condition_hidden_dim),
       nn.ELU(),
@@ -90,20 +106,13 @@ class GoalkeeperStudentFiLMActor(nn.Module):
       nn.ELU(),
       nn.Linear(condition_hidden_dim, self.ball_latent_dim),
     )
-    self.region_condition_encoder = nn.Sequential(
-      nn.Linear(self.num_route_classes + self.ball_latent_dim, condition_hidden_dim),
-      nn.ELU(),
-      nn.Linear(condition_hidden_dim, condition_hidden_dim),
-      nn.ELU(),
-    )
-    self.region_film = nn.Linear(condition_hidden_dim, 2 * rnn_hidden_dim)
-    self.prepare_region_film = nn.Linear(condition_hidden_dim, 2 * rnn_hidden_dim)
     self.condition_aux_head = nn.Sequential(
       nn.Linear(rnn_hidden_dim, condition_hidden_dim),
       nn.ELU(),
       nn.Linear(condition_hidden_dim, 8),
     )
-    self.mlp = MLP(rnn_hidden_dim, output_dim, hidden_dims, activation)
+    self.prepare_head = MLP(rnn_hidden_dim, output_dim, hidden_dims, activation)
+    self.active_head = MLP(rnn_hidden_dim, output_dim, hidden_dims, activation)
 
     distribution_cfg = dict(distribution_cfg or {
       "class_name": "GaussianDistribution",
@@ -112,15 +121,11 @@ class GoalkeeperStudentFiLMActor(nn.Module):
     })
     distribution_cfg.pop("class_name", None)
     self.distribution = GaussianDistribution(output_dim, **distribution_cfg)
-    self.distribution.init_mlp_weights(self.mlp)
+    self.distribution.init_mlp_weights(self.prepare_head)
+    self.distribution.init_mlp_weights(self.active_head)
     self._last_condition_aux: torch.Tensor | None = None
     self._last_region_aux: dict[str, torch.Tensor] | None = None
-    self._init_identity_film()
-
-  def _init_identity_film(self) -> None:
-    for film in (self.film, self.region_film, self.prepare_region_film):
-      nn.init.zeros_(film.weight)
-      nn.init.zeros_(film.bias)
+    self.condition_aux_enabled: bool = True
 
   def _split_student_obs(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return (
@@ -131,33 +136,34 @@ class GoalkeeperStudentFiLMActor(nn.Module):
   def _raw_student_obs(self, obs: TensorDict) -> torch.Tensor:
     return torch.cat([obs[group] for group in self.obs_groups], dim=-1)
 
-  def _conditioned_latent(self, actor_latent: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
-    encoded = self.condition_encoder(condition)
-    gamma_beta = self.film(encoded)
-    gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
-    return (1.0 + gamma) * actor_latent + beta
+  def _encode_task_context(self, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    phase_features = context[..., :4]
+    ball_features = context[..., 4:10]
+    target_features = context[..., 10:19]
+    encoded = torch.cat([
+      self.phase_encoder(phase_features),
+      self.ball_encoder(ball_features),
+      self.target_encoder(target_features),
+    ], dim=-1)
+    active_blend = context[..., 0:1].clamp(0.0, 1.0)
+    return encoded, active_blend
 
-  def _route_conditioned_latent(
-    self,
-    latent: torch.Tensor,
-    condition: torch.Tensor,
-    route_source_latent: torch.Tensor,
-  ) -> torch.Tensor:
-    region_logits = self.region_estimator(route_source_latent)
-    ball_latent = self.ball_estimator(route_source_latent)
-    route_probs = torch.softmax(region_logits, dim=-1)
-    route_features = torch.cat([route_probs, ball_latent], dim=-1)
-    encoded = self.region_condition_encoder(route_features)
-    gamma_beta = self.region_film(encoded)
-    prepare_gamma_beta = self.prepare_region_film(encoded)
-    idle = condition[..., -1:].to(dtype=latent.dtype) > 0.5
-    gamma_beta = torch.where(idle, prepare_gamma_beta, gamma_beta)
-    gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+  def _contextual_latent(self, actor_latent: torch.Tensor, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    context_latent, active_blend = self._encode_task_context(context)
+    latent = self.context_fusion(torch.cat([actor_latent, context_latent], dim=-1))
+    region_logits = self.region_estimator(latent)
+    ball_latent = self.ball_estimator(latent)
     self._last_region_aux = {
       "region_logits": region_logits,
       "ball_latent": ball_latent,
     }
-    return (1.0 + gamma) * latent + beta
+    return latent, active_blend
+
+  def _action_head_output(self, latent: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    _, active_blend = self._encode_task_context(context)
+    prepare_action = self.prepare_head(latent)
+    active_action = self.active_head(latent)
+    return prepare_action * (1.0 - active_blend) + active_action * active_blend
 
   @staticmethod
   def _split_condition_aux(aux: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -170,13 +176,22 @@ class GoalkeeperStudentFiLMActor(nn.Module):
     base_latent = self.rnn(actor_obs, masks, hidden_state).squeeze(0)
     if masks is not None:
       condition = unpad_trajectories(condition, masks)
-    latent = self._conditioned_latent(base_latent, condition)
-    return self._route_conditioned_latent(latent, condition, base_latent)
+    latent, _ = self._contextual_latent(base_latent, condition)
+    return latent
 
   def forward(self, obs: TensorDict, masks=None, hidden_state=None, stochastic_output: bool = False) -> torch.Tensor:
-    latent = self.get_latent(obs, masks, hidden_state)
-    self._last_condition_aux = self.condition_aux_head(latent)
-    mlp_output = self.mlp(latent)
+    raw = self._raw_student_obs(obs)
+    actor_obs, condition = self._split_student_obs(raw)
+    actor_obs = self.obs_normalizer(actor_obs)
+    base_latent = self.rnn(actor_obs, masks, hidden_state).squeeze(0)
+    if masks is not None:
+      condition = unpad_trajectories(condition, masks)
+    latent, active_blend = self._contextual_latent(base_latent, condition)
+    if self.condition_aux_enabled:
+      self._last_condition_aux = self.condition_aux_head(latent)
+    prepare_action = self.prepare_head(latent)
+    active_action = self.active_head(latent)
+    mlp_output = prepare_action * (1.0 - active_blend) + active_action * active_blend
     if stochastic_output:
       self._clamp_distribution_std_param()
       self.distribution.update(mlp_output)
@@ -197,10 +212,12 @@ class GoalkeeperStudentFiLMActor(nn.Module):
     rnn_out, new_hs = self.rnn.rnn(actor_obs, hidden_state)
     base_latent = rnn_out[masks_chunk]
     condition = condition[masks_chunk]
-    latent = self._conditioned_latent(base_latent, condition)
-    latent = self._route_conditioned_latent(latent, condition, base_latent)
-    self._last_condition_aux = self.condition_aux_head(latent)
-    mlp_output = self.mlp(latent)
+    latent, active_blend = self._contextual_latent(base_latent, condition)
+    if self.condition_aux_enabled:
+      self._last_condition_aux = self.condition_aux_head(latent)
+    prepare_action = self.prepare_head(latent)
+    active_action = self.active_head(latent)
+    mlp_output = prepare_action * (1.0 - active_blend) + active_action * active_blend
     return self.distribution.deterministic_output(mlp_output), self._detach_hidden_state(new_hs)
 
   def predict_condition_aux(self, obs: TensorDict, masks=None, hidden_state=None) -> dict[str, torch.Tensor]:

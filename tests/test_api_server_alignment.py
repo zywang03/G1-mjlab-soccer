@@ -398,6 +398,55 @@ class ApiServerAlignmentTest(unittest.TestCase):
     self.assertIsNotNone(captured["idle_env"])
     self.assertEqual(env.num_actions, 58)
 
+  def test_goalkeeper_residual_moe_bundle_loads_moe_policy(self):
+    api = _load_api_server()
+    captured = {}
+
+    class FakeMoEPolicy:
+      def __init__(self, bundle, env, device, idle_env=None):
+        captured["bundle"] = bundle
+        captured["env"] = env
+        captured["device"] = device
+        captured["idle_env"] = idle_env
+
+      def reset(self):
+        pass
+
+    base_bundle = {
+      "sr": [{"actor_state_dict": {"mlp.0.weight": torch.zeros(1)}} for _ in range(6)],
+      "z_low": 0.85,
+      "z_up": 1.35,
+      "vz_low": -5.0,
+      "latch_hi": 3.5,
+    }
+    ckpt = {
+      "moe6_residual": True,
+      "base_moe6": base_bundle,
+      "policy_state_dict": {"residual.0.weight": torch.zeros(1)},
+      "idle": {"actor_state_dict": {"actor_residual.0.weight": torch.zeros(1)}},
+      "gate": {"state": {}, "mean": torch.zeros(6), "std": torch.ones(6), "num_classes": 7},
+      "idle_speed_threshold": 0.5,
+      "idle_incoming_vx_threshold": -0.5,
+    }
+
+    with patch.object(api, "load_env_cfg", return_value=_FakeEnvCfg()), \
+        patch.object(api, "ManagerBasedRlEnv", side_effect=lambda cfg, device: _FakeDualBaseEnv()), \
+        patch.object(api, "RslRlVecEnvWrapper", side_effect=lambda env, clip_actions: _FakeDualWrappedEnv(env, clip_actions)), \
+        patch.object(api.torch, "load", return_value=ckpt), \
+        patch.object(api, "ApiMoE6Policy", FakeMoEPolicy), \
+        patch("mjlab.rl.MjlabOnPolicyRunner", side_effect=AssertionError("Residual MoE bundle must not load as native MLP")):
+      policy, env, resolved_task_id = api._load_policy("targeted_moe6_residual.pt", "Eval-Goalkeeper", "cpu")
+
+    self.assertIsInstance(policy, FakeMoEPolicy)
+    self.assertEqual(resolved_task_id, "Eval-Goalkeeper")
+    self.assertIsNot(captured["bundle"], base_bundle)
+    self.assertIs(captured["bundle"]["sr"], base_bundle["sr"])
+    self.assertEqual(captured["bundle"]["idle_speed_threshold"], 0.5)
+    self.assertEqual(captured["bundle"]["idle_incoming_vx_threshold"], -0.5)
+    self.assertIn("gate", captured["bundle"])
+    self.assertIsNotNone(captured["idle_env"])
+    self.assertEqual(env.num_actions, 58)
+
   def test_create_app_treats_adversarial_goalkeeper_as_goalkeeper(self):
     api = _load_api_server()
     captured = {}

@@ -301,9 +301,14 @@ class MoE7PrepareGoalkeeperActor(nn.Module):
       for param in self.sr_experts[idx].parameters():
         param.requires_grad_(False)
     idle = next((bundle[k] for k in ("idle", "prepare", "idle_expert") if k in bundle), None)
-    if not isinstance(idle, dict) or "actor_state_dict" not in idle:
-      raise KeyError("MoE7 prepare actor expects an idle/prepare actor checkpoint")
-    self.idle_expert.load_state_dict(idle["actor_state_dict"], strict=False)
+    if isinstance(idle, dict) and "actor_state_dict" in idle:
+      self.idle_expert.load_state_dict(idle["actor_state_dict"], strict=False)
+    else:
+      print(
+        "[MoE7PrepareGoalkeeperActor] No idle/prepare expert in bundle; "
+        "idle samples will use the randomly-initialized idle expert (irrelevant "
+        "for active-only KL/distillation)."
+      )
     gate = bundle.get("gate")
     self.has_learned_gate = gate is not None
     if gate is not None:

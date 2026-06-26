@@ -73,7 +73,10 @@ from src.tasks.soccer.mdp.goalkeeper_obs import (
   gk_last_action,
   gk_lin_vel,
 )
-from src.tasks.soccer.mdp.goalkeeper_student_obs import goalkeeper_student_obs
+from src.tasks.soccer.mdp.goalkeeper_student_obs import (
+  goalkeeper_prediction_condition,
+  goalkeeper_student_obs,
+)
 from src.tasks.soccer.mdp.shooter_rewards import action_rate_l2_clip
 from src.tasks.soccer.mdp.goalkeeper_ball_reset import (
   RegionBallVelCfg,
@@ -429,6 +432,17 @@ def configure_goalkeeper_student_ppo_env_cfg(cfg: ManagerBasedRlEnvCfg) -> Manag
     concatenate_terms=True,
     enable_corruption=False,
     history_length=1,
+  )
+  # Critic: privileged terms + prediction condition, 10-frame history for trajectory.
+  # The condition gives the critic the same landing-point context the actor sees.
+  cfg.observations["critic"] = ObservationGroupCfg(
+    terms={
+      **cfg.observations["critic"].terms,
+      "condition": ObservationTermCfg(func=goalkeeper_prediction_condition),
+    },
+    concatenate_terms=True,
+    enable_corruption=False,
+    history_length=10,
   )
   configure_goalkeeper_polish_reward_env_cfg(
     cfg,

@@ -24,6 +24,12 @@ except ModuleNotFoundError:  # Direct execution: python scripts/train_goalkeeper
   import train_shooter_bc as _shooter_bc
 
 from src.tasks.soccer.modules.goalkeeper_student_actor import GoalkeeperStudentFiLMActor
+from src.tasks.soccer.mdp.goalkeeper_student_obs import (
+  GOALKEEPER_PHASE_IDLE_INDEX,
+  GOALKEEPER_STUDENT_OBS_DIM,
+  GOALKEEPER_TEACHER_ACTOR_OBS_DIM,
+  build_goalkeeper_student_obs,
+)
 
 _BaseBcConfig = _shooter_bc.BcConfig
 
@@ -72,6 +78,30 @@ class BcConfig(_BaseBcConfig):
   success_only: bool = False
   """Goalkeeper student BC defaults to all valid teacher timesteps."""
 
+  dataloader_num_workers: int = 8
+  """Number of DataLoader workers for parallel shard loading."""
+
+  train_shards_per_epoch: int | None = 128
+  """Random train shard subset used each epoch; set <=0 or None for all train shards."""
+
+  val_interval: int = 10
+  """Run validation and refresh model_best every N epochs; final epoch always validates."""
+
+  active_action_loss_weight: float = 1.0
+  """Extra BC action-loss weight for non-idle frames where the ball is incoming."""
+
+  transition_prefix_prob: float = 0.0
+  """Probability of prepending a prepare-only sequence to an active BC episode."""
+
+  transition_prefix_min_steps: int = 10
+  """Minimum prepare-prefix length used for transition augmentation."""
+
+  transition_prefix_max_steps: int = 75
+  """Maximum prepare-prefix length used for transition augmentation."""
+
+  best_metric: str = "loss"
+  """Validation metric used for model_best: loss, action_loss, active_action_loss, or idle_action_loss."""
+
 
 def make_goalkeeper_student_actor(obs_dim: int, action_dim: int, cfg: BcConfig, device: str):
   """Create the FiLM-conditioned LSTM actor used by goalkeeper student BC."""
@@ -97,40 +127,200 @@ def make_goalkeeper_student_actor(obs_dim: int, action_dim: int, cfg: BcConfig, 
   ).to(device)
 
 
-def _iter_streaming_rnn_minibatches(
+def _build_episode_index(shards: list[Path], success_only: bool, action_clip: float | None) -> list[tuple[int, int]]:
+  """Build (shard_idx, episode_idx) index without loading full data into memory."""
+  index: list[tuple[int, int]] = []
+  for s_idx, shard in enumerate(shards):
+    payload = torch.load(shard, map_location="cpu", weights_only=False)
+    N = int(payload["student_obs"].shape[0])
+    for e_idx in range(N):
+      if success_only and not bool(payload["metadata"]["success"][e_idx].item()):
+        continue
+      if not torch.any(payload["valid_mask"][e_idx].bool()):
+        continue
+      index.append((s_idx, e_idx))
+    del payload
+  return index
+
+
+class _ShardIterableDataset(torch.utils.data.IterableDataset):
+  """Iterable dataset that streams shards across DataLoader workers.
+
+  Each worker is assigned a subset of shards. It loads one shard at a time,
+  extracts valid episodes, and yields individual (obs, action) episodes.
+  The DataLoader's batch_size + collate_fn assembles padded batches.
+  """
+
+  def __init__(
+    self,
+    shards: list[Path],
+    success_only: bool,
+    action_clip: float | None,
+    seed: int = 0,
+    transition_prefix_prob: float = 0.0,
+    transition_prefix_min_steps: int = 10,
+    transition_prefix_max_steps: int = 75,
+  ):
+    self.shards = shards
+    self.success_only = success_only
+    self.action_clip = action_clip
+    self.seed = seed
+    self.transition_prefix_prob = max(0.0, min(1.0, float(transition_prefix_prob)))
+    self.transition_prefix_min_steps = max(1, int(transition_prefix_min_steps))
+    self.transition_prefix_max_steps = max(self.transition_prefix_min_steps, int(transition_prefix_max_steps))
+
+  def __iter__(self):
+    import random
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+      shard_ids = list(range(len(self.shards)))
+      wid = 0
+    else:
+      w = worker_info.num_workers
+      wid = worker_info.id
+      shard_ids = list(range(wid, len(self.shards), w))
+    rng = random.Random(self.seed + wid)
+    rng.shuffle(shard_ids)
+    for sid in shard_ids:
+      payload = torch.load(self.shards[sid], map_location="cpu", weights_only=False)
+      N = int(payload["student_obs"].shape[0])
+      ep_ids = list(range(N))
+      rng.shuffle(ep_ids)
+      for eid in ep_ids:
+        if self.success_only and not bool(payload["metadata"]["success"][eid].item()):
+          continue
+        mask = payload["valid_mask"][eid].bool()
+        if not torch.any(mask):
+          continue
+        obs = payload["student_obs"][eid, mask, :].float()
+        act = payload["teacher_action"][eid, mask, :].float()
+        if self.action_clip is not None:
+          act = torch.clamp(act, -self.action_clip, self.action_clip)
+        finite = torch.isfinite(obs).all(dim=-1) & torch.isfinite(act).all(dim=-1)
+        if torch.any(finite):
+          obs = obs[finite]
+          act = act[finite]
+          prefix = self._sample_prepare_prefix(payload, rng, exclude=eid)
+          if prefix is not None:
+            prefix_obs, prefix_act = prefix
+            yield obs, act, prefix_obs, prefix_act
+          else:
+            yield obs, act
+      del payload
+
+  def _sample_prepare_prefix(self, payload: dict, rng, *, exclude: int):
+    if self.transition_prefix_prob <= 0.0 or rng.random() >= self.transition_prefix_prob:
+      return None
+    N = int(payload["student_obs"].shape[0])
+    candidates = list(range(N))
+    rng.shuffle(candidates)
+    for prefix_eid in candidates:
+      if prefix_eid == exclude and N > 1:
+        continue
+      mask = payload["valid_mask"][prefix_eid].bool()
+      if not torch.any(mask):
+        continue
+      obs = payload["student_obs"][prefix_eid, mask, :].float()
+      act = payload["teacher_action"][prefix_eid, mask, :].float()
+      idle = _idle_mask_from_student_obs(obs)
+      idle_idx = torch.nonzero(idle, as_tuple=False).flatten()
+      if idle_idx.numel() < self.transition_prefix_min_steps:
+        continue
+      max_len = min(int(idle_idx.numel()), self.transition_prefix_max_steps)
+      length = rng.randint(self.transition_prefix_min_steps, max_len)
+      selected = idle_idx[:length]
+      prefix_obs = obs[selected]
+      prefix_act = act[selected]
+      if self.action_clip is not None:
+        prefix_act = torch.clamp(prefix_act, -self.action_clip, self.action_clip)
+      finite = torch.isfinite(prefix_obs).all(dim=-1) & torch.isfinite(prefix_act).all(dim=-1)
+      if torch.any(finite):
+        return prefix_obs[finite], prefix_act[finite]
+    return None
+
+
+def _select_epoch_shards(
+  shards: list[Path],
+  count: int | None,
+  seed: int,
+  *,
+  epoch: int,
+  shuffle: bool,
+) -> list[Path]:
+  """Pick a deterministic per-epoch shard subset without replacement."""
+  if not shards:
+    return []
+  if count is None or count <= 0 or count >= len(shards):
+    selected = list(shards)
+  else:
+    generator = torch.Generator().manual_seed(seed + epoch * 1009)
+    order = torch.randperm(len(shards), generator=generator).tolist()
+    selected = [shards[idx] for idx in order[:count]]
+  if shuffle and len(selected) > 1 and (count is None or count <= 0 or count >= len(shards)):
+    generator = torch.Generator().manual_seed(seed + epoch * 1009)
+    order = torch.randperm(len(selected), generator=generator).tolist()
+    selected = [selected[idx] for idx in order]
+  return selected
+
+
+def _should_run_validation(epoch: int, cfg: BcConfig) -> bool:
+  interval = int(cfg.val_interval)
+  if interval <= 0:
+    return epoch == cfg.epochs
+  return epoch % interval == 0 or epoch == cfg.epochs
+
+
+def _collate_padded(batch: list[tuple[torch.Tensor, ...]]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Pad variable-length episodes into (T_max, B, dim) with masks."""
+  normalized_batch = []
+  for item in batch:
+    if len(item) == 2:
+      obs, act = item
+    elif len(item) == 4:
+      obs, act, prefix_obs, prefix_act = item
+      obs = torch.cat([prefix_obs, obs], dim=0)
+      act = torch.cat([prefix_act, act], dim=0)
+    else:
+      raise ValueError(f"Unsupported BC batch item with {len(item)} tensors")
+    normalized_batch.append((_upgrade_goalkeeper_student_obs(obs), act))
+  max_t = max(obs.shape[0] for obs, _ in normalized_batch)
+  dim_obs = GOALKEEPER_STUDENT_OBS_DIM
+  dim_act = normalized_batch[0][1].shape[1]
+  obs_padded = torch.zeros(max_t, len(normalized_batch), dim_obs)
+  act_padded = torch.zeros(max_t, len(normalized_batch), dim_act)
+  masks = torch.zeros(max_t, len(normalized_batch), dtype=torch.bool)
+  for j, (obs, act) in enumerate(normalized_batch):
+    t = obs.shape[0]
+    obs_padded[:t, j] = obs
+    act_padded[:t, j] = act
+    masks[:t, j] = True
+  return obs_padded, act_padded, masks
+
+
+def _make_dataloader(
   shards: list[Path],
   cfg: BcConfig,
-  device: str,
-  generator: torch.Generator,
   shuffle: bool,
-):
-  """Stream goalkeeper RNN BC batches without loading every shard at once."""
-  shard_order = torch.randperm(len(shards), generator=generator).tolist() if shuffle else list(range(len(shards)))
-  pending: list[tuple[torch.Tensor, torch.Tensor]] = []
-  yielded = 0
-
-  for shard_idx in shard_order:
-    shard = shards[shard_idx]
-    episodes = _shooter_bc._load_episode_sequences(shard, cfg.success_only, cfg.action_clip)
-    if not episodes:
-      continue
-    if shuffle:
-      order = torch.randperm(len(episodes), generator=generator).tolist()
-      episodes = [episodes[idx] for idx in order]
-    pending.extend(episodes)
-
-    while len(pending) >= cfg.batch_size:
-      batch_eps = pending[:cfg.batch_size]
-      pending = pending[cfg.batch_size:]
-      yield _shooter_bc._build_padded_batch(batch_eps, device)
-      yielded += 1
-      if cfg.max_train_batches_per_epoch is not None and shuffle and yielded >= cfg.max_train_batches_per_epoch:
-        return
-      if cfg.max_val_batches is not None and not shuffle and yielded >= cfg.max_val_batches:
-        return
-
-  if pending:
-    yield _shooter_bc._build_padded_batch(pending, device)
+  *,
+  seed: int | None = None,
+) -> torch.utils.data.DataLoader:
+  dataset = _ShardIterableDataset(
+    shards,
+    cfg.success_only,
+    cfg.action_clip,
+    seed=cfg.seed if seed is None else seed,
+    transition_prefix_prob=cfg.transition_prefix_prob,
+    transition_prefix_min_steps=cfg.transition_prefix_min_steps,
+    transition_prefix_max_steps=cfg.transition_prefix_max_steps,
+  )
+  return torch.utils.data.DataLoader(
+    dataset,
+    batch_size=cfg.batch_size,
+    collate_fn=_collate_padded,
+    num_workers=cfg.dataloader_num_workers,
+    pin_memory=True,
+    persistent_workers=cfg.dataloader_num_workers > 0,
+  )
 
 
 def _update_goalkeeper_obs_normalizer(actor, shards: list[Path], cfg: BcConfig, device: str) -> int:
@@ -145,6 +335,7 @@ def _update_goalkeeper_obs_normalizer(actor, shards: list[Path], cfg: BcConfig, 
       obs, _ = _shooter_bc._load_flat_samples(shard, cfg.success_only, cfg.action_clip)
       if obs.numel() == 0:
         continue
+      obs = _upgrade_goalkeeper_student_obs(obs)
       total += int(obs.shape[0])
       for start in range(0, obs.shape[0], cfg.batch_size):
         batch = obs[start:start + cfg.batch_size].to(device)
@@ -224,10 +415,69 @@ def _goalkeeper_route_targets_from_obs(
     route = route + (cy < 0.0).long()
 
   speed = torch.linalg.vector_norm(vel, dim=-1)
-  condition_idle = student_obs[..., -1] > 0.5
+  condition_idle = _idle_mask_from_student_obs(student_obs)
   kinematic_idle = (speed < idle_speed_threshold) | (vx >= idle_incoming_vx_threshold)
   idle = condition_idle | kinematic_idle
   return torch.where(idle, torch.full_like(route, 6), route)
+
+
+def _bc_action_loss_per_element(pred: torch.Tensor, actions: torch.Tensor, cfg: BcConfig) -> torch.Tensor:
+  if cfg.loss == "smooth_l1":
+    return F.smooth_l1_loss(pred, actions, beta=cfg.smooth_l1_beta, reduction="none")
+  if cfg.loss == "mse":
+    return F.mse_loss(pred, actions, reduction="none")
+  raise ValueError(f"Unsupported BC loss: {cfg.loss!r}. Use 'smooth_l1' or 'mse'.")
+
+
+def _active_mask_from_student_obs(obs_flat: torch.Tensor) -> torch.Tensor:
+  return ~_idle_mask_from_student_obs(obs_flat)
+
+
+def _idle_mask_from_student_obs(obs_flat: torch.Tensor) -> torch.Tensor:
+  if obs_flat.shape[-1] >= GOALKEEPER_STUDENT_OBS_DIM:
+    return obs_flat[..., GOALKEEPER_PHASE_IDLE_INDEX] > 0.5
+  return obs_flat[..., -1] > 0.5
+
+
+def _upgrade_goalkeeper_student_obs(obs: torch.Tensor) -> torch.Tensor:
+  if obs.shape[-1] == GOALKEEPER_STUDENT_OBS_DIM:
+    return obs
+  if obs.shape[-1] == GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 4:
+    return build_goalkeeper_student_obs(
+      obs[..., :GOALKEEPER_TEACHER_ACTOR_OBS_DIM],
+      obs[..., GOALKEEPER_TEACHER_ACTOR_OBS_DIM:],
+    )
+  return obs
+
+
+def _weighted_goalkeeper_action_loss(
+  pred: torch.Tensor,
+  target: torch.Tensor,
+  obs_flat: torch.Tensor,
+  cfg: BcConfig,
+) -> tuple[torch.Tensor, dict[str, float]]:
+  per_element = _bc_action_loss_per_element(pred, target, cfg)
+  active = _active_mask_from_student_obs(obs_flat)
+  weights = torch.ones_like(per_element)
+  if cfg.active_action_loss_weight != 1.0:
+    weights = torch.where(active.unsqueeze(-1), weights * cfg.active_action_loss_weight, weights)
+  loss = (per_element * weights).sum() / weights.sum().clamp_min(1.0)
+
+  with torch.no_grad():
+    idle = ~active
+    active_values = int(active.sum().item()) * int(target.shape[-1])
+    idle_values = int(idle.sum().item()) * int(target.shape[-1])
+    active_loss_sum = float(per_element[active].sum().item()) if torch.any(active) else 0.0
+    idle_loss_sum = float(per_element[idle].sum().item()) if torch.any(idle) else 0.0
+  stats = {
+    "unweighted_loss_sum": float(per_element.sum().item()),
+    "action_values": float(per_element.numel()),
+    "active_action_loss_sum": active_loss_sum,
+    "active_action_values": float(active_values),
+    "idle_action_loss_sum": idle_loss_sum,
+    "idle_action_values": float(idle_values),
+  }
+  return loss, stats
 
 
 def _goalkeeper_region_aux_loss(
@@ -258,17 +508,31 @@ def _goalkeeper_region_aux_loss(
 
 def _evaluate_goalkeeper_bc(actor, shards: list[Path], cfg: BcConfig, device: str, route_gate) -> dict[str, float]:
   if not shards:
-    return {"loss": float("nan"), "action_loss": float("nan"), "region_aux_loss": float("nan"), "samples": 0.0}
+    return {
+      "loss": float("nan"),
+      "action_loss": float("nan"),
+      "active_action_loss": float("nan"),
+      "idle_action_loss": float("nan"),
+      "region_aux_loss": float("nan"),
+      "samples": 0.0,
+    }
 
   actor.eval()
-  generator = torch.Generator().manual_seed(cfg.seed + 17)
-  total_loss = 0.0
+  loader = _make_dataloader(shards, cfg, shuffle=False, seed=cfg.seed + 17)
   total_action_loss = 0.0
   total_action_values = 0
+  total_active_action_loss = 0.0
+  total_active_action_values = 0
+  total_idle_action_loss = 0.0
+  total_idle_action_values = 0
   total_region_loss = 0.0
   total_region_samples = 0
+  batches = 0
   with torch.no_grad():
-    for obs_padded, act_padded, masks in _iter_streaming_rnn_minibatches(shards, cfg, device, generator, shuffle=False):
+    for obs_padded, act_padded, masks in loader:
+      obs_padded = obs_padded.to(device, non_blocking=True)
+      act_padded = act_padded.to(device, non_blocking=True)
+      masks = masks.to(device, non_blocking=True)
       T_max = obs_padded.shape[0]
       hidden_state = None
       for start in range(0, T_max, cfg.bptt_length):
@@ -280,33 +544,53 @@ def _evaluate_goalkeeper_bc(actor, shards: list[Path], cfg: BcConfig, device: st
           continue
         pred, hidden_state = _shooter_bc._forward_rnn_chunk(actor, obs_chunk, mask_chunk, hidden_state)
         target = act_chunk[mask_chunk]
-        action_loss = _shooter_bc._bc_loss(pred, target, cfg, reduction="sum")
+        obs_flat = obs_chunk[mask_chunk]
+        action_loss = _bc_action_loss_per_element(pred, target, cfg).sum()
+        active = _active_mask_from_student_obs(obs_flat)
+        idle = ~active
         region_loss, region_samples = _goalkeeper_region_aux_loss(
-          actor,
-          obs_chunk,
-          mask_chunk,
-          cfg,
-          route_gate,
-          reduction="sum",
+          actor, obs_chunk, mask_chunk, cfg, route_gate, reduction="sum",
         )
         action_values = int(target.numel())
         total_action_loss += float(action_loss.item())
         total_action_values += action_values
+        if torch.any(active):
+          total_active_action_loss += float(_bc_action_loss_per_element(pred[active], target[active], cfg).sum().item())
+          total_active_action_values += int(active.sum().item()) * int(target.shape[-1])
+        if torch.any(idle):
+          total_idle_action_loss += float(_bc_action_loss_per_element(pred[idle], target[idle], cfg).sum().item())
+          total_idle_action_values += int(idle.sum().item()) * int(target.shape[-1])
         if region_samples > 0:
           total_region_loss += float(region_loss.item())
           total_region_samples += region_samples
-        total_loss += float(action_loss.item()) + cfg.region_aux_coef * float(region_loss.item())
+      batches += 1
+      if cfg.max_val_batches is not None and batches >= cfg.max_val_batches:
+        break
 
   if total_action_values == 0:
-    return {"loss": float("nan"), "action_loss": float("nan"), "region_aux_loss": float("nan"), "samples": 0.0}
+    return {
+      "loss": float("nan"),
+      "action_loss": float("nan"),
+      "active_action_loss": float("nan"),
+      "idle_action_loss": float("nan"),
+      "region_aux_loss": float("nan"),
+      "samples": 0.0,
+    }
   action_mean = total_action_loss / total_action_values
+  active_action_mean = total_active_action_loss / total_active_action_values if total_active_action_values > 0 else float("nan")
+  idle_action_mean = total_idle_action_loss / total_idle_action_values if total_idle_action_values > 0 else float("nan")
   region_mean = total_region_loss / total_region_samples if total_region_samples > 0 else 0.0
   return {
     "loss": action_mean + cfg.region_aux_coef * region_mean,
     "action_loss": action_mean,
+    "active_action_loss": active_action_mean,
+    "idle_action_loss": idle_action_mean,
     "region_aux_loss": region_mean,
     "samples": float(total_action_values),
+    "active_action_values": float(total_active_action_values),
+    "idle_action_values": float(total_idle_action_values),
     "region_samples": float(total_region_samples),
+    "batches": float(batches),
   }
 
 
@@ -324,7 +608,8 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
 
   shards = _shooter_bc._find_shards(cfg.dataset_dir)
   train_shards, val_shards = _shooter_bc._split_shards(shards, cfg)
-  obs_dim, action_dim = _shooter_bc._infer_dims(shards)
+  dataset_obs_dim, action_dim = _shooter_bc._infer_dims(shards)
+  obs_dim = GOALKEEPER_STUDENT_OBS_DIM
   run_tag = cfg.run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   out_dir = Path(cfg.output_dir).expanduser().resolve() / run_tag
   if out_dir.exists() and any(out_dir.iterdir()) and not cfg.overwrite:
@@ -335,7 +620,6 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
   normalizer_samples = _update_goalkeeper_obs_normalizer(actor, train_shards, cfg, device)
   route_gate = _load_goalkeeper_route_gate(cfg.teacher, device)
   optimizer = torch.optim.AdamW(actor.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-  generator = torch.Generator().manual_seed(cfg.seed)
 
   metadata = {
     "dataset_dir": str(Path(cfg.dataset_dir).expanduser().resolve()),
@@ -343,6 +627,7 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
     "train_shards": len(train_shards),
     "val_shards": len(val_shards),
     "obs_dim": obs_dim,
+    "dataset_obs_dim": dataset_obs_dim,
     "action_dim": action_dim,
     "model": cfg.model,
     "normalizer_samples": normalizer_samples,
@@ -357,8 +642,26 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
   print(f"[INFO] Route labels: {'teacher gate' if route_gate is not None else 'heuristic'}")
   if cfg.obs_normalization:
     print(f"[INFO] Updated obs normalizer with {normalizer_samples} samples.")
+  print(f"[INFO] DataLoader workers: {cfg.dataloader_num_workers}")
+  print(
+    f"[INFO] Train shard subset per epoch: "
+    f"{cfg.train_shards_per_epoch if cfg.train_shards_per_epoch and cfg.train_shards_per_epoch > 0 else 'all'}"
+  )
+  print(f"[INFO] Validation interval: {cfg.val_interval} epochs, max_val_batches={cfg.max_val_batches}")
 
   best_metric = float("inf")
+  last_val = {
+    "loss": float("nan"),
+    "action_loss": float("nan"),
+    "active_action_loss": float("nan"),
+    "idle_action_loss": float("nan"),
+    "region_aux_loss": float("nan"),
+    "samples": 0.0,
+    "active_action_values": 0.0,
+    "idle_action_values": 0.0,
+    "region_samples": 0.0,
+    "batches": 0.0,
+  }
   history: list[dict] = []
   for epoch in range(1, cfg.epochs + 1):
     actor.train()
@@ -367,16 +670,21 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
     total_region_loss = 0.0
     total_region_samples = 0
     batches = 0
+    epoch_train_shards = _select_epoch_shards(
+      train_shards,
+      cfg.train_shards_per_epoch,
+      cfg.seed,
+      epoch=epoch,
+      shuffle=True,
+    )
+    train_loader = _make_dataloader(epoch_train_shards, cfg, shuffle=True, seed=cfg.seed + epoch * 1009)
 
-    for obs_padded, act_padded, masks in _iter_streaming_rnn_minibatches(
-      train_shards, cfg, device, generator, shuffle=True
-    ):
+    for obs_padded, act_padded, masks in train_loader:
+      obs_padded = obs_padded.to(device, non_blocking=True)
+      act_padded = act_padded.to(device, non_blocking=True)
+      masks = masks.to(device, non_blocking=True)
       T_max = obs_padded.shape[0]
       hidden_state = None
-      batch_loss = 0.0
-      batch_action_values = 0
-      batch_region_loss = 0.0
-      batch_region_samples = 0
 
       for start in range(0, T_max, cfg.bptt_length):
         end = min(start + cfg.bptt_length, T_max)
@@ -388,7 +696,8 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
 
         pred, hidden_state = _shooter_bc._forward_rnn_chunk(actor, obs_chunk, mask_chunk, hidden_state)
         target = act_chunk[mask_chunk]
-        action_loss = _shooter_bc._bc_loss(pred, target, cfg)
+        obs_flat = obs_chunk[mask_chunk]
+        action_loss, action_stats = _weighted_goalkeeper_action_loss(pred, target, obs_flat, cfg)
         region_loss, region_samples = _goalkeeper_region_aux_loss(actor, obs_chunk, mask_chunk, cfg, route_gate)
         loss = action_loss + cfg.region_aux_coef * region_loss
 
@@ -398,19 +707,16 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
           torch.nn.utils.clip_grad_norm_(actor.parameters(), cfg.grad_clip)
         optimizer.step()
 
-        action_values = int(target.numel())
-        total_action_loss += float(action_loss.item()) * action_values
+        action_values = int(action_stats["action_values"])
+        total_action_loss += float(action_stats["unweighted_loss_sum"])
         total_action_values += action_values
-        batch_loss += float(loss.item()) * action_values
-        batch_action_values += action_values
         if region_samples > 0:
           total_region_loss += float(region_loss.item()) * region_samples
           total_region_samples += region_samples
-          batch_region_loss += float(region_loss.item()) * region_samples
-          batch_region_samples += region_samples
 
-      if batch_action_values > 0:
-        batches += 1
+      batches += 1
+      if cfg.max_train_batches_per_epoch is not None and batches >= cfg.max_train_batches_per_epoch:
+        break
 
     if batches == 0 or total_action_values == 0:
       raise RuntimeError("No BC samples found. Check dataset or valid masks.")
@@ -418,8 +724,12 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
     train_action_loss = total_action_loss / total_action_values
     train_region_loss = total_region_loss / total_region_samples if total_region_samples > 0 else 0.0
     train_loss = train_action_loss + cfg.region_aux_coef * train_region_loss
-    val = _evaluate_goalkeeper_bc(actor, val_shards, cfg, device, route_gate)
-    metric = val["loss"] if torch.isfinite(torch.tensor(val["loss"])) else train_loss
+    ran_val = _should_run_validation(epoch, cfg)
+    if ran_val:
+      last_val = _evaluate_goalkeeper_bc(actor, val_shards, cfg, device, route_gate)
+    val = last_val
+    metric_value = val.get(cfg.best_metric, float("nan"))
+    metric = metric_value if ran_val and torch.isfinite(torch.tensor(metric_value)) else float("inf")
     row = {
       "epoch": epoch,
       "train_loss": train_loss,
@@ -427,12 +737,21 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
       "train_region_aux_loss": train_region_loss,
       "val_loss": val["loss"],
       "val_action_loss": val["action_loss"],
+      "val_active_action_loss": val["active_action_loss"],
+      "val_idle_action_loss": val["idle_action_loss"],
       "val_region_aux_loss": val["region_aux_loss"],
       "train_action_values": total_action_values,
       "train_region_samples": total_region_samples,
       "val_action_values": int(val["samples"]),
+      "val_active_action_values": int(val.get("active_action_values", 0.0)),
+      "val_idle_action_values": int(val.get("idle_action_values", 0.0)),
       "val_region_samples": int(val.get("region_samples", 0.0)),
+      "val_batches": int(val.get("batches", 0.0)),
       "batches": batches,
+      "train_shards": len(epoch_train_shards),
+      "validated": ran_val,
+      "best_metric": cfg.best_metric,
+      "metric": metric,
     }
     history.append(row)
 
@@ -440,18 +759,20 @@ def train_goalkeeper_student_bc_impl(cfg: BcConfig) -> None:
       f"[INFO] epoch={epoch:04d} train_loss={train_loss:.6f} "
       f"action={train_action_loss:.6f} region={train_region_loss:.6f} "
       f"val_loss={val['loss']:.6f} val_action={val['action_loss']:.6f} "
-      f"val_region={val['region_aux_loss']:.6f} batches={batches}"
+      f"val_active={val['active_action_loss']:.6f} val_idle={val['idle_action_loss']:.6f} "
+      f"val_region={val['region_aux_loss']:.6f} batches={batches} "
+      f"train_shards={len(epoch_train_shards)} val={'yes' if ran_val else 'no'}"
     )
 
-    if metric < best_metric:
+    if ran_val and metric < best_metric:
       best_metric = metric
       _shooter_bc._save_checkpoint(out_dir / "model_best.pt", actor, epoch, cfg, row)
     if cfg.save_interval > 0 and epoch % cfg.save_interval == 0:
       _shooter_bc._save_checkpoint(out_dir / f"model_{epoch}.pt", actor, epoch, cfg, row)
 
   _shooter_bc._save_checkpoint(out_dir / "model_last.pt", actor, cfg.epochs, cfg, history[-1])
-  _shooter_bc._save_json(out_dir / "history.json", {"history": history, "best_loss": best_metric})
-  print(f"[INFO] Done. best_loss={best_metric:.6f}")
+  _shooter_bc._save_json(out_dir / "history.json", {"history": history, "best_metric": cfg.best_metric, "best_loss": best_metric})
+  print(f"[INFO] Done. best_{cfg.best_metric}={best_metric:.6f}")
 
 
 def train_goalkeeper_student_bc(cfg: BcConfig) -> None:

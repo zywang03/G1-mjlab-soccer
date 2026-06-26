@@ -1,38 +1,39 @@
 """Render N random goalkeeper episodes, one mp4 each, into an output dir."""
 from __future__ import annotations
-from dataclasses import asdict
 from pathlib import Path
 import imageio, torch, tyro
 from mjlab.envs import ManagerBasedRlEnv
-from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
+from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
-from src.tasks.soccer.config.g1.gk_train_cfg import goalkeeper_train_runner_cfg
+from eval_naive_goalkeeper import _apply_delayed_launch_sampling, _load_policy, _reset_policy
 
 
 def main(ckpt: str = "logs/rsl_rl/g1_goalkeeper/distilled/model_distilled_v3.pt",
          out_dir: str = "/mnt/c/QBS/Courses/embodied_ai/proj/viz",
-         device: str = "cuda:0", n: int = 20, seed: int = 100):
+         device: str = "cuda:0", n: int = 20, seed: int = 100, steps: int = 150,
+         delayed_launch: bool = False, launch_delay_s: float = 1.5):
   configure_torch_backends()
   Path(out_dir).mkdir(parents=True, exist_ok=True)
   cfg = load_env_cfg("Eval-Goalkeeper", play=False)
   cfg.scene.num_envs = 1
   cfg.seed = seed
+  if delayed_launch:
+    _apply_delayed_launch_sampling(cfg, wait_s=launch_delay_s)
   if "fell_over" in cfg.terminations: cfg.terminations["fell_over"] = None
   cfg.viewer.width = 640; cfg.viewer.height = 480
   env = ManagerBasedRlEnv(cfg=cfg, device=device, render_mode="rgb_array")
   wrapped = RslRlVecEnvWrapper(env, clip_actions=100.0)
-  runner = MjlabOnPolicyRunner(wrapped, asdict(goalkeeper_train_runner_cfg()), device=device)
-  runner.load(ckpt, load_cfg={"actor": True})
-  policy = runner.get_inference_policy(device=device)
+  policy = _load_policy(ckpt, wrapped, device)
   ball = env.scene["ball"]; org = env.scene.env_origins[0]
 
   n_save = 0
   for ep in range(n):
     obs = wrapped.reset()
     if isinstance(obs, tuple): obs = obs[0]
+    _reset_policy(policy)
     frames = []; entered = False
-    for _ in range(150):
+    for _ in range(steps):
       with torch.inference_mode():
         a = policy(obs)
       res = wrapped.step(a); obs = res[0]

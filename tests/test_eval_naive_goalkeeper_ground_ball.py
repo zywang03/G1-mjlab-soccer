@@ -263,6 +263,105 @@ class EvalNaiveGoalkeeperGroundBallTest(unittest.TestCase):
     self.assertIs(policy.loaded_bundle, bundle)
     self.assertEqual(policy.device, "cpu")
 
+  def test_moe6_residual_checkpoint_is_adapted_to_moe_bundle(self):
+    script = _load_eval_script()
+    base_sr = [
+      {
+        "actor_state_dict": {
+          "expert_id": torch.tensor([float(i)]),
+          "_ballistic_marker": torch.ones(1),
+          "distribution.std_param": torch.full((1,), float(i)),
+          "residual.0.weight": torch.full((1,), float(i)),
+        },
+        "ballistic_residual": {"base_hidden": (1024, 512, 256), "residual_scale": 0.3},
+      }
+      for i in range(6)
+    ]
+    residual_state = {
+      "_marker": torch.full((1,), 9.0),
+      "_residual_regions": torch.tensor([1, 2, 3, 5]),
+      "residual.0.weight": torch.full((1,), 7.0),
+    }
+    ckpt = {
+      "moe6_residual": True,
+      "base_moe6": {
+        "moe6": True,
+        "sr": base_sr,
+        "z_low": 0.85,
+        "z_up": 1.35,
+      },
+      "policy_state_dict": residual_state,
+      "hidden_dims": (512, 256, 128),
+      "activation": "elu",
+      "residual_scale": 0.01,
+      "residual_regions": (1, 2, 3, 5),
+    }
+
+    class FakeMoE6Policy:
+      def __init__(self, loaded_bundle, env, device):
+        self.loaded_bundle = loaded_bundle
+        self.env = env
+        self.device = device
+
+      def __call__(self, obs):
+        return torch.zeros(obs["actor"].shape[0], 29)
+
+    with patch.object(script.torch, "load", return_value=ckpt), \
+        patch("src.tasks.soccer.modules.moe6_goalkeeper_policy.MoE6GoalkeeperPolicy", FakeMoE6Policy):
+      policy = script._load_policy("targeted_residual.pt", env=_FakeWrappedEnv(), device="cpu")
+
+    self.assertIsInstance(policy, FakeMoE6Policy)
+    loaded_bundle = policy.loaded_bundle
+    self.assertEqual(loaded_bundle["z_low"], 0.85)
+    self.assertEqual(loaded_bundle["z_up"], 1.35)
+    self.assertEqual(len(loaded_bundle["sr"]), 6)
+    self.assertIs(loaded_bundle["sr"][0], base_sr[0])
+    self.assertIs(loaded_bundle["sr"][4], base_sr[4])
+    for idx in (1, 2, 3, 5):
+      self.assertIn("actor_state_dict", loaded_bundle["sr"][idx])
+      self.assertEqual(
+        loaded_bundle["sr"][idx]["actor_state_dict"]["residual.0.weight"].item(),
+        7.0,
+      )
+      self.assertEqual(
+        loaded_bundle["sr"][idx]["actor_state_dict"]["_ballistic_marker"].item(),
+        9.0,
+      )
+      self.assertEqual(
+        loaded_bundle["sr"][idx]["actor_state_dict"]["distribution.std_param"].item(),
+        float(idx),
+      )
+      self.assertEqual(
+        loaded_bundle["sr"][idx]["ballistic_residual"]["residual_scale"],
+        0.01,
+      )
+      self.assertEqual(
+        tuple(loaded_bundle["sr"][idx]["ballistic_residual"]["base_hidden"]),
+        (1024, 512, 256),
+      )
+
+  def test_moe6_residual_checkpoint_preserves_idle_and_gate_metadata(self):
+    script = _load_eval_script()
+    idle = {"actor_state_dict": {"history_encoder.0.weight": torch.zeros(1)}}
+    gate = {"state": {"0.weight": torch.zeros(1)}, "mean": torch.zeros(6), "std": torch.ones(6), "num_classes": 7}
+    ckpt = {
+      "moe6_residual": True,
+      "base_moe6": {"moe6": True, "sr": [{"actor_state_dict": {}} for _ in range(6)]},
+      "policy_state_dict": {"_residual_regions": torch.tensor([1]), "residual.0.weight": torch.zeros(1)},
+      "idle": idle,
+      "gate": gate,
+      "idle_speed_threshold": 0.5,
+      "idle_incoming_vx_threshold": -0.5,
+    }
+
+    adapted = script._moe_bundle_from_checkpoint(ckpt)
+
+    self.assertIsNotNone(adapted)
+    self.assertIs(adapted["idle"], idle)
+    self.assertIs(adapted["gate"], gate)
+    self.assertEqual(adapted["idle_speed_threshold"], 0.5)
+    self.assertEqual(adapted["idle_incoming_vx_threshold"], -0.5)
+
   def test_training_checkpoint_with_moe_actor_state_loads_as_moe_bundle(self):
     script = _load_eval_script()
     calls = []
@@ -427,6 +526,52 @@ class EvalNaiveGoalkeeperGroundBallTest(unittest.TestCase):
     self.assertEqual(kwargs["condition_hidden_dim"], 128)
     self.assertEqual(kwargs["hidden_dims"], (512, 256, 128))
 
+  def test_goalkeeper_student_checkpoint_infers_dual_head_architecture_without_config(self):
+    script = _load_eval_script()
+    calls = []
+
+    class FakeActor:
+      def __init__(self, *args, **kwargs):
+        calls.append(("actor_init", kwargs))
+
+      def load_state_dict(self, state_dict, strict=True):
+        calls.append(("load_state_dict", strict, sorted(state_dict.keys())))
+
+      def eval(self):
+        return self
+
+      def to(self, device):
+        return self
+
+    actor_state = {
+      "rnn.rnn.weight_ih_l0": torch.zeros(4 * 160, 960),
+      "rnn.rnn.weight_hh_l0": torch.zeros(4 * 160, 160),
+      "rnn.rnn.weight_ih_l1": torch.zeros(4 * 160, 160),
+      "phase_encoder.0.weight": torch.zeros(64, 4),
+      "ball_encoder.0.weight": torch.zeros(64, 6),
+      "target_encoder.0.weight": torch.zeros(64, 9),
+      "context_fusion.0.weight": torch.zeros(160, 352),
+      "prepare_head.0.weight": torch.zeros(256, 160),
+      "prepare_head.2.weight": torch.zeros(128, 256),
+      "prepare_head.4.weight": torch.zeros(64, 128),
+      "prepare_head.6.weight": torch.zeros(29, 64),
+      "active_head.0.weight": torch.zeros(256, 160),
+      "active_head.2.weight": torch.zeros(128, 256),
+      "active_head.4.weight": torch.zeros(64, 128),
+      "active_head.6.weight": torch.zeros(29, 64),
+    }
+    ckpt = {"actor_state_dict": actor_state}
+
+    with patch.object(script, "GoalkeeperStudentFiLMActor", FakeActor), \
+        patch.object(script.torch, "load", return_value=ckpt):
+      script._load_policy("student_dual_head.pt", env=_FakeWrappedEnv(), device="cpu")
+
+    kwargs = calls[0][1]
+    self.assertEqual(kwargs["rnn_hidden_dim"], 160)
+    self.assertEqual(kwargs["rnn_num_layers"], 2)
+    self.assertEqual(kwargs["condition_hidden_dim"], 64)
+    self.assertEqual(kwargs["hidden_dims"], (256, 128, 64))
+
   def test_policy_reset_hook_resets_policy_on_env_reset_and_done_step(self):
     script = _load_eval_script()
 
@@ -463,6 +608,48 @@ class EvalNaiveGoalkeeperGroundBallTest(unittest.TestCase):
     self.assertEqual(policy.reset_calls, 1)
     env.step(torch.zeros(1))
     self.assertEqual(policy.reset_calls, 2)
+
+  def test_headless_eval_resets_recurrent_policy_each_trial(self):
+    script = _load_eval_script()
+
+    class FakeEnv:
+      def __init__(self):
+        self.reset_calls = 0
+        self.step_calls = 0
+        self._policy_reset_hooked = False
+
+      def reset(self):
+        self.reset_calls += 1
+        return {"actor": torch.zeros(1, 960)}
+
+      def step(self, action):
+        del action
+        self.step_calls += 1
+        return {"actor": torch.zeros(1, 960)}, torch.zeros(1), torch.tensor([True]), {}
+
+      @property
+      def unwrapped(self):
+        return self
+
+    class FakePolicy:
+      def __init__(self):
+        self.reset_calls = 0
+
+      def __call__(self, obs):
+        del obs
+        return torch.zeros(1, 29)
+
+      def reset(self):
+        self.reset_calls += 1
+
+    cfg = type("Cfg", (), {"num_trials": 3})()
+    env = FakeEnv()
+    policy = FakePolicy()
+
+    with patch.object(script, "run_trial", side_effect=lambda e, p: {"ball_entered_goal": False, "steps": 1}):
+      script.run_headless_eval(cfg, env, policy)
+
+    self.assertEqual(policy.reset_calls, 3)
 
 
 if __name__ == "__main__":

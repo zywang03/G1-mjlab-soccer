@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -16,6 +18,7 @@ import src.tasks  # noqa: F401
 class GoalkeeperStudentBcTest(unittest.TestCase):
   def test_student_obs_appends_normalized_prediction_condition_to_teacher_actor_obs(self):
     from src.tasks.soccer.mdp.goalkeeper_student_obs import (
+      GOALKEEPER_TASK_CONTEXT_DIM,
       GOALKEEPER_STUDENT_OBS_DIM,
       GOALKEEPER_TEACHER_ACTOR_OBS_DIM,
       build_goalkeeper_student_obs,
@@ -30,7 +33,12 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
 
     self.assertEqual(student_obs.shape, (2, GOALKEEPER_STUDENT_OBS_DIM))
     self.assertTrue(torch.equal(student_obs[:, :GOALKEEPER_TEACHER_ACTOR_OBS_DIM], teacher_obs))
-    self.assertTrue(torch.equal(student_obs[:, -4:], condition))
+    self.assertEqual(student_obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM:].shape[-1], GOALKEEPER_TASK_CONTEXT_DIM)
+    self.assertTrue(torch.equal(student_obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM], 1.0 - condition[:, 3]))
+    self.assertTrue(torch.equal(student_obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 1], condition[:, 3]))
+    self.assertTrue(torch.equal(student_obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 2], 1.0 - condition[:, 3]))
+    self.assertTrue(torch.equal(student_obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 10:GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 12], condition[:, :2]))
+    self.assertTrue(torch.equal(student_obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 3], condition[:, 2]))
 
   def test_prediction_condition_normalizes_units_before_condition_encoder(self):
     from src.tasks.soccer.mdp.goalkeeper_student_obs import normalize_goalkeeper_prediction
@@ -174,7 +182,7 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     self.assertTrue(torch.equal(env._gk_student_actor_history, expected_history))
     self.assertTrue(torch.equal(obs, _flatten_goalkeeper_actor_history(expected_history)))
 
-  def test_lstm_student_actor_uses_film_conditioning_after_960d_lstm(self):
+  def test_lstm_student_actor_uses_shared_recurrent_trunk_with_phase_heads(self):
     from scripts.train_goalkeeper_student_bc import BcConfig, make_goalkeeper_student_actor
     from src.tasks.soccer.mdp.goalkeeper_student_obs import (
       GOALKEEPER_STUDENT_OBS_DIM,
@@ -191,12 +199,16 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
 
     self.assertTrue(actor.is_recurrent)
     self.assertEqual(actor.rnn.rnn.input_size, GOALKEEPER_TEACHER_ACTOR_OBS_DIM)
-    self.assertTrue(hasattr(actor, "condition_encoder"))
-    self.assertTrue(hasattr(actor, "film"))
-    self.assertTrue(hasattr(actor, "condition_aux_head"))
+    self.assertFalse(hasattr(actor, "prepare_rnn"))
+    self.assertFalse(hasattr(actor, "active_rnn"))
+    self.assertTrue(hasattr(actor, "phase_encoder"))
+    self.assertTrue(hasattr(actor, "ball_encoder"))
+    self.assertTrue(hasattr(actor, "target_encoder"))
+    self.assertTrue(hasattr(actor, "context_fusion"))
     self.assertTrue(hasattr(actor, "region_estimator"))
     self.assertTrue(hasattr(actor, "ball_estimator"))
-    self.assertTrue(hasattr(actor, "region_film"))
+    self.assertTrue(hasattr(actor, "prepare_head"))
+    self.assertTrue(hasattr(actor, "active_head"))
     obs = TensorDict(
       {"student": torch.zeros(2, GOALKEEPER_STUDENT_OBS_DIM)},
       batch_size=[2],
@@ -213,35 +225,115 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     self.assertEqual(region_aux["region_logits"].shape, (2, 7))
     self.assertEqual(region_aux["ball_latent"].shape, (2, actor.ball_latent_dim))
 
-  def test_goalkeeper_student_region_condition_changes_active_action_not_prepare_action(self):
+  def test_goalkeeper_bc_collate_can_prefix_active_episode_with_prepare_sequence(self):
+    from scripts.train_goalkeeper_student_bc import _collate_padded
+    from src.tasks.soccer.mdp.goalkeeper_student_obs import (
+      GOALKEEPER_PHASE_ACTIVE_INDEX,
+      GOALKEEPER_PHASE_IDLE_INDEX,
+      GOALKEEPER_STUDENT_OBS_DIM,
+      GOALKEEPER_TEACHER_ACTOR_OBS_DIM,
+    )
+
+    prefix_obs = torch.zeros(4, GOALKEEPER_STUDENT_OBS_DIM)
+    prefix_obs[:, :GOALKEEPER_TEACHER_ACTOR_OBS_DIM] = 3.0
+    prefix_obs[:, GOALKEEPER_PHASE_IDLE_INDEX] = 1.0
+    prefix_act = torch.full((4, 2), 0.25)
+
+    active_obs = torch.zeros(3, GOALKEEPER_STUDENT_OBS_DIM)
+    active_obs[:, :GOALKEEPER_TEACHER_ACTOR_OBS_DIM] = -1.0
+    active_obs[:, GOALKEEPER_PHASE_ACTIVE_INDEX] = 1.0
+    active_act = torch.full((3, 2), -0.5)
+
+    obs, actions, masks = _collate_padded(
+      [(active_obs, active_act, prefix_obs, prefix_act)]
+    )
+
+    self.assertEqual(obs.shape, (7, 1, GOALKEEPER_STUDENT_OBS_DIM))
+    self.assertTrue(torch.all(masks))
+    self.assertTrue(torch.all(obs[:4, 0, GOALKEEPER_PHASE_IDLE_INDEX] == 1.0))
+    self.assertTrue(torch.all(obs[4:, 0, GOALKEEPER_PHASE_ACTIVE_INDEX] == 1.0))
+    self.assertTrue(torch.all(actions[:4, 0] == 0.25))
+    self.assertTrue(torch.all(actions[4:, 0] == -0.5))
+
+  def test_goalkeeper_bc_dataset_samples_prepare_prefix_for_active_episode(self):
+    from scripts.train_goalkeeper_student_bc import _ShardIterableDataset
+    from src.tasks.soccer.mdp.goalkeeper_student_obs import (
+      GOALKEEPER_PHASE_ACTIVE_INDEX,
+      GOALKEEPER_PHASE_IDLE_INDEX,
+      GOALKEEPER_STUDENT_OBS_DIM,
+      GOALKEEPER_TEACHER_ACTOR_OBS_DIM,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+      shard = Path(tmp) / "shard_000000.pt"
+      obs = torch.zeros(2, 5, GOALKEEPER_STUDENT_OBS_DIM)
+      obs[0, :, :GOALKEEPER_TEACHER_ACTOR_OBS_DIM] = -1.0
+      obs[0, :, GOALKEEPER_PHASE_ACTIVE_INDEX] = 1.0
+      obs[1, :, :GOALKEEPER_TEACHER_ACTOR_OBS_DIM] = 3.0
+      obs[1, :, GOALKEEPER_PHASE_IDLE_INDEX] = 1.0
+      actions = torch.stack([
+        torch.full((5, 2), -0.5),
+        torch.full((5, 2), 0.25),
+      ])
+      torch.save(
+        {
+          "student_obs": obs,
+          "teacher_action": actions,
+          "valid_mask": torch.ones(2, 5, dtype=torch.bool),
+          "metadata": {"success": torch.ones(2, dtype=torch.bool)},
+        },
+        shard,
+      )
+
+      dataset = _ShardIterableDataset(
+        [shard],
+        success_only=False,
+        action_clip=None,
+        seed=1,
+        transition_prefix_prob=1.0,
+        transition_prefix_min_steps=3,
+        transition_prefix_max_steps=3,
+      )
+      samples = list(dataset)
+
+    prefixed = [sample for sample in samples if len(sample) == 4]
+    self.assertTrue(prefixed)
+    active_obs, active_act, prefix_obs, prefix_act = prefixed[0]
+    self.assertEqual(prefix_obs.shape[0], 3)
+    self.assertTrue(torch.all(prefix_obs[:, GOALKEEPER_PHASE_IDLE_INDEX] == 1.0))
+    self.assertTrue(torch.all(active_obs[:, GOALKEEPER_PHASE_ACTIVE_INDEX] == 1.0))
+    self.assertTrue(torch.all(prefix_act == 0.25))
+    self.assertTrue(torch.all(active_act == -0.5))
+
+  def test_goalkeeper_student_task_context_routes_active_and_prepare_heads(self):
     from scripts.train_goalkeeper_student_bc import BcConfig, make_goalkeeper_student_actor
-    from src.tasks.soccer.mdp.goalkeeper_student_obs import GOALKEEPER_STUDENT_OBS_DIM
+    from src.tasks.soccer.mdp.goalkeeper_student_obs import (
+      GOALKEEPER_STUDENT_OBS_DIM,
+      GOALKEEPER_TEACHER_ACTOR_OBS_DIM,
+    )
 
     cfg = BcConfig(dataset_dir="unused", obs_normalization=False, batch_size=2)
     actor = make_goalkeeper_student_actor(GOALKEEPER_STUDENT_OBS_DIM, 29, cfg, "cpu")
     actor.eval()
 
     obs = torch.zeros(2, GOALKEEPER_STUDENT_OBS_DIM)
-    obs[:, -1] = torch.tensor([0.0, 1.0])
+    obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM] = torch.tensor([0.0, 1.0])
+    obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 1] = torch.tensor([1.0, 0.0])
+    obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 2] = torch.tensor([0.0, 1.0])
+    obs[:, GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 3] = torch.tensor([0.0, 1.0])
     with torch.no_grad():
-      for param in actor.condition_encoder.parameters():
+      for param in actor.prepare_head.parameters():
         param.zero_()
-      actor.film.weight.zero_()
-      actor.film.bias.zero_()
-      actor.region_film.weight.zero_()
-      actor.region_film.bias.zero_()
-      actor.region_film.bias[: actor.rnn.rnn.hidden_size].fill_(0.25)
-      actor.prepare_region_film.weight.zero_()
-      actor.prepare_region_film.bias.zero_()
+      for param in actor.active_head.parameters():
+        param.zero_()
+      actor.prepare_head[-1].bias.fill_(1.5)
+      actor.active_head[-1].bias.fill_(-2.0)
 
     td = TensorDict({"student": obs}, batch_size=[2])
-    actor.reset()
-    active_latent = actor.rnn(obs[:, :960]).squeeze(0)[0]
-    actor.reset()
-    conditioned = actor.get_latent(td)
+    action = actor(td)
 
-    self.assertTrue(torch.allclose(conditioned[0], active_latent * 1.25, atol=1e-5))
-    self.assertFalse(torch.allclose(conditioned[1], active_latent * 1.25, atol=1e-5))
+    self.assertTrue(torch.allclose(action[0], torch.full_like(action[0], 1.5), atol=1e-5))
+    self.assertTrue(torch.allclose(action[1], torch.full_like(action[1], -2.0), atol=1e-5))
 
   def test_goalkeeper_student_actor_clamps_negative_std_before_sampling(self):
     from scripts.train_goalkeeper_student_bc import BcConfig, make_goalkeeper_student_actor
@@ -317,35 +409,6 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     self.assertTrue(loss.requires_grad)
     self.assertEqual(actor.region_condition_output["region_logits"].shape, (2, 7))
 
-  def test_rnn_bc_minibatches_stream_shards_before_first_yield(self):
-    from scripts.train_goalkeeper_student_bc import BcConfig, _iter_streaming_rnn_minibatches
-
-    shards = [Path(f"shard_{idx}.pt") for idx in range(4)]
-    loaded: list[str] = []
-
-    def _fake_load(path: Path, success_only: bool, action_clip: float | None):
-      loaded.append(path.name)
-      obs = torch.zeros(2, 3)
-      act = torch.zeros(2, 1)
-      return [(obs, act)]
-
-    cfg = BcConfig(
-      dataset_dir="unused",
-      batch_size=2,
-      success_only=False,
-      max_val_batches=None,
-    )
-    with patch("scripts.train_shooter_bc._load_episode_sequences", side_effect=_fake_load):
-      iterator = _iter_streaming_rnn_minibatches(
-        shards, cfg, "cpu", torch.Generator().manual_seed(0), shuffle=False
-      )
-      obs_padded, act_padded, masks = next(iterator)
-
-    self.assertEqual(loaded, ["shard_0.pt", "shard_1.pt"])
-    self.assertEqual(obs_padded.shape, (2, 2, 3))
-    self.assertEqual(act_padded.shape, (2, 2, 1))
-    self.assertTrue(torch.all(masks))
-
   def test_goalkeeper_bc_normalizer_warmup_samples_shards(self):
     from scripts.train_goalkeeper_student_bc import BcConfig, _update_goalkeeper_obs_normalizer
 
@@ -379,6 +442,109 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     self.assertEqual(len(loaded), 2)
     self.assertEqual(samples, 6)
     self.assertEqual(actor.updates, 4)
+
+  def test_goalkeeper_bc_validation_schedule_runs_interval_and_final_epoch(self):
+    from scripts.train_goalkeeper_student_bc import BcConfig, _should_run_validation
+
+    cfg = BcConfig(dataset_dir="unused", epochs=25, val_interval=10)
+
+    self.assertFalse(_should_run_validation(1, cfg))
+    self.assertTrue(_should_run_validation(10, cfg))
+    self.assertTrue(_should_run_validation(20, cfg))
+    self.assertTrue(_should_run_validation(25, cfg))
+
+  def test_goalkeeper_bc_epoch_shard_sampling_uses_small_epoch_subset(self):
+    from scripts.train_goalkeeper_student_bc import BcConfig, _select_epoch_shards
+
+    shards = [Path(f"shard_{idx}.pt") for idx in range(10)]
+    cfg = BcConfig(dataset_dir="unused", train_shards_per_epoch=3)
+
+    first = _select_epoch_shards(shards, cfg.train_shards_per_epoch, cfg.seed, epoch=1, shuffle=True)
+    second = _select_epoch_shards(shards, cfg.train_shards_per_epoch, cfg.seed, epoch=2, shuffle=True)
+
+    self.assertEqual(len(first), 3)
+    self.assertEqual(len(second), 3)
+    self.assertNotEqual(first, shards)
+    self.assertNotEqual(first, second)
+    self.assertTrue(set(first).issubset(set(shards)))
+
+  def test_goalkeeper_bc_validation_honors_max_val_batches(self):
+    from scripts.train_goalkeeper_student_bc import BcConfig, _evaluate_goalkeeper_bc
+
+    class _Actor:
+      region_condition_output = None
+
+      def eval(self):
+        pass
+
+    def _fake_forward(actor, obs_chunk, mask_chunk, hidden_state=None):
+      return torch.zeros(int(mask_chunk.sum().item()), 2), hidden_state
+
+    batches = [
+      (torch.zeros(1, 1, 964), torch.ones(1, 1, 2), torch.ones(1, 1, dtype=torch.bool))
+      for _ in range(3)
+    ]
+    cfg = BcConfig(dataset_dir="unused", max_val_batches=1, obs_normalization=False)
+    with (
+      patch("scripts.train_goalkeeper_student_bc._make_dataloader", return_value=batches),
+      patch("scripts.train_shooter_bc._forward_rnn_chunk", side_effect=_fake_forward),
+    ):
+      val = _evaluate_goalkeeper_bc(_Actor(), [Path("val.pt")], cfg, "cpu", route_gate=None)
+
+    self.assertEqual(val["batches"], 1)
+    self.assertEqual(val["samples"], 2.0)
+
+  def test_goalkeeper_bc_weighted_action_loss_prioritizes_active_frames(self):
+    from scripts.train_goalkeeper_student_bc import BcConfig, _weighted_goalkeeper_action_loss
+
+    pred = torch.zeros(2, 1)
+    target = torch.ones(2, 1)
+    obs = torch.zeros(2, 964)
+    obs[0, -1] = 1.0
+    obs[1, -1] = 0.0
+    cfg = BcConfig(
+      dataset_dir="unused",
+      loss="mse",
+      active_action_loss_weight=3.0,
+    )
+
+    loss, stats = _weighted_goalkeeper_action_loss(pred, target, obs, cfg)
+
+    self.assertAlmostEqual(float(loss.item()), 1.0)
+    self.assertEqual(stats["active_action_values"], 1.0)
+    self.assertEqual(stats["idle_action_values"], 1.0)
+    self.assertEqual(stats["active_action_loss_sum"], 1.0)
+    self.assertEqual(stats["idle_action_loss_sum"], 1.0)
+
+  def test_goalkeeper_bc_validation_reports_active_and_idle_losses(self):
+    from scripts.train_goalkeeper_student_bc import BcConfig, _evaluate_goalkeeper_bc
+
+    class _Actor:
+      region_condition_output = None
+
+      def eval(self):
+        pass
+
+    def _fake_forward(actor, obs_chunk, mask_chunk, hidden_state=None):
+      del actor, obs_chunk, hidden_state
+      return torch.zeros(int(mask_chunk.sum().item()), 1), None
+
+    obs = torch.zeros(2, 1, 964)
+    obs[0, 0, -1] = 1.0
+    obs[1, 0, -1] = 0.0
+    actions = torch.ones(2, 1, 1)
+    masks = torch.ones(2, 1, dtype=torch.bool)
+    cfg = BcConfig(dataset_dir="unused", loss="mse", max_val_batches=1, obs_normalization=False)
+    with (
+      patch("scripts.train_goalkeeper_student_bc._make_dataloader", return_value=[(obs, actions, masks)]),
+      patch("scripts.train_shooter_bc._forward_rnn_chunk", side_effect=_fake_forward),
+    ):
+      val = _evaluate_goalkeeper_bc(_Actor(), [Path("val.pt")], cfg, "cpu", route_gate=None)
+
+    self.assertEqual(val["active_action_values"], 1.0)
+    self.assertEqual(val["idle_action_values"], 1.0)
+    self.assertAlmostEqual(val["active_action_loss"], 1.0)
+    self.assertAlmostEqual(val["idle_action_loss"], 1.0)
 
   def test_teacher_loader_uses_moe_bundle_adapter_for_gate_plus_seven_experts(self):
     from scripts.collect_goalkeeper_teacher_dataset import _load_teacher_policy
@@ -469,7 +635,7 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     self.assertGreater(rl_cfg.algorithm.offline_bc_active_fraction, 0.0)
     self.assertEqual(load_runner_cls(task_id).__name__, "GoalkeeperStudentRunner")
 
-  def test_student_ppo_actor_is_about_one_million_parameters(self):
+  def test_student_ppo_actor_is_about_one_million_parameters_with_shared_rnn(self):
     from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
     from tensordict import TensorDict
     from src.tasks.soccer.config.g1.rl_cfg import GoalkeeperStudentRunner
@@ -513,116 +679,294 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     param_count = sum(param.numel() for param in actor.parameters())
 
     self.assertGreaterEqual(param_count, 900_000)
-    self.assertLessEqual(param_count, 1_200_000)
+    self.assertLessEqual(param_count, 1_300_000)
     self.assertEqual(actor.rnn.rnn.hidden_size, 160)
 
-  def test_student_ppo_script_defaults_to_scratch_hard3_teacher_task(self):
-    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+  def test_student_ppo_reference_kl_phase_weights_idle_and_active_separately(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
 
-    cfg = FineTuneConfig(num_envs=64, max_iterations=7)
-    train_cfg = build_train_config(cfg)
+    class _Actor:
+      def __init__(self, mean, std):
+        self.output_distribution_params = (torch.as_tensor(mean, dtype=torch.float32), torch.as_tensor(std, dtype=torch.float32))
 
-    self.assertEqual(cfg.task_id, "Unitree-G1-Goalkeeper-Student-PPO")
-    self.assertIsNone(train_cfg.load_checkpoint_path)
-    self.assertFalse(train_cfg.load_actor_only)
-    self.assertEqual(train_cfg.env.scene.num_envs, 64)
-    self.assertEqual(train_cfg.agent.max_iterations, 7)
-    self.assertEqual(train_cfg.agent.run_name, cfg.run_name)
-    self.assertEqual(
-      train_cfg.agent.algorithm.teacher_checkpoint_path,
-      "/data/Courses/[CS2810]EmbodiedAI/humanoid_soccer_proj/G1-mjlab-soccer/logs/repairs/goalkeeper_moe7_hard3_default_idle.pt",
-    )
-    self.assertGreater(train_cfg.agent.algorithm.distill_coef, 0.0)
-    self.assertNotIn("push_robot", train_cfg.env.events)
-    self.assertIn("idle_low_base_height", train_cfg.env.rewards)
-    self.assertIn("idle_base_height_band", train_cfg.env.rewards)
-    self.assertIn("idle_leg_ready_pose", train_cfg.env.rewards)
-    self.assertEqual(train_cfg.env.rewards["idle_low_base_height"].weight, -20.0)
-    self.assertEqual(train_cfg.env.rewards["idle_base_height_band"].weight, 5.0)
-    self.assertEqual(train_cfg.env.rewards["idle_leg_ready_pose"].weight, -5.0)
-    self.assertIn("condition_target_reach", train_cfg.env.rewards)
+      def get_kl_divergence(self, old_params, new_params):
+        old_mean, old_std = old_params
+        new_mean, new_std = new_params
+        old_dist = torch.distributions.Normal(old_mean, old_std)
+        new_dist = torch.distributions.Normal(new_mean, new_std)
+        return torch.distributions.kl_divergence(old_dist, new_dist).sum(dim=-1)
 
-  def test_student_ppo_bc_regularized_profile_simplifies_prepare_rewards(self):
+    class _ReferenceActor:
+      def __call__(self, obs, masks=None, hidden_state=None, stochastic_output=False):
+        del obs, masks, hidden_state, stochastic_output
+        self.output_distribution_params = (
+          torch.zeros(2, 2),
+          torch.ones(2, 2),
+        )
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.actor = _Actor([[1.0, 0.0], [1.0, 0.0]], [[1.0, 1.0], [1.0, 1.0]])
+    algo.reference_actor = _ReferenceActor()
+    algo.device = "cpu"
+    algo.reference_kl_coef = 0.1
+    algo.reference_kl_idle_coef = 0.1
+    algo.reference_kl_active_coef = 0.03
+    algo.reference_kl_std_floor = 0.1
+    batch = type(
+      "Batch",
+      (),
+      {
+        "observations": TensorDict({"student": torch.zeros(2, 4)}, batch_size=[2]),
+        "masks": None,
+        "hidden_states": (None, None),
+        "actor_loss_mask": torch.tensor([0.0, 1.0]),
+      },
+    )()
+
+    raw = algo._reference_kl_loss(batch)
+    weighted = algo._reference_kl_loss(batch, phase_weighted=True)
+
+    self.assertAlmostEqual(raw.item(), 0.5)
+    self.assertAlmostEqual(weighted.item(), 0.0325)
+
+  def test_goalkeeper_prior_dataset_uses_success_rollout_frames_without_idle_filter(self):
+    from src.tasks.soccer.modules.goalkeeper_prior_discriminator import GoalkeeperPriorDataset
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      shard_dir = root / "shards"
+      shard_dir.mkdir()
+      obs = torch.zeros(2, 3, 964)
+      obs[0, :, -1] = torch.tensor([1.0, 0.0, 1.0])
+      obs[1, :, -1] = torch.tensor([0.0, 0.0, 0.0])
+      actions = torch.arange(2 * 3 * 29, dtype=torch.float32).reshape(2, 3, 29)
+      torch.save(
+        {
+          "student_obs": obs,
+          "teacher_action": actions,
+          "valid_mask": torch.ones(2, 3, dtype=torch.bool),
+          "metadata": {"success": torch.tensor([True, False])},
+        },
+        shard_dir / "shard_000000.pt",
+      )
+
+      dataset = GoalkeeperPriorDataset(str(root), device="cpu", max_samples=8)
+      samples = dataset.sample(8)
+
+    self.assertEqual(dataset.num_samples, 3)
+    self.assertEqual(samples.shape[1], 964 + 29)
+    self.assertEqual(samples.shape[0], 8)
+    # The successful episode has two idle frames and one active frame; all are kept.
+    self.assertEqual(int((dataset.features[:, 963] > 0.5).sum().item()), 2)
+
+  def test_goalkeeper_prior_discriminator_reward_is_nonnegative_and_clipped(self):
+    from src.tasks.soccer.modules.goalkeeper_prior_discriminator import GoalkeeperPriorDiscriminator
+
+    disc = GoalkeeperPriorDiscriminator(input_dim=3, hidden_dims=(4,), reward_clip=0.7)
+    with torch.no_grad():
+      for param in disc.parameters():
+        param.zero_()
+
+    reward = disc.reward(torch.ones(5, 3))
+
+    self.assertTrue(torch.all(reward >= 0.0))
+    self.assertTrue(torch.all(reward <= 0.7))
+    self.assertEqual(reward.shape, (5,))
+
+  def test_student_ppo_prior_discriminator_config_is_forwarded_to_algorithm(self):
     from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
 
     cfg = FineTuneConfig(
-      init="checkpoints/model_best.pt",
-      num_envs=64,
-      max_iterations=7,
-      profile="bc_regularized_finetune",
-      offline_bc_dataset="data/goalkeeper_student/teacher_rollouts/merged",
-      offline_bc_coef=0.05,
-      offline_idle_bc_coef=1.0,
-      offline_bc_batch_size=16,
-      offline_bc_seq_len=24,
-      offline_bc_every_n_updates=4,
-      num_learning_epochs=3,
-      learning_rate=1.0e-4,
-    )
-    train_cfg = build_train_config(cfg)
-
-    self.assertEqual(train_cfg.load_checkpoint_path, "checkpoints/model_best.pt")
-    self.assertTrue(train_cfg.load_actor_only)
-    self.assertFalse(train_cfg.init_at_random_ep_len)
-    self.assertIn("idle_fall_penalty", train_cfg.env.rewards)
-    self.assertAlmostEqual(train_cfg.env.rewards["idle_fall_penalty"].weight, -1000.0)
-    self.assertIn("action_rate", train_cfg.env.rewards)
-    self.assertLess(train_cfg.env.rewards["action_rate"].weight, 0.0)
-    self.assertNotIn("posture", train_cfg.env.rewards)
-    self.assertIn("idle_low_base_height", train_cfg.env.rewards)
-    self.assertIn("idle_base_height_band", train_cfg.env.rewards)
-    self.assertIn("idle_leg_ready_pose", train_cfg.env.rewards)
-    self.assertIn("active_upright", train_cfg.env.rewards)
-    self.assertGreater(train_cfg.env.rewards["active_upright"].weight, 0.0)
-    self.assertIn("active_fall_penalty", train_cfg.env.rewards)
-    self.assertLess(train_cfg.env.rewards["active_fall_penalty"].weight, 0.0)
-    self.assertIn("idle_alive", train_cfg.env.rewards)
-    self.assertGreater(train_cfg.env.rewards["idle_alive"].weight, 0.0)
-    self.assertIn("idle_action_rate", train_cfg.env.rewards)
-    self.assertAlmostEqual(train_cfg.env.rewards["idle_action_rate"].weight, -0.05)
-    self.assertIn("idle_upright", train_cfg.env.rewards)
-    self.assertGreater(train_cfg.env.rewards["idle_upright"].weight, 0.0)
-    self.assertIn("idle_base_still", train_cfg.env.rewards)
-    self.assertLess(train_cfg.env.rewards["idle_base_still"].weight, 0.0)
-    self.assertEqual(
-      train_cfg.agent.algorithm.offline_bc_dataset,
-      "data/goalkeeper_student/teacher_rollouts/merged",
-    )
-    self.assertEqual(train_cfg.agent.algorithm.offline_bc_coef, 0.05)
-    self.assertEqual(train_cfg.agent.algorithm.offline_idle_bc_coef, 1.0)
-    self.assertEqual(train_cfg.agent.algorithm.offline_bc_batch_size, 16)
-    self.assertEqual(train_cfg.agent.algorithm.offline_bc_seq_len, 24)
-    self.assertEqual(train_cfg.agent.algorithm.offline_bc_every_n_updates, 4)
-    self.assertEqual(train_cfg.agent.algorithm.num_learning_epochs, 3)
-    self.assertEqual(train_cfg.agent.algorithm.learning_rate, 1.0e-4)
-
-  def test_student_ppo_polish_profile_matches_train_polish_safety_knobs(self):
-    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
-
-    cfg = FineTuneConfig(
-      init="checkpoints/model_best.pt",
-      num_envs=64,
-      max_iterations=7,
-      profile="student_polish",
-      offline_bc_dataset="data/goalkeeper_student/teacher_rollouts/merged",
+      prior_disc_dataset_dir="data/prior",
+      prior_disc_reward_coef=0.25,
+      prior_disc_updates=2,
+      prior_disc_batch_size=128,
     )
     train_cfg = build_train_config(cfg)
     alg = train_cfg.agent.algorithm
 
-    self.assertEqual(train_cfg.actor_std_override, 0.06)
-    self.assertAlmostEqual(alg.max_action_std, 0.06)
-    self.assertAlmostEqual(alg.min_action_std, 0.01)
-    self.assertAlmostEqual(alg.learning_rate, 1.0e-4)
-    self.assertAlmostEqual(alg.clip_param, 0.1)
-    self.assertAlmostEqual(alg.desired_kl, 0.005)
-    self.assertAlmostEqual(alg.entropy_coef, 0.0)
-    self.assertAlmostEqual(alg.offline_bc_coef, 0.5)
-    self.assertAlmostEqual(alg.offline_idle_bc_coef, 0.5)
-    self.assertEqual(alg.offline_bc_every_n_updates, 1)
-    self.assertEqual(alg.critic_warmup_iterations, 50)
-    self.assertTrue(alg.mask_idle_actor_loss)
-    self.assertEqual(cfg.eval_interval, 20)
-    self.assertGreater(cfg.rollback_drop, 0.0)
+    self.assertEqual(alg.prior_disc_dataset_dir, "data/prior")
+    self.assertEqual(alg.prior_disc_reward_coef, 0.25)
+    self.assertEqual(alg.prior_disc_updates, 2)
+    self.assertEqual(alg.prior_disc_batch_size, 128)
+
+  def test_student_ppo_active_bc_config_is_forwarded_to_algorithm(self):
+    from dataclasses import asdict
+
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+
+    cfg = FineTuneConfig(
+      active_bc_dataset_dir="data/active_bc",
+      active_bc_coef=0.2,
+      active_bc_final_coef=0.05,
+      active_bc_anneal_updates=2000,
+      active_bc_batch_size=64,
+    )
+    train_cfg = build_train_config(cfg)
+    alg = train_cfg.agent.algorithm
+
+    self.assertEqual(alg.active_bc_dataset_dir, "data/active_bc")
+    self.assertEqual(alg.active_bc_coef, 0.2)
+    self.assertEqual(alg.active_bc_final_coef, 0.05)
+    self.assertEqual(alg.active_bc_anneal_updates, 2000)
+    self.assertEqual(alg.active_bc_batch_size, 64)
+    self.assertEqual(asdict(train_cfg.agent)["algorithm"]["active_bc_dataset_dir"], "data/active_bc")
+
+  def test_student_ppo_motion_prior_reward_does_not_enable_rl_bc_loss(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+
+    cfg = FineTuneConfig(
+      motion_prior_weight=0.35,
+      motion_prior_dir="src/assets/soccer/motions/goalkeeper",
+      motion_prior_names=("leftjump.pt", "rightjump.pt"),
+      motion_prior_route_mode="region",
+      motion_prior_std=0.4,
+    )
+    train_cfg = build_train_config(cfg)
+
+    reward = train_cfg.env.rewards["motion_prior_joint_pose"]
+    self.assertEqual(reward.weight, 0.35)
+    self.assertEqual(reward.params["motion_dir"], "src/assets/soccer/motions/goalkeeper")
+    self.assertEqual(reward.params["motion_names"], ("leftjump.pt", "rightjump.pt"))
+    self.assertEqual(reward.params["route_mode"], "region")
+    self.assertEqual(reward.params["std"], 0.4)
+    self.assertEqual(train_cfg.agent.algorithm.active_bc_coef, 0.0)
+    self.assertIsNone(train_cfg.agent.algorithm.active_bc_dataset_dir)
+
+  def test_student_ppo_idle_action_rate_weight_can_be_overridden(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+
+    cfg = FineTuneConfig(profile="teacher_kl", idle_action_rate_weight=-0.1)
+
+    train_cfg = build_train_config(cfg)
+
+    self.assertEqual(train_cfg.env.rewards["idle_action_rate"].weight, -0.1)
+
+  def test_student_ppo_idle_joint_pose_weight_can_be_overridden(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+
+    cfg = FineTuneConfig(profile="teacher_kl", idle_joint_pose_weight=-0.05)
+
+    train_cfg = build_train_config(cfg)
+
+    self.assertEqual(train_cfg.env.rewards["idle_joint_pose"].weight, -0.05)
+
+  def test_student_ppo_prior_discriminator_reward_applies_only_active_samples(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+
+    class _Norm:
+      def update_normalization(self, obs):
+        del obs
+
+      def reset(self, dones):
+        del dones
+
+    class _Storage:
+      def add_transition(self, transition):
+        self.rewards = transition.rewards.clone()
+
+    class _Prior:
+      def reward(self, features):
+        return torch.ones(features.shape[0]) * 2.0
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.freeze_actor_obs_normalization = True
+    algo.actor = _Norm()
+    algo.critic = _Norm()
+    algo.rnd = None
+    algo.transition = type("Transition", (), {"values": torch.zeros(2, 1), "clear": lambda self: None})()
+    algo.storage = _Storage()
+    algo.device = "cpu"
+    algo.gamma = 0.99
+    algo.prior_disc_reward_coef = 0.5
+    algo.prior_discriminator = _Prior()
+    algo.env = None
+    obs = TensorDict({"student": torch.zeros(2, 964)}, batch_size=[2])
+    obs["student"][:, -1] = torch.tensor([1.0, 0.0])
+    algo.transition.actions = torch.zeros(2, 29)
+
+    algo.process_env_step(obs, torch.zeros(2), torch.zeros(2, dtype=torch.bool), {})
+
+    self.assertTrue(torch.allclose(algo.storage.rewards, torch.tensor([0.0, 1.0])))
+
+  def test_student_ppo_prior_discriminator_update_separates_expert_and_policy_samples(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+    from src.tasks.soccer.modules.goalkeeper_prior_discriminator import GoalkeeperPriorDiscriminator
+
+    class _Dataset:
+      def sample(self, batch_size):
+        return torch.ones(batch_size, 3)
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.prior_discriminator = GoalkeeperPriorDiscriminator(input_dim=3, hidden_dims=(4,))
+    algo.prior_dataset = _Dataset()
+    algo.prior_disc_optimizer = torch.optim.Adam(algo.prior_discriminator.parameters(), lr=1.0e-3)
+    algo.prior_disc_batch_size = 4
+    algo.prior_disc_updates = 2
+    algo.device = "cpu"
+    policy_features = torch.zeros(8, 3)
+
+    metrics = algo._update_prior_discriminator(policy_features)
+
+    self.assertIn("prior_disc", metrics)
+    self.assertIn("prior_disc_expert_acc", metrics)
+    self.assertIn("prior_disc_policy_acc", metrics)
+    self.assertTrue(torch.isfinite(torch.tensor(metrics["prior_disc"])))
+
+  def test_student_ppo_active_bc_loss_supervises_actor_mean_with_expert_actions(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+
+    class _Actor(torch.nn.Module):
+      def __init__(self):
+        super().__init__()
+        self.obs_groups = ("actor",)
+        self.bias = torch.nn.Parameter(torch.zeros(2))
+        self.output_distribution_params = (torch.zeros(3, 2), torch.ones(3, 2))
+
+      def forward(self, obs, stochastic_output=False):
+        del stochastic_output
+        mean = obs["actor"][:, :2] + self.bias
+        self.output_distribution_params = (mean, torch.ones_like(mean) * 0.1)
+        return mean
+
+    class _Dataset:
+      input_dim = 4
+
+      def sample(self, batch_size):
+        del batch_size
+        obs = torch.tensor(
+          [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+          ]
+        )
+        actions = torch.tensor(
+          [
+            [1.0, 1.0],
+            [2.0, 1.0],
+            [1.0, 2.0],
+          ]
+        )
+        return torch.cat([obs, actions], dim=-1)
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.actor = _Actor()
+    algo.active_bc_dataset = _Dataset()
+    algo.active_bc_coef = 1.0
+    algo.active_bc_batch_size = 3
+    algo.active_bc_obs_dim = 2
+    algo.device = "cpu"
+    optimizer = torch.optim.SGD(algo.actor.parameters(), lr=0.5)
+
+    initial_loss = algo._active_bc_loss()
+    optimizer.zero_grad()
+    initial_loss.backward()
+    optimizer.step()
+    updated_loss = algo._active_bc_loss()
+
+    self.assertGreater(initial_loss.item(), 0.0)
+    self.assertLess(updated_loss.item(), initial_loss.item())
 
   def test_student_ppo_script_can_still_load_actor_checkpoint_when_init_is_given(self):
     from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
@@ -643,21 +987,6 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     self.assertFalse(train_cfg.load_actor_only)
     self.assertFalse(train_cfg.load_model_only)
 
-  def test_student_ppo_script_allows_distillation_knob_overrides(self):
-    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
-
-    cfg = FineTuneConfig(
-      init="student_bc.pt",
-      teacher="/tmp/teacher.pt",
-      distill_coef=0.25,
-      teacher_every_n_steps=3,
-    )
-    train_cfg = build_train_config(cfg)
-
-    self.assertEqual(train_cfg.agent.algorithm.teacher_checkpoint_path, "/tmp/teacher.pt")
-    self.assertEqual(train_cfg.agent.algorithm.distill_coef, 0.25)
-    self.assertEqual(train_cfg.agent.algorithm.teacher_every_n_steps, 3)
-
   def test_student_ppo_bc_finetune_freezes_actor_obs_normalizer_updates(self):
     from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
 
@@ -668,6 +997,285 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     train_cfg = build_train_config(cfg)
 
     self.assertTrue(train_cfg.agent.algorithm.freeze_actor_obs_normalization)
+
+  def test_student_ppo_scratch_defaults_do_not_freeze_actor_obs_normalizer(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+
+    cfg = FineTuneConfig(init=None, profile="default")
+    train_cfg = build_train_config(cfg)
+
+    self.assertFalse(train_cfg.agent.algorithm.freeze_actor_obs_normalization)
+
+  def test_student_ppo_teacher_kl_defaults_are_looser_for_policy_updates(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+
+    cfg = FineTuneConfig(profile="teacher_kl")
+    train_cfg = build_train_config(cfg)
+    alg = train_cfg.agent.algorithm
+
+    self.assertEqual(alg.teacher_kl_coef, 0.003)
+    self.assertEqual(alg.min_action_std, 0.03)
+    self.assertEqual(alg.max_action_std, 0.15)
+    self.assertFalse(alg.idle_deterministic_actions)
+    self.assertEqual(alg.condition_aux_coef, 0.01)
+    self.assertEqual(alg.condition_aux_final_coef, 0.01)
+    self.assertTrue(alg.condition_aux_active_only)
+
+  def test_student_ppo_teacher_kl_allows_explicit_zero_coef_override(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+
+    cfg = FineTuneConfig(profile="teacher_kl", teacher_kl_coef=0.0)
+    train_cfg = build_train_config(cfg)
+
+    self.assertEqual(train_cfg.agent.algorithm.teacher_kl_coef, 0.0)
+
+  def test_student_ppo_teacher_kl_profile_relaxes_prepare_motion_penalties(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+
+    cfg = FineTuneConfig(profile="teacher_kl")
+    train_cfg = build_train_config(cfg)
+    rewards = train_cfg.env.rewards
+
+    self.assertEqual(rewards["idle_base_still"].weight, -0.05)
+    self.assertEqual(rewards["idle_leg_ready_pose"].weight, 0.0)
+    self.assertEqual(rewards["idle_joint_pose"].weight, 0.0)
+    self.assertEqual(rewards["idle_action_rate"].weight, -0.005)
+
+  def test_student_ppo_teacher_kl_profile_prioritizes_block_outcomes_over_idle_shaping(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
+
+    cfg = FineTuneConfig(profile="teacher_kl")
+    train_cfg = build_train_config(cfg)
+    rewards = train_cfg.env.rewards
+
+    self.assertEqual(rewards["goal_conceded"].weight, -20.0)
+    self.assertEqual(rewards["intercept"].weight, 1.0)
+    self.assertEqual(rewards["condition_target_reach"].weight, 0.5)
+    self.assertEqual(rewards["body"].weight, 1.0)
+    self.assertEqual(rewards["stop_ball"].weight, 3.0)
+    self.assertEqual(rewards["idle_base_height_band"].weight, 5.0)
+    self.assertEqual(rewards["idle_upright"].weight, 2.0)
+    self.assertEqual(rewards["idle_alive"].weight, 0.1)
+    self.assertEqual(rewards["active_upright"].weight, 2.0)
+
+  def test_student_ppo_teacher_kl_eval_interval_saves_best_block_rate_checkpoint(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, TrainConfig, _run_teacher_kl_training
+
+    @dataclass
+    class _FakeEnvCfg:
+      seed: int = 0
+
+    @dataclass
+    class _FakeAgentCfg:
+      seed: int = 0
+      max_iterations: int = 5
+      experiment_name: str = "tmp_goalkeeper_tests"
+      run_name: str = "unit_test_teacher_kl_eval"
+      clip_actions: float | None = None
+
+    class _FakeAlg:
+      def __init__(self):
+        self.actor = torch.nn.Linear(1, 1)
+
+      def save(self):
+        return {"actor_state_dict": self.actor.state_dict()}
+
+      def _clamp_actor_std(self):
+        return None
+
+    class _FakeRunner:
+      def __init__(self, env, agent_cfg, log_dir, device):
+        self.env = env
+        self.log_dir = log_dir
+        self.alg = _FakeAlg()
+        self.learn_calls = []
+        self.policy = SimpleNamespace(
+          training=False,
+          eval=lambda: None,
+          train=lambda: None,
+          reset=lambda: None,
+        )
+
+      def add_git_repo_to_log(self, _path):
+        return None
+
+      def get_inference_policy(self, device=None):
+        return self.policy
+
+      def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        self.learn_calls.append(num_learning_iterations)
+
+    fake_env = SimpleNamespace(close=lambda: None)
+    cfg = FineTuneConfig(
+      profile="teacher_kl",
+      init="model_0.pt",
+      run_name="unit_test_teacher_kl_eval",
+      max_iterations=5,
+      eval_interval=2,
+      eval_steps=10,
+      eval_resets=1,
+      device_ids=[0],
+    )
+    train_cfg = TrainConfig(
+      env=_FakeEnvCfg(),
+      agent=_FakeAgentCfg(),
+      load_checkpoint_path="model_0.pt",
+      load_actor_only=True,
+      load_model_only=False,
+      actor_std_override=None,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir, \
+      patch("scripts.train_goalkeeper_student_ppo.configure_torch_backends"), \
+      patch("scripts.train_goalkeeper_student_ppo.torch.cuda.is_available", return_value=False), \
+      patch("scripts.train_goalkeeper_student_ppo.Path", wraps=Path), \
+      patch("scripts.train_goalkeeper_student_ppo.ManagerBasedRlEnv", return_value=fake_env), \
+      patch("scripts.train_goalkeeper_student_ppo.RslRlVecEnvWrapper", side_effect=lambda env, clip_actions=None: env), \
+      patch("scripts.train_goalkeeper_student_ppo.load_runner_cls", return_value=_FakeRunner), \
+      patch("scripts.train_goalkeeper_student_ppo._load_initial_checkpoint"), \
+      patch("scripts.train_goalkeeper_student_ppo.dump_yaml"), \
+      patch("scripts.train_goalkeeper_student_ppo._eval_goalkeeper_diagnostics", side_effect=[
+        {"block_rate": 0.10, "prelaunch_fall_rate": 0.70, "active_fall_rate": 0.80},
+        {"block_rate": 0.30, "prelaunch_fall_rate": 0.50, "active_fall_rate": 0.60},
+        {"block_rate": 0.20, "prelaunch_fall_rate": 0.40, "active_fall_rate": 0.50},
+        {"block_rate": 0.35, "prelaunch_fall_rate": 0.20, "active_fall_rate": 0.30},
+      ]), \
+      patch("scripts.train_goalkeeper_student_ppo._save_runner_checkpoint") as save_ckpt, \
+      patch("scripts.train_goalkeeper_student_ppo.datetime") as fake_datetime:
+      fake_datetime.now.return_value.strftime.return_value = "2026-06-25_23-59-59"
+      cwd = Path.cwd()
+      try:
+        import os
+        os.chdir(tmpdir)
+        _run_teacher_kl_training(cfg.task_id, cfg, train_cfg)
+      finally:
+        os.chdir(cwd)
+
+    saved_paths = [call.args[1].name for call in save_ckpt.call_args_list]
+    self.assertIn("model_best.pt", saved_paths)
+    self.assertGreaterEqual(saved_paths.count("model_best.pt"), 3)
+
+  def test_student_ppo_teacher_kl_resume_wandb_writes_metadata_file(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, TrainConfig, _run_teacher_kl_training
+
+    @dataclass
+    class _FakeEnvCfg:
+      seed: int = 0
+
+    @dataclass
+    class _FakeAgentCfg:
+      seed: int = 0
+      max_iterations: int = 0
+      experiment_name: str = "tmp_goalkeeper_tests"
+      run_name: str = "unit_test_teacher_kl_wandb_resume"
+      clip_actions: float | None = None
+
+    class _FakeAlg:
+      def __init__(self):
+        self.actor = torch.nn.Linear(1, 1)
+
+      def save(self):
+        return {"actor_state_dict": self.actor.state_dict()}
+
+      def _clamp_actor_std(self):
+        return None
+
+    class _FakeRunner:
+      def __init__(self, env, agent_cfg, log_dir, device):
+        self.alg = _FakeAlg()
+
+      def add_git_repo_to_log(self, _path):
+        return None
+
+      def get_inference_policy(self, device=None):
+        return SimpleNamespace(training=False, eval=lambda: None, train=lambda: None, reset=lambda: None)
+
+      def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      prev_run = Path(tmpdir) / "logs" / "rsl_rl" / "g1_goalkeeper_student" / "old_run"
+      (prev_run / "params").mkdir(parents=True)
+      (prev_run / "params" / "wandb.yaml").write_text("id: resume123\nresume: must\n")
+      ckpt = prev_run / "model_600.pt"
+      ckpt.write_bytes(b"")
+      cfg = FineTuneConfig(
+        profile="teacher_kl",
+        init=str(ckpt),
+        run_name="unit_test_teacher_kl_wandb_resume",
+        max_iterations=0,
+        eval_interval=0,
+        resume_wandb=True,
+        device_ids=[0],
+      )
+      train_cfg = TrainConfig(
+        env=_FakeEnvCfg(),
+        agent=_FakeAgentCfg(),
+        load_checkpoint_path=str(ckpt),
+        load_actor_only=True,
+        load_model_only=False,
+        actor_std_override=None,
+      )
+
+      with patch("scripts.train_goalkeeper_student_ppo.configure_torch_backends"), \
+        patch("scripts.train_goalkeeper_student_ppo.torch.cuda.is_available", return_value=False), \
+        patch("scripts.train_goalkeeper_student_ppo.ManagerBasedRlEnv", return_value=SimpleNamespace(close=lambda: None)), \
+        patch("scripts.train_goalkeeper_student_ppo.RslRlVecEnvWrapper", side_effect=lambda env, clip_actions=None: env), \
+        patch("scripts.train_goalkeeper_student_ppo.load_runner_cls", return_value=_FakeRunner), \
+        patch("scripts.train_goalkeeper_student_ppo._load_initial_checkpoint"), \
+        patch.dict("os.environ", {}, clear=True):
+        cwd = Path.cwd()
+        try:
+          import os
+          os.chdir(tmpdir)
+          _run_teacher_kl_training(cfg.task_id, cfg, train_cfg)
+        finally:
+          os.chdir(cwd)
+
+      new_runs = sorted((Path(tmpdir) / "logs" / "rsl_rl" / "tmp_goalkeeper_tests").glob("*_unit_test_teacher_kl_wandb_resume"))
+      self.assertEqual(len(new_runs), 1)
+      wandb_meta = new_runs[0] / "params" / "wandb.yaml"
+      self.assertTrue(wandb_meta.exists())
+      text = wandb_meta.read_text()
+      self.assertIn("id: resume123", text)
+
+  def test_student_ppo_script_can_resume_wandb_from_explicit_id(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, _resolve_wandb_resume
+
+    cfg = FineTuneConfig(
+      init="logs/rsl_rl/g1_goalkeeper_student/2026-06-25_23-35-33_run/model_600.pt",
+      wandb_resume_id="abc12345",
+    )
+
+    with patch.dict("os.environ", {}, clear=True):
+      meta = _resolve_wandb_resume(cfg)
+
+    self.assertEqual(meta["id"], "abc12345")
+    self.assertEqual(meta["resume"], "must")
+    self.assertEqual(meta["source"], "explicit")
+    self.assertEqual(meta["dir"], "")
+
+  def test_student_ppo_script_can_resume_wandb_from_init_run_metadata(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, _resolve_wandb_resume
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      run_dir = Path(tmpdir) / "logs" / "rsl_rl" / "g1_goalkeeper_student" / "2026-06-25_23-35-33_run"
+      params_dir = run_dir / "params"
+      params_dir.mkdir(parents=True)
+      (run_dir / "model_600.pt").write_bytes(b"")
+      (params_dir / "wandb.yaml").write_text("id: oldrun42\nresume: must\n")
+      cfg = FineTuneConfig(
+        init=str(run_dir / "model_600.pt"),
+        resume_wandb=True,
+      )
+
+      with patch.dict("os.environ", {}, clear=True):
+        meta = _resolve_wandb_resume(cfg)
+
+    self.assertEqual(meta["id"], "oldrun42")
+    self.assertEqual(meta["resume"], "must")
+    self.assertEqual(meta["source"], "init")
+    self.assertEqual(meta["dir"], str(run_dir))
 
   def test_student_ppo_script_can_override_loaded_actor_std_and_entropy(self):
     from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
@@ -681,36 +1289,6 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
 
     self.assertEqual(train_cfg.actor_std_override, 0.03)
     self.assertEqual(train_cfg.agent.algorithm.entropy_coef, 0.0)
-
-  def test_student_ppo_script_wires_condition_strength_knobs(self):
-    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
-
-    cfg = FineTuneConfig(
-      init="student_bc.pt",
-      distill_coef=0.05,
-      distill_final_coef=0.0,
-      distill_anneal_updates=100,
-      offline_bc_coef=0.5,
-      offline_bc_final_coef=0.05,
-      offline_bc_anneal_updates=200,
-      offline_bc_active_fraction=0.75,
-      condition_aux_coef=0.2,
-      condition_aux_final_coef=0.05,
-      condition_aux_anneal_updates=300,
-    )
-    train_cfg = build_train_config(cfg)
-    alg = train_cfg.agent.algorithm
-
-    self.assertEqual(alg.distill_coef, 0.05)
-    self.assertEqual(alg.distill_final_coef, 0.0)
-    self.assertEqual(alg.distill_anneal_updates, 100)
-    self.assertEqual(alg.offline_bc_coef, 0.5)
-    self.assertEqual(alg.offline_bc_final_coef, 0.05)
-    self.assertEqual(alg.offline_bc_anneal_updates, 200)
-    self.assertEqual(alg.offline_bc_active_fraction, 0.75)
-    self.assertEqual(alg.condition_aux_coef, 0.2)
-    self.assertEqual(alg.condition_aux_final_coef, 0.05)
-    self.assertEqual(alg.condition_aux_anneal_updates, 300)
 
   def test_student_ppo_script_can_override_min_action_std_floor(self):
     from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
@@ -838,6 +1416,7 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
 
     algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
     algo.mask_idle_actor_loss = True
+    algo.idle_actor_loss_weight = 0.0
     algo.clip_param = 0.1
     algo.actor = type("Actor", (), {"_raw_student_obs": lambda _self, obs: obs["student"]})()
     observations = {"student": torch.tensor([[0.0, 0.0, 0.0, 1.0], [0.2, 0.1, 0.3, 0.0]])}
@@ -849,6 +1428,69 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
 
     self.assertTrue(torch.allclose(surrogate_loss, torch.tensor(-1.0)))
     self.assertTrue(torch.allclose(entropy_loss, torch.tensor(2.0)))
+
+  def test_student_ppo_can_keep_small_prepare_policy_loss_weight(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.mask_idle_actor_loss = True
+    algo.idle_actor_loss_weight = 0.2
+    algo.clip_param = 0.1
+    batch = type("Batch", (), {})()
+    batch.actor_loss_mask = torch.tensor([0.0, 1.0])
+    advantages = torch.tensor([10.0, 2.0])
+    ratio = torch.ones(2)
+    entropy = torch.tensor([5.0, 1.0])
+
+    surrogate_loss, entropy_loss = algo._masked_actor_losses(batch, advantages, ratio, entropy)
+
+    self.assertTrue(torch.allclose(surrogate_loss, torch.tensor(-3.3333333)))
+    self.assertTrue(torch.allclose(entropy_loss, torch.tensor(1.6666666)))
+
+  def test_student_ppo_idle_action_mask_uses_delayed_launch_state_before_obs_condition(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.device = "cpu"
+    algo.env = type("Env", (), {"num_envs": 2, "_gk_delayed_ball_launched": torch.tensor([False, True])})()
+    algo.actor = type("Actor", (), {"_raw_student_obs": lambda _self, obs: obs["student"]})()
+    observations = {"student": torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.2, 0.1, 0.3, 1.0]])}
+
+    idle_mask = algo._idle_action_mask(observations)
+
+    self.assertTrue(torch.equal(idle_mask, torch.tensor([True, False])))
+
+  def test_student_ppo_idle_action_mask_uses_unwrapped_delayed_launch_state(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.device = "cpu"
+    base_env = type("BaseEnv", (), {"num_envs": 2, "_gk_delayed_ball_launched": torch.tensor([False, True])})()
+    algo.env = type("WrapperEnv", (), {"num_envs": 2, "unwrapped": base_env})()
+    algo.actor = type("Actor", (), {"_raw_student_obs": lambda _self, obs: obs["student"]})()
+    observations = {"student": torch.tensor([[0.0, 0.0, 0.0, 0.0], [0.2, 0.1, 0.3, 1.0]])}
+
+    idle_mask = algo._idle_action_mask(observations)
+
+    self.assertTrue(torch.equal(idle_mask, torch.tensor([True, False])))
+
+  def test_student_ppo_uses_rollout_actor_loss_mask_for_recurrent_batches(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.mask_idle_actor_loss = True
+    algo.idle_actor_loss_weight = 0.0
+    algo.clip_param = 0.1
+    batch = type("Batch", (), {})()
+    batch.actor_loss_mask = torch.tensor([[[0.0], [1.0]], [[1.0], [0.0]]])
+    advantages = torch.tensor([[100.0, 1.0], [2.0, 100.0]])
+    ratio = torch.ones(2, 2)
+    entropy = torch.tensor([[1000.0, 3.0], [4.0, 1000.0]])
+
+    surrogate_loss, entropy_loss = algo._masked_actor_losses(batch, advantages, ratio, entropy)
+
+    self.assertTrue(torch.allclose(surrogate_loss, torch.tensor(-1.5)))
+    self.assertTrue(torch.allclose(entropy_loss, torch.tensor(3.5)))
 
   def test_student_ppo_clips_actor_mean_when_recovery_clip_is_set(self):
     from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
@@ -905,6 +1547,21 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     algo._ppo_update_count = 15
     self.assertAlmostEqual(algo._scheduled_coef(1.0, 0.1, 10), 0.1)
 
+  def test_student_ppo_active_bc_weight_uses_linear_schedule(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.active_bc_coef = 0.8
+    algo.active_bc_final_coef = 0.05
+    algo.active_bc_anneal_updates = 2000
+    algo._ppo_update_count = 0
+
+    self.assertAlmostEqual(algo._active_bc_weight(), 0.8)
+    algo._ppo_update_count = 1000
+    self.assertAlmostEqual(algo._active_bc_weight(), 0.425)
+    algo._ppo_update_count = 2500
+    self.assertAlmostEqual(algo._active_bc_weight(), 0.05)
+
   def test_student_ppo_process_env_step_can_skip_actor_normalizer_update(self):
     from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
 
@@ -951,62 +1608,6 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     self.assertTrue(torch.equal(algo.actor.reset_dones, dones))
     self.assertTrue(torch.equal(algo.critic.reset_dones, dones))
     self.assertTrue(algo.transition.cleared)
-
-  def test_student_ppo_act_is_deterministic_only_for_idle_condition_by_default(self):
-    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
-
-    class _Transition:
-      pass
-
-    class _Actor:
-      def __init__(self):
-        self.mean = torch.tensor([[1.0, 1.0], [2.0, 2.0]])
-        self.sample = torch.tensor([[10.0, 10.0], [20.0, 20.0]])
-        self.logged_actions = None
-
-      def get_hidden_state(self):
-        return "actor_h"
-
-      def __call__(self, obs, stochastic_output=False):
-        self.output_distribution_params = (self.mean, torch.ones_like(self.mean) * 0.2)
-        return self.sample if stochastic_output else self.mean
-
-      @property
-      def output_mean(self):
-        return self.mean
-
-      def get_output_log_prob(self, actions):
-        self.logged_actions = actions.clone()
-        return actions.sum(dim=-1)
-
-    class _Critic:
-      def get_hidden_state(self):
-        return "critic_h"
-
-      def __call__(self, obs):
-        return torch.zeros(2, 1)
-
-    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
-    algo.actor = _Actor()
-    algo.critic = _Critic()
-    algo.transition = _Transition()
-    algo.teacher_policy = None
-    algo.teacher_every_n_steps = 1
-    algo._act_step = 0
-    algo.idle_deterministic_actions = True
-
-    obs = TensorDict(
-      {"student": torch.tensor([[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 0.0]])},
-      batch_size=[2],
-    )
-
-    actions = algo.act(obs)
-
-    expected = torch.tensor([[1.0, 1.0], [20.0, 20.0]])
-    self.assertTrue(torch.equal(actions, expected))
-    self.assertTrue(torch.equal(algo.transition.actions, expected))
-    self.assertTrue(torch.equal(algo.actor.logged_actions, expected))
-    self.assertTrue(torch.equal(algo.transition.privileged_actions, algo.actor.output_mean))
 
   def test_student_ppo_can_sample_idle_actions_for_prepare_recovery(self):
     from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
@@ -1060,135 +1661,167 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
     expected = torch.tensor([[10.0, 10.0], [20.0, 20.0]])
     self.assertTrue(torch.equal(actions, expected))
 
-  def test_student_ppo_algorithm_loads_offline_bc_regularizer_dataset(self):
+  def test_student_ppo_reference_kl_penalizes_drift_from_start_policy(self):
     from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
 
-    with tempfile.TemporaryDirectory() as tmp:
-      dataset = Path(tmp) / "dataset"
-      shards = dataset / "shards"
-      shards.mkdir(parents=True)
-      torch.save(
-        {
-          "student_obs": torch.zeros(2, 5, 964),
-          "teacher_action": torch.ones(2, 5, 29),
-          "valid_mask": torch.ones(2, 5, dtype=torch.bool),
-        },
-        shards / "shard_000000.pt",
-      )
+    class _Actor:
+      def __init__(self, mean):
+        self.mean = torch.as_tensor(mean, dtype=torch.float32)
+        self.std = torch.ones_like(self.mean) * 0.5
+        self.output_distribution_params = (self.mean, self.std)
 
-      algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
-      algo.device = "cpu"
-      algo.offline_bc_coef = 0.1
-      algo.offline_bc_batch_size = 3
-      algo.offline_bc_seq_len = 4
-      algo.offline_bc_cache_shards = 8
-      algo._init_offline_bc_dataset(str(dataset))
+      def __call__(self, obs, masks=None, hidden_state=None, stochastic_output=False):
+        del obs, masks, hidden_state, stochastic_output
+        self.output_distribution_params = (self.mean, self.std)
+        return self.mean
 
-      obs, actions, masks = algo._sample_offline_bc_batch()
+      def get_kl_divergence(self, old_params, new_params):
+        old_mean, old_std = old_params
+        new_mean, new_std = new_params
+        old_dist = torch.distributions.Normal(old_mean, old_std)
+        new_dist = torch.distributions.Normal(new_mean, new_std)
+        return torch.distributions.kl_divergence(old_dist, new_dist).sum(dim=-1)
 
-    self.assertEqual(obs.shape, (4, 3, 964))
-    self.assertEqual(actions.shape, (4, 3, 29))
-    self.assertEqual(masks.shape, (4, 3))
-    self.assertTrue(torch.all(masks))
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.actor = _Actor([[0.0, 0.0], [0.0, 0.0]])
+    algo.reference_actor = _Actor([[0.0, 0.0], [0.0, 0.0]])
+    algo.device = "cpu"
+    algo.reference_kl_std_floor = 0.1
+    batch = type(
+      "Batch",
+      (),
+      {
+        "observations": TensorDict({"student": torch.zeros(2, 4)}, batch_size=[2]),
+        "masks": None,
+        "hidden_states": (None, None),
+      },
+    )()
 
-  def test_student_ppo_offline_bc_prefers_active_segments_when_requested(self):
+    self.assertAlmostEqual(algo._reference_kl_loss(batch).item(), 0.0)
+
+    algo.actor = _Actor([[1.0, 0.0], [0.0, 0.0]])
+
+    self.assertGreater(algo._reference_kl_loss(batch).item(), 0.0)
+
+  def test_student_ppo_reference_kl_uses_std_floor_for_low_exploration_policy(self):
     from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
 
-    with tempfile.TemporaryDirectory() as tmp:
-      dataset = Path(tmp) / "dataset"
-      shards = dataset / "shards"
-      shards.mkdir(parents=True)
-      student_obs = torch.zeros(1, 8, 964)
-      student_obs[0, :4, -1] = 1.0
-      student_obs[0, 4:, -1] = 0.0
-      torch.save(
-        {
-          "student_obs": student_obs,
-          "teacher_action": torch.ones(1, 8, 29),
-          "valid_mask": torch.ones(1, 8, dtype=torch.bool),
-        },
-        shards / "shard_000000.pt",
-      )
+    class _Actor:
+      def __init__(self, mean, std):
+        self.mean = torch.as_tensor(mean, dtype=torch.float32)
+        self.std = torch.ones_like(self.mean) * std
+        self.output_distribution_params = (self.mean, self.std)
 
-      algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
-      algo.device = "cpu"
-      algo.offline_bc_coef = 0.1
-      algo.offline_idle_bc_coef = 0.0
-      algo.offline_bc_batch_size = 3
-      algo.offline_bc_seq_len = 2
-      algo.offline_bc_cache_shards = 1
-      algo.offline_bc_active_fraction = 1.0
-      algo._init_offline_bc_dataset(str(dataset))
+      def __call__(self, obs, masks=None, hidden_state=None, stochastic_output=False):
+        del obs, masks, hidden_state, stochastic_output
+        self.output_distribution_params = (self.mean, self.std)
+        return self.mean
 
-      obs, _, masks = algo._sample_offline_bc_batch()
+      def get_kl_divergence(self, old_params, new_params):
+        old_mean, old_std = old_params
+        new_mean, new_std = new_params
+        old_dist = torch.distributions.Normal(old_mean, old_std)
+        new_dist = torch.distributions.Normal(new_mean, new_std)
+        return torch.distributions.kl_divergence(old_dist, new_dist).sum(dim=-1)
 
-    self.assertEqual(obs.shape, (2, 3, 964))
-    self.assertTrue(torch.all(obs[masks, -1] == 0.0))
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.actor = _Actor([[1.0, 0.0], [0.0, 0.0]], std=0.002)
+    algo.reference_actor = _Actor([[0.0, 0.0], [0.0, 0.0]], std=0.002)
+    algo.device = "cpu"
+    algo.reference_kl_std_floor = 0.1
+    batch = type(
+      "Batch",
+      (),
+      {
+        "observations": TensorDict({"student": torch.zeros(2, 4)}, batch_size=[2]),
+        "masks": None,
+        "hidden_states": (None, None),
+      },
+    )()
 
-  def test_student_ppo_offline_idle_bc_samples_only_prepare_condition(self):
+    loss = algo._reference_kl_loss(batch)
+
+    self.assertTrue(torch.isfinite(loss))
+    self.assertLess(loss.item(), 100.0)
+
+  def test_student_ppo_reference_kl_clips_distribution_means(self):
     from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
 
-    with tempfile.TemporaryDirectory() as tmp:
-      dataset = Path(tmp) / "dataset"
-      shards = dataset / "shards"
-      shards.mkdir(parents=True)
-      student_obs = torch.zeros(1, 6, 964)
-      student_obs[0, :3, -1] = 1.0
-      student_obs[0, 3:, -1] = 0.0
-      torch.save(
-        {
-          "student_obs": student_obs,
-          "teacher_action": torch.ones(1, 6, 29),
-          "valid_mask": torch.ones(1, 6, dtype=torch.bool),
-        },
-        shards / "shard_000000.pt",
-      )
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.reference_kl_std_floor = 0.1
+    algo.actor_mean_clip = 6.0
 
-      algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
-      algo.device = "cpu"
-      algo.offline_bc_coef = 0.1
-      algo.offline_bc_batch_size = 2
-      algo.offline_bc_seq_len = 2
-      algo.offline_bc_cache_shards = 1
-      algo._init_offline_bc_dataset(str(dataset))
+    mean, std = algo._reference_kl_params((torch.tensor([[100.0, -100.0]]), torch.ones(1, 2) * 0.01))
 
-      obs, _, masks = algo._sample_offline_bc_batch(idle_only=True)
+    self.assertTrue(torch.equal(mean, torch.tensor([[6.0, -6.0]])))
+    self.assertTrue(torch.equal(std, torch.ones(1, 2) * 0.1))
 
-    self.assertEqual(obs.shape, (2, 2, 964))
-    self.assertTrue(torch.all(obs[masks, -1] == 1.0))
-
-  def test_student_ppo_offline_idle_bc_uses_only_initial_idle_prefix(self):
+  def test_student_ppo_reference_kl_backward_accepts_reference_tensors(self):
     from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
 
-    with tempfile.TemporaryDirectory() as tmp:
-      dataset = Path(tmp) / "dataset"
-      shards = dataset / "shards"
-      shards.mkdir(parents=True)
-      student_obs = torch.zeros(1, 6, 964)
-      student_obs[0, :, 0] = torch.arange(6, dtype=torch.float32)
-      student_obs[0, [0, 1, 4, 5], -1] = 1.0
-      torch.save(
-        {
-          "student_obs": student_obs,
-          "teacher_action": torch.ones(1, 6, 29),
-          "valid_mask": torch.ones(1, 6, dtype=torch.bool),
-        },
-        shards / "shard_000000.pt",
-      )
+    class _CurrentActor:
+      def __init__(self):
+        self.mean = torch.zeros(2, 2, requires_grad=True)
+        self.std = torch.full((2, 2), 0.1, requires_grad=True)
+        self.output_distribution_params = (self.mean, self.std)
 
-      algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
-      algo.device = "cpu"
-      algo.offline_bc_coef = 0.1
-      algo.offline_bc_batch_size = 1
-      algo.offline_bc_seq_len = 4
-      algo.offline_bc_cache_shards = 1
-      algo._init_offline_bc_dataset(str(dataset))
+      def get_kl_divergence(self, old_params, new_params):
+        old_mean, old_std = old_params
+        new_mean, new_std = new_params
+        old_dist = torch.distributions.Normal(old_mean, old_std)
+        new_dist = torch.distributions.Normal(new_mean, new_std)
+        return torch.distributions.kl_divergence(old_dist, new_dist).sum(dim=-1)
 
-      obs, _, masks = algo._sample_offline_bc_batch(idle_only=True)
+    class _ReferenceActor:
+      def __call__(self, obs, masks=None, hidden_state=None, stochastic_output=False):
+        del masks, hidden_state, stochastic_output
+        mean = obs["student"][:, :2] + 0.1
+        std = torch.ones_like(mean) * 0.1
+        self.output_distribution_params = (mean, std)
+        return mean
 
-    self.assertEqual(obs.shape, (4, 1, 964))
-    self.assertEqual(masks[:, 0].tolist(), [True, True, False, False])
-    self.assertTrue(torch.equal(obs[masks, 0], torch.tensor([0.0, 1.0])))
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.actor = _CurrentActor()
+    algo.reference_actor = _ReferenceActor()
+    algo.device = "cpu"
+    algo.reference_kl_std_floor = 0.1
+    batch = type(
+      "Batch",
+      (),
+      {
+        "observations": TensorDict({"student": torch.zeros(2, 4)}, batch_size=[2]),
+        "masks": None,
+        "hidden_states": (None, None),
+      },
+    )()
+
+    loss = algo._reference_kl_loss(batch)
+    loss.backward()
+
+    self.assertIsNotNone(algo.actor.mean.grad)
+    self.assertIsNotNone(algo.actor.std.grad)
+    self.assertTrue(torch.isfinite(algo.actor.mean.grad).all())
+    self.assertTrue(torch.isfinite(algo.actor.std.grad).all())
+
+  def test_student_ppo_clips_actor_distribution_mean_during_update(self):
+    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+
+    class _Distribution:
+      def __init__(self):
+        self.mean = torch.tensor([[10.0, -9.0, 2.0]])
+        self.updated = None
+
+      def update(self, mean):
+        self.updated = mean
+        self.mean = mean
+
+    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
+    algo.actor = type("Actor", (), {"distribution": _Distribution()})()
+    algo.actor_mean_clip = 6.0
+
+    algo._clip_actor_distribution_mean()
+
+    self.assertTrue(torch.equal(algo.actor.distribution.updated, torch.tensor([[6.0, -6.0, 2.0]])))
 
   def test_student_ppo_route_targets_match_moe7_heuristic_and_prepare_class(self):
     from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
@@ -1320,63 +1953,26 @@ class GoalkeeperStudentBcTest(unittest.TestCase):
 
     self.assertLess(loss.item(), 0.1)
 
-  def test_student_ppo_offline_bc_runs_only_every_n_updates(self):
-    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
+  def test_student_ppo_active_reward_weights_can_be_overridden(self):
+    from scripts.train_goalkeeper_student_ppo import FineTuneConfig, build_train_config
 
-    algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
-    algo.device = "cpu"
-    algo.offline_bc_coef = 0.1
-    algo.offline_bc_every_n_updates = 4
-    algo._offline_bc_shards = [Path("dummy.pt")]
+    cfg = FineTuneConfig(
+      profile="teacher_kl",
+      action_rate_weight=0.0,
+      active_upright_weight=0.0,
+      active_fall_penalty_weight=-10.0,
+      intercept_weight=5.0,
+      stop_ball_weight=10.0,
+    )
 
-    calls = 0
+    train_cfg = build_train_config(cfg)
+    rewards = train_cfg.env.rewards
 
-    def fake_loss():
-      nonlocal calls
-      calls += 1
-      return torch.tensor(3.0)
-
-    algo._offline_bc_loss = fake_loss
-
-    losses = [algo._scheduled_offline_bc_loss(i).item() for i in range(8)]
-
-    self.assertEqual(losses, [3.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0])
-    self.assertEqual(calls, 2)
-
-  def test_student_ppo_prefetches_offline_bc_shards_before_sampling(self):
-    from src.tasks.soccer.modules.goalkeeper_student_ppo import GoalkeeperStudentPPO
-
-    with tempfile.TemporaryDirectory() as tmp:
-      dataset = Path(tmp) / "dataset"
-      shards = dataset / "shards"
-      shards.mkdir(parents=True)
-      for index in range(3):
-        torch.save(
-          {
-            "student_obs": torch.full((2, 5, 964), float(index)),
-            "teacher_action": torch.full((2, 5, 29), float(index)),
-            "valid_mask": torch.ones(2, 5, dtype=torch.bool),
-          },
-          shards / f"shard_{index:06d}.pt",
-        )
-
-      algo = GoalkeeperStudentPPO.__new__(GoalkeeperStudentPPO)
-      algo.device = "cpu"
-      algo.offline_bc_coef = 0.1
-      algo.offline_bc_batch_size = 3
-      algo.offline_bc_seq_len = 4
-      algo.offline_bc_cache_shards = 2
-      algo._init_offline_bc_dataset(str(dataset))
-      algo._prefetch_offline_bc_shards()
-
-      self.assertEqual(len(algo._offline_bc_active_shards), 2)
-      self.assertEqual(len(algo._offline_bc_cache), 2)
-      with patch("torch.load", side_effect=AssertionError("sampling should use the prefetched shard cache")):
-        obs, actions, masks = algo._sample_offline_bc_batch()
-
-    self.assertEqual(obs.shape, (4, 3, 964))
-    self.assertEqual(actions.shape, (4, 3, 29))
-    self.assertTrue(torch.all(masks))
+    self.assertEqual(rewards["action_rate"].weight, 0.0)
+    self.assertEqual(rewards["active_upright"].weight, 0.0)
+    self.assertEqual(rewards["active_fall_penalty"].weight, -10.0)
+    self.assertEqual(rewards["intercept"].weight, 5.0)
+    self.assertEqual(rewards["stop_ball"].weight, 10.0)
 
 
 if __name__ == "__main__":

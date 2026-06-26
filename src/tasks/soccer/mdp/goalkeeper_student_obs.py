@@ -23,7 +23,10 @@ if TYPE_CHECKING:
 
 GOALKEEPER_TEACHER_ACTOR_OBS_DIM = 960
 GOALKEEPER_PREDICTION_CONDITION_DIM = 4
-GOALKEEPER_STUDENT_OBS_DIM = GOALKEEPER_TEACHER_ACTOR_OBS_DIM + GOALKEEPER_PREDICTION_CONDITION_DIM
+GOALKEEPER_TASK_CONTEXT_DIM = 19
+GOALKEEPER_STUDENT_OBS_DIM = GOALKEEPER_TEACHER_ACTOR_OBS_DIM + GOALKEEPER_TASK_CONTEXT_DIM
+GOALKEEPER_PHASE_ACTIVE_INDEX = GOALKEEPER_TEACHER_ACTOR_OBS_DIM
+GOALKEEPER_PHASE_IDLE_INDEX = GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 1
 GOALKEEPER_CONDITION_Y_SCALE = 1.5
 GOALKEEPER_CONDITION_Z_CENTER = 0.9
 GOALKEEPER_CONDITION_Z_SCALE = 0.9
@@ -59,7 +62,13 @@ def build_goalkeeper_student_obs(
   teacher_actor_obs: torch.Tensor,
   prediction_condition: torch.Tensor,
 ) -> torch.Tensor:
-  """Append normalized prediction condition to the normal goalkeeper actor obs."""
+  """Append a rich task context to the normal goalkeeper actor obs.
+
+  The public prediction input remains the compact normalized
+  ``[target_y, target_z, time, idle]`` tuple.  Internally we expand it into a
+  stronger task context with phase, current ball kinematics from the 960D
+  history, target crossing, and coarse route hints.
+  """
   if teacher_actor_obs.shape[-1] != GOALKEEPER_TEACHER_ACTOR_OBS_DIM:
     raise ValueError(
       "teacher_actor_obs must have final dimension "
@@ -80,7 +89,48 @@ def build_goalkeeper_student_obs(
   )
   teacher_actor_obs = teacher_actor_obs.expand(*batch_shape, GOALKEEPER_TEACHER_ACTOR_OBS_DIM)
   prediction_condition = prediction_condition.expand(*batch_shape, GOALKEEPER_PREDICTION_CONDITION_DIM)
-  return torch.cat([teacher_actor_obs, prediction_condition], dim=-1)
+  task_context = build_goalkeeper_task_context(teacher_actor_obs, prediction_condition)
+  return torch.cat([teacher_actor_obs, task_context], dim=-1)
+
+
+def build_goalkeeper_task_context(
+  teacher_actor_obs: torch.Tensor,
+  prediction_condition: torch.Tensor,
+) -> torch.Tensor:
+  """Build 19D context: phase, launch progress, ball state, target, route hints."""
+  idle = prediction_condition[..., 3:4].clamp(0.0, 1.0)
+  active = 1.0 - idle
+  launch_progress = active
+  time_to_crossing = prediction_condition[..., 2:3]
+  target_yz = prediction_condition[..., :2]
+  ball_history = teacher_actor_obs[..., :30].reshape(*teacher_actor_obs.shape[:-1], 10, 3)
+  ball_pos = ball_history[..., -1, :]
+  prev_pos = ball_history[..., -2, :]
+  ball_vel = torch.clamp((ball_pos - prev_pos) / 0.02, -10.0, 10.0) / 10.0
+  ball_pos_norm = torch.stack([
+    torch.clamp(ball_pos[..., 0] / 3.0, -1.5, 1.5),
+    torch.clamp(ball_pos[..., 1] / GOALKEEPER_CONDITION_Y_SCALE, -1.5, 1.5),
+    torch.clamp((ball_pos[..., 2] - GOALKEEPER_CONDITION_Z_CENTER) / GOALKEEPER_CONDITION_Z_SCALE, -1.5, 1.5),
+  ], dim=-1)
+  high = (target_yz[..., 1:2] > 0.35).to(dtype=teacher_actor_obs.dtype)
+  low = (target_yz[..., 1:2] < -0.35).to(dtype=teacher_actor_obs.dtype)
+  center_h = 1.0 - torch.clamp(high + low, 0.0, 1.0)
+  left = (target_yz[..., 0:1] > 0.2).to(dtype=teacher_actor_obs.dtype)
+  right = (target_yz[..., 0:1] < -0.2).to(dtype=teacher_actor_obs.dtype)
+  center_y = 1.0 - torch.clamp(left + right, 0.0, 1.0)
+  route_hint = torch.cat([left, center_y, right, high, center_h, low], dim=-1)
+  target_radius = torch.linalg.vector_norm(target_yz, dim=-1, keepdim=True).clamp(max=2.0) / 2.0
+  return torch.cat([
+    active,
+    idle,
+    launch_progress,
+    time_to_crossing,
+    ball_pos_norm,
+    ball_vel,
+    target_yz,
+    target_radius,
+    route_hint,
+  ], dim=-1)
 
 
 def goalkeeper_prediction_condition(

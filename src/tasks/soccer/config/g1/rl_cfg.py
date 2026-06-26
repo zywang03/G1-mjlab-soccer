@@ -290,7 +290,7 @@ class GoalkeeperStudentRunner(MjlabOnPolicyRunner):
     train_cfg["actor"].setdefault("condition_hidden_dim", _GK_STUDENT_CONDITION_HIDDEN_DIM)
     train_cfg["actor"].setdefault("ball_latent_dim", _GK_STUDENT_BALL_LATENT_DIM)
     train_cfg["critic"].setdefault("rnn_type", _RNN_TYPE)
-    train_cfg["critic"].setdefault("rnn_hidden_dim", _RNN_HIDDEN_DIM)
+    train_cfg["critic"].setdefault("rnn_hidden_dim", _GK_STUDENT_RNN_HIDDEN_DIM)
     train_cfg["critic"].setdefault("rnn_num_layers", _RNN_NUM_LAYERS)
 
   def __init__(self, env, train_cfg: dict, log_dir=None, device="cpu", **kwargs):

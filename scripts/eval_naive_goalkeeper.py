@@ -209,6 +209,44 @@ def _moe_bundle_from_checkpoint(loaded: dict) -> dict | None:
     return None
   if "sr" in loaded:
     return loaded
+  if loaded.get("moe6_residual") and isinstance(loaded.get("base_moe6"), dict):
+    base_bundle = loaded["base_moe6"]
+    if "sr" not in base_bundle:
+      return None
+    regions = loaded.get("residual_regions")
+    if regions is None:
+      regions_tensor = loaded.get("policy_state_dict", {}).get("_residual_regions")
+      if isinstance(regions_tensor, torch.Tensor):
+        regions = tuple(int(x) for x in regions_tensor.tolist())
+    if regions is None:
+      return None
+
+    adapted = dict(base_bundle)
+    adapted["sr"] = list(base_bundle["sr"])
+    policy_state = loaded.get("policy_state_dict")
+    if not isinstance(policy_state, dict):
+      return None
+    for idx in regions:
+      idx = int(idx)
+      expert = dict(base_bundle["sr"][idx])
+      base_actor_state = expert.get("actor_state_dict")
+      if not isinstance(base_actor_state, dict):
+        return None
+      merged_actor_state = dict(base_actor_state)
+      for key, value in policy_state.items():
+        if key.startswith("residual.") or key in ("_ballistic_marker", "distribution.std_param"):
+          merged_actor_state[key] = value
+      if "_marker" in policy_state:
+        merged_actor_state["_ballistic_marker"] = policy_state["_marker"]
+      expert["actor_state_dict"] = merged_actor_state
+      ballistic_meta = dict(expert.get("ballistic_residual", {}))
+      ballistic_meta["residual_scale"] = float(loaded.get("residual_scale", ballistic_meta.get("residual_scale", 0.25)))
+      expert["ballistic_residual"] = ballistic_meta
+      adapted["sr"][idx] = expert
+    for key in ("idle", "prepare", "idle_expert", "gate", "idle_speed_threshold", "idle_incoming_vx_threshold"):
+      if key in loaded:
+        adapted[key] = loaded[key]
+    return adapted
   actor_state = loaded.get("actor_state_dict")
   if isinstance(actor_state, dict) and "sr" in actor_state:
     return actor_state
@@ -227,18 +265,19 @@ def _hidden_dims_from_student_checkpoint(loaded: dict) -> tuple[int, ...]:
     hidden_dims = cfg["hidden_dims"]
   else:
     hidden_dims = []
-    layer_idx = 0
-    while True:
-      weight = actor_state.get(f"mlp.{layer_idx}.weight")
-      if not isinstance(weight, torch.Tensor):
-        weight = actor_state.get(f"mlp.mlp.{layer_idx}.weight")
-      if not isinstance(weight, torch.Tensor):
+    for prefix in ("active_head", "active_head.mlp", "prepare_head", "prepare_head.mlp", "mlp", "mlp.mlp"):
+      layer_idx = 0
+      candidate = []
+      while True:
+        weight = actor_state.get(f"{prefix}.{layer_idx}.weight")
+        if not isinstance(weight, torch.Tensor):
+          break
+        candidate.append(int(weight.shape[0]))
+        layer_idx += 2
+      if candidate:
+        hidden_dims = candidate[:-1]
         break
-      hidden_dims.append(int(weight.shape[0]))
-      layer_idx += 2
-    if hidden_dims:
-      hidden_dims = hidden_dims[:-1]
-    else:
+    if not hidden_dims:
       hidden_dims = (128, 64, 32)
   return tuple(int(x) for x in hidden_dims)
 
@@ -248,7 +287,9 @@ def _rnn_hidden_dim_from_student_checkpoint(loaded: dict) -> int:
   if isinstance(cfg, dict) and "rnn_hidden_dim" in cfg:
     return int(cfg["rnn_hidden_dim"])
   actor_state = loaded.get("actor_state_dict", {}) if isinstance(loaded, dict) else {}
-  weight = actor_state.get("rnn.rnn.weight_ih_l0")
+  weight = actor_state.get("prepare_rnn.rnn.weight_ih_l0")
+  if not isinstance(weight, torch.Tensor):
+    weight = actor_state.get("rnn.rnn.weight_ih_l0")
   if isinstance(weight, torch.Tensor) and weight.dim() == 2:
     return int(weight.shape[0] // 4)
   return 128
@@ -261,7 +302,7 @@ def _rnn_num_layers_from_student_checkpoint(loaded: dict) -> int:
   actor_state = loaded.get("actor_state_dict", {}) if isinstance(loaded, dict) else {}
   layer_ids = []
   for key in actor_state:
-    if key.startswith("rnn.rnn.weight_ih_l"):
+    if key.startswith(("prepare_rnn.rnn.weight_ih_l", "rnn.rnn.weight_ih_l")):
       try:
         layer_ids.append(int(key.rsplit("l", 1)[1]))
       except ValueError:
@@ -274,6 +315,10 @@ def _condition_hidden_dim_from_student_checkpoint(loaded: dict) -> int:
   if isinstance(cfg, dict) and "condition_hidden_dim" in cfg:
     return int(cfg["condition_hidden_dim"])
   actor_state = loaded.get("actor_state_dict", {}) if isinstance(loaded, dict) else {}
+  for key in ("phase_encoder.0.weight", "ball_encoder.0.weight", "target_encoder.0.weight"):
+    weight = actor_state.get(key)
+    if isinstance(weight, torch.Tensor) and weight.dim() == 2:
+      return int(weight.shape[0])
   weight = actor_state.get("condition_encoder.0.weight")
   if isinstance(weight, torch.Tensor) and weight.dim() == 2:
     return int(weight.shape[0])
@@ -299,7 +344,7 @@ def _student_action_dim(loaded: dict, env) -> int:
   if env_action_dim is not None:
     return int(env_action_dim)
   actor_state = loaded.get("actor_state_dict", {})
-  for key in ("mlp.6.weight", "mlp.mlp.6.weight"):
+  for key in ("active_head.6.weight", "active_head.mlp.6.weight", "mlp.6.weight", "mlp.mlp.6.weight"):
     weight = actor_state.get(key)
     if isinstance(weight, torch.Tensor):
       return int(weight.shape[0])
@@ -525,6 +570,7 @@ def run_headless_eval(cfg: EvalConfig, env, policy):
   blocked_count = 0
 
   for trial in range(cfg.num_trials):
+    _reset_policy(policy)
     stats = run_trial(env, policy)
     if not stats["ball_entered_goal"]:
       blocked_count += 1

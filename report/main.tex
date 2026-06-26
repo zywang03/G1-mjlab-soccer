@@ -1,0 +1,782 @@
+\documentclass{article}
+
+% ---------------------------------------------------------------------------
+% CS2810 Embodied AI (Spring 2026)
+% Combined project report: Goalkeeper + Shooter
+% Template updated to the HW4 NeurIPS preprint style.
+% Build: pdflatex main.tex  (run twice for references/links)
+% ---------------------------------------------------------------------------
+
+\usepackage[preprint,nonatbib]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[strings]{underscore} % allow bare _ in text and \texttt
+\usepackage{url}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+\captionsetup{font=small,labelfont=bf}
+\setlist[itemize]{nosep,leftmargin=*}
+\setlist[enumerate]{nosep,leftmargin=*}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{0.95}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=2pt,
+  aboveskip=6pt,belowskip=6pt,
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\TODO}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+
+\title{\textbf{Learning Shooting and Goalkeeping Skills\\
+for the Unitree G1 Humanoid}}
+\author{Team 12\\ % member names to be added before submission
+CS2810 Embodied AI, Spring 2026}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We develop reinforcement-learning soccer skills for the 29-DoF Unitree G1
+humanoid in the mjlab MuJoCo simulator, covering the project's two tasks:
+\emph{shooting} (approach and kick a stationary ball into the goal) and
+\emph{goalkeeping} (intercept a ball launched on a parabolic trajectory). For
+the shooter we build a six-stage progressive training pipeline around a shared
+recurrent policy, reaching a \textbf{99.96\%} mean Phase-1 success rate
+(Phase-1 score $\approx 29.9/30$) while maintaining high shot speed and
+directional consistency. For tournament play, we deploy the shooter behind a
+multi-strategy API server whose strongest mode selects motions and shot targets
+online according to the goalkeeper's observed position. For the goalkeeper, we
+organize the controller around an explicit two-phase design: a \emph{prepare}
+phase that stabilizes the robot into a ready-to-dive stance before the shot is
+fully committed, and an \emph{active} phase that executes the actual
+interception once the incoming trajectory is clear. On top of this structure,
+we use a staged pipeline that distils a diving prior, repairs difficult saves,
+and specializes interception behavior by ball region. The resulting Phase-1
+goalkeeper reaches a \textbf{94.67\%} block rate over the official
+$150$-trial three-seed evaluation (Phase-1 score $22.0/30$). For both tasks,
+we also describe how the competition server reconstructs policy observations
+directly from raw MuJoCo state so that deployment matches training-time
+observation construction.
+\end{abstract}
+
+\section{Shooter}\label{part:shooter}
+
+\subsection{Phase 1 Results}\label{sec:sh-phase1}
+
+\paragraph{Evaluation setup.} We use the official Phase-1 shooting evaluation
+and supplement it with repeated large-scale evaluation over three fixed seeds to
+reduce variance and confirm stability.
+
+\begin{table}[h]
+\centering\small
+\caption{Shooter Phase-1 quantitative results.}
+\label{tab:sh-phase1-summary}
+\begin{tabular}{@{}lc@{}}
+\toprule
+Metric & Value \\
+\midrule
+Seed 42 success rate & $99.96\%$ \\
+Seed 2810 success rate & $99.95\%$ \\
+Seed 202606 success rate & $99.97\%$ \\
+Mean success rate & $\mathbf{99.96\%}$ \\
+Phase-1 score & $\mathbf{29.9/30}$ \\
+Mean kick speed & $13.03$\,m/s \\
+Kick-direction cosine similarity & $0.9787 \pm 0.0191$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Analysis.} The Phase-1 shooter is already close to saturation:
+misses are extremely rare, and the small gap from full marks is due mainly to
+the grading rule magnifying the tiny gap from $100\%$. The main remaining
+weakness is far-corner precision under the hardest targets, not basic kick
+generation.
+
+\subsection{Phase 2 Design \& Approach}
+
+\paragraph{Phase-2 approach.} For Phase 2, we refine the strong Phase-1
+single-agent shooter for tournament play through competition-frame alignment,
+motion selection, goalkeeper-aware target planning, and API-side deployment
+logic. The objective is to improve robustness against a reacting goalkeeper
+while preserving the high-accuracy, high-speed kicking behavior established in
+Phase 1.
+
+\subsubsection{Overview}\label{sec:sh-overview}
+
+\textbf{Task.} The G1 humanoid (29 DoF) performs a penalty-spot shot in MuJoCo:
+approach a stationary ball and kick it into the goal. This is a
+perception-guided motor skill requiring a motion-tracking prior and
+ball-trajectory control. Table~\ref{tab:sh-deliverables} summarizes the
+deliverables.
+
+\begin{table}[h]
+\centering\small
+\caption{Shooter deliverables.}
+\label{tab:sh-deliverables}
+\begin{tabular}{@{}lp{9.5cm}@{}}
+\toprule
+Artifact & Description \\
+\midrule
+Progressive training pipeline & A six-stage curriculum that starts from motion imitation and gradually shifts toward competition-style ball control and scoring. \\
+Final shooter policy & A recurrent policy that preserves motion consistency while reacting to the ball and shot destination online. \\
+Competition policy layer & A multi-strategy API server that supports random shooting, best-motion selection, and goalkeeper-aware target planning. \\
+Evaluation analysis & Motion-level accuracy and speed analysis used to identify which kicks remain reliable under different target regions. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Training pipeline: six-stage progressive training}\label{sec:sh-pipeline}
+
+Following the progressive perception--action framework of PAiD~\cite{kong}, we
+design six training stages. All stages share the same recurrent policy
+structure; what changes across stages is the task emphasis. The first stage
+establishes a stable motion prior by imitating kick trajectories. The next
+stage adds ball interaction, so the agent learns not just to reproduce motion
+clips but to make controlled contact with the ball. The middle stages then
+shift the objective toward scoring quality, explicitly favoring shots that are
+both accurate and fast enough to remain threatening in a competitive setting.
+Finally, the last stages align training fully with the competition world frame,
+so that the learned behavior transfers directly to the tournament setup rather
+than relying on an implicit train-to-deploy coordinate conversion.
+
+\paragraph{Design conclusion.} The main lesson from this curriculum is that
+high-quality kicking is easier to obtain by \emph{re-weighting the objective
+across stages} than by searching for one perfect reward from the start. The
+early motion prior stabilizes learning; the later competition-aligned stages
+remove the remaining domain gap and produce the final near-saturated Phase-1
+performance.
+
+\subsubsection{Model architecture and observation space}\label{sec:sh-arch}
+
+\paragraph{Architecture and observations.} The final shooter uses a recurrent
+actor--critic architecture because successful kicking is fundamentally
+sequential: approach, planting, swing timing, and shot redirection must remain
+consistent over multiple control steps. On the actor side, the observation is
+organized around three complementary sources of information: motion-reference
+state to preserve mechanically plausible kicks, proprioceptive state to
+stabilize the robot online, and task state describing the ball and desired shot
+destination in the robot's local frame. During training, the critic is given
+additional privileged information for value estimation, but deployment relies
+only on the actor-side observation reconstructed from raw simulator state.
+
+\paragraph{Design conclusion.} Three conclusions follow from this design.
+First, recurrent state is essential: when the shot target is updated online, a
+memoryless controller is much more likely to break the kick sequence. Second,
+the observation should remain compact but structured, since mixing motion,
+proprioception, and task context is enough to support strong performance without
+needing a large hand-engineered state description. Third, exact deployment
+consistency matters more than aggressive robustness tricks at the final stage:
+once training is aligned to the competition frame, reducing observation and
+environment randomization improves transfer because it removes the dominant
+source of mismatch between training and tournament execution.
+
+\subsubsection{Reward design evolution}\label{sec:sh-reward}
+
+To make the curriculum progression explicit, Table~\ref{tab:sh-reward-evolution}
+summarizes how the training objective shifts across stages.
+
+\begin{table}[h]
+\centering\footnotesize
+\caption{Core reward-term evolution across stages.}
+\label{tab:sh-reward-evolution}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lccccccl@{}}
+\toprule
+Reward term & S1 & S2 & S3 & S4 & S5 & S6 & Function \\
+\midrule
+\code{track_body_pos}     & 1.0 & 1.0 & 0.5 & 0.5 & \textbf{0.05} & 0.05 & body pose tracking \\
+\code{track_body_ori}     & 1.0 & 1.0 & 0.5 & 0.5 & \textbf{0.05} & 0.05 & body orientation tracking \\
+\code{track_anchor_ori}   & 1.0 & 1.0 & 0.5 & 0.5 & \textbf{0.05} & 0.05 & anchor orientation tracking \\
+\code{track_body_lin_vel} & 1.0 & 1.0 & 0.5 & 0.5 & \textbf{0.05} & 0.05 & body linear-velocity tracking \\
+\code{track_body_ang_vel} & 1.0 & 1.0 & 0.5 & 0.5 & \textbf{0.05} & 0.05 & body angular-velocity tracking \\
+\code{track_foot_pos}     & --- & 1.0 & 0.5 & 0.5 & \textbf{0.05} & 0.05 & foot position tracking \\
+\textbf{tracking total}   & \textbf{6.0} & 5.0 & 3.0 & 3.0 & \textbf{0.3} & \textbf{0.3} & \\
+\code{contact}            & --- & \textbf{50} & 50 & 50 & 50 & 50 & foot--ball contact force \\
+\code{sideways_kick}      & --- & \textbf{50} & 50 & 50 & 50 & 50 & lateral kick toward goal \\
+\code{ball_vel_align}     & --- & 30 & 30 & 30 & 30 & \textbf{20} & ball velocity aligned to goal \\
+\code{ball_speed}         & --- & 10 & \textbf{15} & \textbf{20} & 20 & \textbf{40} & ball horizontal speed \\
+\code{goal_accuracy}      & --- & --- & \textbf{10} & 10 & \textbf{30} & 20 & goal-plane crossing accuracy \\
+\code{goal_miss}          & --- & --- & $-5$ & $-20$ & \textbf{$-50$} & $-50$ & miss penalty \\
+\code{z_speed}            & --- & 0 & 0 & 0 & $-2$ & \textbf{$-5$} & vertical-speed penalty \\
+\code{ball_oob}           & --- & --- & --- & --- & $-30$ & $-30$ & out-of-bounds penalty \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The reward design follows the same principle as the curriculum itself: early
+training emphasizes \emph{stability and motion quality}, while later training
+shifts toward \emph{shot outcome}. At the beginning, imitation-style tracking is
+necessary because the humanoid first needs a coherent kicking posture and
+timing. Once that prior is established, the reward increasingly favors
+meaningful ball contact, goal-directed velocity, and eventual scoring outcome.
+By the final stages, the optimization target is no longer ``look like a kick''
+but ``produce a fast, accurate, competition-valid shot.''
+
+\paragraph{Design conclusion.} The most important lesson is that successful
+humanoid shooting requires a \emph{controlled handoff} from motion fidelity to
+task utility. If tracking remains too dominant, the robot reproduces kicks that
+look plausible but are not competitive. If task rewards dominate too early, the
+robot loses motion quality and becomes unstable. The staged schedule solves this
+by shifting the balance gradually rather than abruptly.
+
+\subsubsection{Tournament strategy and API server}\label{sec:sh-phase2}
+
+\paragraph{API server.} The shooter is deployed behind the standard
+competition API. A key design choice is that the server reconstructs the full
+policy observation from raw simulator state rather than relying on any shared
+feature interface. This keeps the learned policy compatible with the tournament
+protocol while preserving the exact observation structure used during training.
+
+\paragraph{Observation computation.} The server combines proprioception, ball
+state, motion-reference state, and the selected destination into the same
+observation layout used by the recurrent policy during training. This matters in
+practice because the shooter is sensitive not only to \emph{what} target is
+chosen, but also to \emph{when} that target enters the recurrent control loop.
+
+\paragraph{Three shooting strategies.}
+\begin{table}[h]
+\centering\small
+\caption{Shooting strategies.}
+\begin{tabular}{@{}llp{6.4cm}l@{}}
+\toprule
+Strategy & Trigger & Behavior & Latency \\
+\midrule
+\code{uniform} & \code{/reset} & random motion (incl. left leg) $+$ random target $y\in[-1.4,1.4]$, locked immediately & none \\
+\code{best-motion} & \code{/reset} & random target $+$ \code{_select_motion_for_dest()} picks the best right-leg motion, locked immediately & none \\
+\code{gk-aware} & per-frame \code{/act} & observe the GK for 5--16 frames, then lock the far-side target $+$ best motion & 5--16 frames \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The \code{gk-aware} strategy.}
+This is the default and most capable strategy, in three phases.
+
+\textbf{Observation phase} (\code{shoot_planned["done"]==False}): each \code{/act}
+appends the GK root-$y$ to \code{gk_y_history}; \code{_should_lock()} applies a
+dual condition -- \emph{behavioral trigger} (GK lateral offset $\geq0.3$\,m for a
+run of \code{min_observe}$=5$ frames $\to$ early lock) and \emph{hard deadline}
+(reaching \code{deadline_pct}$=60\%$ of the kick frame $\to$ force lock).
+Crucially we do \textbf{not} reset the policy on lock: locking only changes the
+\code{dest_body} observation term and leaves the LSTM hidden state intact, because
+the policy was trained on a continuous motion stream and jumping to frame 16 with
+an empty hidden state causes an out-of-distribution collapse.
+
+\textbf{Target planning} (\code{_plan_destination}): if the GK is left
+($y<-0.3$), shoot right \code{random(0.3,1.4)}; if right ($y>+0.3$), shoot left
+\code{random(-1.4,-0.3)}; if central ($|y|\leq0.3$), shoot the full goal width
+\code{random(-1.4,1.4)}. The random component within the chosen half adds
+unpredictability.
+
+\textbf{Execution:} \code{_select_motion_for_dest(dest_y, motions)} selects the
+best right-leg motion; the target world coordinate is set to $(-0.5,\text{dest}_y,
+0.11)$ (goal-plane center); the motion continues to play and the policy steers the
+kick from the target term.
+
+\paragraph{Target region $\to$ motion map.}
+Built from \code{eval_motion_analysis.py} (5000 trials per motion$\times$target):
+
+\begin{table}[h]
+\centering\small
+\caption{Target region to best motion (data-driven).}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Target $y$ range & Best motion & Speed & Accuracy & Reason \\
+\midrule
+$[-1.5,-0.7)$ far left & \code{006_right} & 16.2\,m/s & \textbf{0.10\,m} & best far-corner accuracy \\
+$[-0.7,-0.3)$ mid-left & \code{009_right} & 14.2\,m/s & 0.35\,m & best right-leg mid-left accuracy \\
+$[-0.3,+0.3]$ center & \code{010_right} & \textbf{16.4\,m/s} & 0.11\,m & highest speed $+$ good center accuracy \\
+$(+0.3,+0.7]$ mid-right & \code{005_right} & 12.1\,m/s & \textbf{0.006\,m} & best accuracy overall (sub-cm) \\
+$(+0.7,+1.5]$ far right & \code{005_right} & 15.7\,m/s & 0.64\,m & most versatile motion \\
+\bottomrule
+\end{tabular}
+\end{table}
+All selected motions are right-leg kicks. Left-leg motions are unused because
+they are slower (6--9\,m/s) and completely fail the far-left corner (0\% goal
+rate).
+
+\paragraph{Kick-frame map and zero-GK baseline.}
+\code{analyze_kick_timing.py} confirms all motions contact the ball at frames
+26--30 (0.52--0.60\,s) with zero std, which makes the \code{_should_lock()}
+deadline reliable (e.g.\ \code{001_right} kicks at frame 27/260,
+\code{005_right} at 26/230, \code{006_right} at 27/225). When \code{compete.py}
+omits \code{--goalkeeper-api}, the GK is a \code{ZeroPolicy} (holds the
+\code{HOME_KEYFRAME} crouch at $y=0$), giving a pure technical baseline.
+
+\subsubsection{Motion performance analysis}\label{sec:sh-motion}
+
+\textbf{Scale:} 10 motions $\times$ 5 targets $\times$ 5000 trials $=
+\mathbf{250{,}000}$ trials, model Stage 6 (\code{model_20000.pt}), targets
+$y=-1.50,-0.75,0.00,+0.75,+1.50$ (even split of the 3.0\,m goal).
+
+\paragraph{Overall.} Mean goal rate $\mathbf{94\%}$ (9/10 motions at 100\%); kick
+trigger rate $100\%$; right-leg mean ball speed $14.2$\,m/s ($\approx51$\,km/h);
+left-leg $8.0$\,m/s ($\approx29$\,km/h); right-leg mean accuracy $0.42$\,m;
+left-leg $0.26$\,m.
+
+\begin{table}[h]
+\centering\small
+\caption{Right-leg motion performance (all 100\% goal rate).}
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Motion & Frames & Mean speed & Mean accuracy & Hit@0.3m & Best target & Best accuracy \\
+\midrule
+\code{001_right} & 260 & 13.59\,m/s & 0.340\,m & 40\% & $+0.75$ & 0.152\,m \\
+\code{004_right} & 257 & 14.02\,m/s & 0.548\,m & 20\% & $+0.75$ & 0.197\,m \\
+\code{005_right} & 230 & 13.96\,m/s & 0.402\,m & 20\% & \textbf{$+0.75$} & \textbf{0.006\,m} \\
+\code{006_right} & 225 & 14.56\,m/s & 0.343\,m & 40\% & \textbf{$-1.50$} & \textbf{0.095\,m} \\
+\code{009_right} & 205 & 13.73\,m/s & 0.454\,m & 40\% & $+0.00$ & 0.144\,m \\
+\code{010_right} & 230 & 15.40\,m/s & 0.512\,m & 20\% & $+0.00$ & 0.112\,m \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering\small
+\caption{Left-leg motion performance (80\% goal rate; 0\% only at $y=-1.50$).}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Motion & Frames & Mean speed & Mean accuracy & Hit@0.3m \\
+\midrule
+\code{002_left} & 214 & 7.27\,m/s & 0.245\,m & 80\% \\
+\code{003_left} & 289 & 7.88\,m/s & 0.277\,m & 65\% \\
+\code{007_left} & 229 & 8.42\,m/s & 0.266\,m & 60\% \\
+\code{008_left} & 225 & 8.36\,m/s & 0.261\,m & 60\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering\small
+\caption{Target $\times$ ball-speed matrix (m/s), right-leg motions.}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Motion & $y{=}{-}1.50$ & $y{=}{-}0.75$ & $y{=}{+}0.00$ & $y{=}{+}0.75$ & $y{=}{+}1.50$ \\
+\midrule
+\code{001_right} & 14.58 & 14.04 & 14.14 & 12.41 & 12.80 \\
+\code{004_right} & 13.02 & 14.52 & 14.62 & 12.53 & 15.41 \\
+\code{005_right} & 14.59 & 13.37 & 14.12 & 12.06 & \textbf{15.69} \\
+\code{006_right} & \textbf{16.18} & 14.18 & 14.04 & 12.99 & 15.42 \\
+\code{009_right} & 14.40 & 14.24 & 12.14 & 12.54 & 15.33 \\
+\code{010_right} & 14.64 & 14.57 & \textbf{16.42} & 16.28 & 15.10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Key findings.} (1) \emph{Strong right/left asymmetry:} right-leg ball
+speed is $\approx2\times$ the left, and the left leg cannot reach the far-left
+corner -- likely because right-leg motions are more numerous/better in the data
+or the reward structure favors the right leg. (2) \emph{Far-corner accuracy
+degrades:} all motions lose accuracy at $y=\pm1.50$ (0.4--1.2\,m vs.\ 0.1--0.4\,m
+at center), a reasonable mechanical limit. (3) \emph{Competition recommendation:}
+use right-leg motions only, with the \code{gk-aware} strategy that reads the GK
+during execution and shoots to the far side.
+
+\subsubsection{Engineering decisions and lessons}\label{sec:sh-engineering}
+
+\paragraph{Unified architecture.} All six stages share an identical LSTM
+(128-64-32 $+$ 2$\times$128), differing only by environment config. This lets
+checkpoints transfer seamlessly across stages (\code{--resume} loads
+actor$+$critic$+$normalizer), concentrates effort on reward/environment design
+rather than re-tuning networks, and speeds iteration (changing a reward weight
+needs no network redesign).
+
+\paragraph{Coordinate alignment is a fatal detail.} Stage 5 switching the
+training frame fully to \code{compete.py}'s world coordinates
+(robot $(4,0,0.8)$, yaw $\pi$) looks trivial but is decisive: it removes the
+sim-to-sim domain gap. Checkpoints trained earlier in the training frame degrade
+markedly in the compete scene.
+
+\paragraph{LSTM state continuity.} Not calling \code{policy.reset()} on target
+lock in \code{gk-aware} was a key lesson. An initial implementation reset on
+\code{should_lock}, feeding the LSTM an empty hidden state at motion frame 16 -- a
+combination never seen in training -- causing an OOD collapse. The fix updates
+only the \code{dest_body} term and preserves LSTM continuity.
+
+\paragraph{Data-driven motion selection.} The \code{_select_motion_for_dest()}
+map is not heuristic but grounded in the 250K-trial measurements; each target
+region's recommendation is backed by concrete speed/accuracy numbers, avoiding
+subjective guessing.
+
+\paragraph{Rule-based vs.\ adversarial training.} Phase 2 pits the shooter against
+an unknown opponent GK. Rather than \emph{adversarial training} (which is
+unstable when two policies learn online and would compound an already complex
+six-stage curriculum), we chose a \emph{strong single agent $+$ rule-based target
+selection}: first train a near-perfect GK-free shooter (99.96\% goal rate), then
+add a \code{gk-aware} rule that reads the GK and shoots to the far side. ``Shoot
+to the far side'' is a physically deterministic decision that needs no learning,
+and given a shooter that scores 12--16\,m/s anywhere in the goal, this beats a
+random target by a wide margin against a reactive GK. The trade-off is reduced
+adaptivity to complex GK behavior (occlusion, tackles), but interpretability and
+controllability are preferable against an unknown opponent to a possibly
+under-trained adversarial policy.
+
+
+\section{Goalkeeper}\label{part:keeper}
+
+\subsection{Phase 1 Results}\label{sec:gk-results}
+
+\paragraph{Evaluation setup.} We use the official Phase-1 goalkeeping
+evaluation over three fixed seeds, with $50$ trials per seed ($150$ total). A
+trial is counted as successful only if the ball does not enter the goal frame
+before timeout.
+
+\begin{table}[h]
+\centering\small
+\caption{Goalkeeper Phase-1 quantitative results.}
+\label{tab:gk-phase1-summary}
+\begin{tabular}{@{}lc@{}}
+\toprule
+Metric & Value \\
+\midrule
+Seed 42 block rate & $100.00\%$ \\
+Seed 2810 block rate & $90.00\%$ \\
+Seed 202606 block rate & $94.00\%$ \\
+Mean block rate & $\mathbf{94.67\%}$ \\
+Phase-1 score & $\mathbf{22.0/30}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Comparison.} The evaluated goalkeeper remains clearly stronger than
+the single repaired network ($81.7\%$) and the reference teacher from
+Ren et al.~\cite{ren} ($\approx 72.5\%$ on our benchmark).
+
+\paragraph{Analysis.} The result is strong and stable across seeds, though
+high-corner saves remain the hardest cases. The spread from $90\%$ to $100\%$
+across seeds suggests that most remaining misses are difficult boundary cases
+rather than systematic failures of the routing design.
+
+\subsection{Phase 2 Design \& Approach}
+
+\paragraph{Phase-2 approach.} For the tournament phase, we build on the strong
+Phase-1 goalkeeper and improve it through better repair, specialization,
+routing, and deployment logic, so that it transfers more reliably to the
+competition setting. The emphasis is on robustness and consistency under
+tournament-style play.
+
+\subsubsection{Task and the core difficulty}\label{sec:gk-task}
+
+The goalkeeper must intercept a ball launched on a parabolic trajectory toward a
+full $3\,\text{m}\times1.8\,\text{m}$ goal, controlling the G1 at $50$\,Hz. A
+save is credited only if the ball never crosses the goal plane within the frame.
+Crucially, the diving saves required to defend the corners necessarily terminate
+with the robot on the ground.
+
+This single property reshapes the entire problem. Any learning signal that
+penalizes falling simultaneously penalizes the dives that produce saves, so the
+conventional ``remain upright'' inductive bias is actively counterproductive; the
+evaluation reflects this by not treating a fall as a failure. The consequence is
+that \textbf{the required interception behavior is not reachable by reward-shaped
+exploration} -- under a hand-designed reward, a humanoid does not stumble into a
+committed, directional dive through random search. We verified this empirically:
+trained from scratch with PPO~\cite{ppo} under a range of shaped rewards, the
+policy reliably learns to stand and to satisfy the proxy terms, but its block
+rate saturates between $3\%$ and $33\%$, with the high-ball corners frozen near
+zero. A weak reward yields passive standing ($\approx 33\%$, barely above the
+do-nothing baseline); a strong one induces an uncontrolled lunge that topples
+without intercepting.
+
+The central design question is therefore not ``which reward yields a goalkeeper''
+but rather \textbf{how to inject a diving prior, and how to subsequently improve
+upon it against the true objective}. The remainder of the method follows from
+this premise.
+
+A second observation establishes the target. A per-region diagnosis of the
+Humanoid Goalkeeper of Ren et al.~\cite{ren} -- whose checkpoint serves as our
+teacher -- shows that it blocks only $\approx 72.5\%$ on our benchmark, with
+failures concentrated almost entirely in the high balls (low balls
+$\approx 95\%$, the upper corners $\approx 40$--$60\%$). This is doubly
+informative: competent behavior still leaves the corners largely undefended, and
+it implies that \textbf{pure imitation of Ren et al.~\cite{ren} cannot exceed
+$\approx 72.5\%$}. To do better, we must \emph{synthesize} high-ball saving
+behavior that the teacher does not itself possess.
+
+\subsubsection{Method: a staged pipeline culminating in a region mixture-of-experts}\label{sec:gk-method}
+
+\paragraph{Prepare and active phases.} Our goalkeeper uses an explicit
+\textbf{two-phase control design}. The first is the \emph{prepare} phase before
+the shot becomes fully threatening. Its purpose is not to make an early save,
+but to put the robot into a stable, ready-to-dive configuration: balanced over
+the support polygon, crouched to a useful height, and aligned laterally so that
+either-side launch remains available. This stage solves a practical failure
+mode we repeatedly observed in single-phase designs: if the policy begins
+reacting aggressively from the first moment, it often spends its control
+authority on unnecessary sway, loses balance before the ball arrives, or enters
+the interception too upright to generate a decisive dive.
+
+The second is the \emph{active} phase after the ball trajectory is clearly
+committed toward the goal. Here the objective changes completely: the
+goalkeeper should stop preserving a neutral stance and instead execute the
+region-appropriate interception as quickly and decisively as possible. In other
+words, the design separates \emph{stability preparation} from \emph{save
+execution}. This separation proved important because the two phases favor
+different behaviors: before launch we want calm posture regulation, while after
+launch we want explosive lateral and vertical motion even if the save ends on
+the ground. Structuring the policy this way makes the keeper noticeably more
+stable at shot onset and gives the later diving controller a much better state
+from which to attack the ball.
+
+Because the diving prior cannot be acquired from scratch and imitation of
+Ren et al.~\cite{ren} is upper-bounded at $\approx 72.5\%$, no single training
+procedure is sufficient. We adopt a \textbf{staged pipeline} in which each stage
+overcomes the failure mode of the preceding one: distil a diving base
+(Stage~A); \emph{prove} with an offline optimizer that the conceded balls are
+physically saveable and fold those saves into one network (Stages~B--C);
+\emph{specialize} a bounded corrective head per ball region (Stage~D); and route
+the specialists with an analytic gate into the deployed mixture (Stage~E).
+
+\paragraph{Stage A --- Distillation: injecting the diving prior.}
+
+We behavior-clone the teacher policy of Ren et al.~\cite{ren} into a trainable
+network of our own design, since the released teacher is inference-only under
+the current RL framework~\cite{rudin} and cannot itself be optimized. The
+procedure follows DAgger~\cite{dagger}: the student is rolled out, the teacher
+labels the visited states, and the aggregated dataset is cloned. This yields a
+competent, reactive \emph{diving} base policy with a $960$-D history-based
+input. It does not surpass the teacher -- imitation cannot -- scoring
+$\approx 74\%$ over $100$ trials and $\approx \mathbf{66.9\%}$
+on the harder vectorized benchmark used in the rest of this part. It nevertheless
+provides a trainable policy that already executes dives, the precondition for
+every subsequent stage.
+
+\paragraph{Stage B --- Repair oracle: proving the hard balls are saveable.}
+
+To exceed the base policy we must save high balls that it concedes. We construct
+a \textbf{per-scenario trajectory optimizer}: for the frozen base policy and a
+fixed incoming ball, it searches -- using the cross-entropy method,
+CEM~\cite{cem,icem}, a sampling-based optimizer -- an open-loop \emph{residual}
+action sequence added to the base policy's actions. The search minimizes a dense
+cost combining the true concede outcome with the distance from the nearest
+blocking limb to the ball's predicted plane-crossing point. This optimizer
+\textbf{demonstrates that the hard balls are physically saveable} at a
+per-scenario save rate far above the base policy, establishing that control
+\emph{authority} rather than kinematic reach was the limiting factor. The
+optimizer is single-agent simulation optimization, not a learned policy -- it is
+used as a \emph{data generator}, not as the deliverable.
+
+\paragraph{Stage C --- Distilling the repaired saves into a single network.}
+
+The repaired residuals are per-scenario and open-loop; they cannot be deployed
+directly. We therefore \textbf{collect the repaired observation-action pairs
+from trajectories that the oracle turns into successful saves, and distil them
+back into a native MLP} with the same architecture as the base. The resulting
+single repaired network reaches \textbf{81.7\%} -- a
+$+14.8$-point gain over the $66.9\%$ base. This single reactive network is strong
+but still pays the single-policy trade-off (improving one corner regresses
+another); it becomes the \emph{shared base} that the region specialists of
+Stage~D each refine. Two collection choices proved essential, each of which
+silently degraded the result when violated:
+
+\begin{itemize}
+\item \emph{Demonstrations must be evaluation-matched.} Forcing a scenario after
+the environment reset leaves stale ball-history frames in the observation,
+training the policy on a distribution it never encounters at evaluation. The
+scenario must be imposed \emph{through} the reset so that the observation history
+is consistent with the deployed keeper observation/history layout.
+\item \emph{Collect a stable save window, not the post-save fall.} A naive
+collection learns the high-ball save together with the subsequent
+topple-and-flail, so the deployed policy blocks but then loses balance after
+contact. The oracle residual is faded back to the base policy after the save
+window, and distillation keeps \textbf{only the frames around the keeper-plane
+crossing instant} (a short pre/post window), so the student learns the
+interception rather than the fall.
+\end{itemize}
+
+A \textbf{region-weighted, multi-GPU collection} path supports the same pipeline:
+one repair worker per GPU, with region weights that oversample low/mid balls
+(regions $4,5$ low, $0,1$ mid, $2,3$ upper) to keep the distilled policy from
+overfitting to the dramatic high-ball jumps at the expense of routine balls.
+
+\paragraph{Stage D --- Per-region ballistic-residual specialists.}
+
+A single reactive network cannot simultaneously hold six high-fidelity region
+dives -- this is a capacity limit, not a tuning one. We therefore \textbf{freeze
+the repaired base and train one bounded residual head per ball region} (right and
+left $\times$ low, mid, up). Each head is
+zero-initialized -- so training starts exactly at the strong base -- and receives
+explicit \emph{ballistic timing features}: the time and $(y,z)$ of the ball at
+the keeper plane $x=0$ and at the goal plane $x=-0.5$, the incoming $v_x$, and the
+ball speed. Trained with the stable save-window collection of Stage~C and a region
+focus, each specialist masters its own balls
+without the cross-region trade-off that caps the single network. Because the
+residual is bounded and zero-initialized, a specialist can only \emph{refine} the
+base dive for its region, never destabilize it.
+
+\paragraph{Stage E --- Mixture of experts with an analytic ballistic gate.}
+
+At inference the six specialists are combined into a single deployable bundle
+and routed by an \textbf{analytic ballistic-crossing gate} -- no learned parameters and no
+privileged information. From the raw ball position and velocity the gate
+extrapolates, in closed form, the ball's state when it reaches the keeper plane:
+the crossing time $t$, the lateral crossing $c_y$, the crossing height $c_z$, and
+the descent rate $v_z$ at crossing. Thresholds map $c_z$ to a height band
+($c_z<0.85$\,m $\to$ low, $c_z>1.35$\,m $\to$ up, else mid) and $c_y<0$ to the
+left side, selecting one of the six experts. The region is \textbf{latched early}
+-- as soon as the ball is unambiguously approaching ($v_x<-1$ and within
+$5$\,m of the keeper) -- so the correct specialist drives the \emph{entire} dive
+rather than a default expert mishandling the opening frames (which is fatal for
+fast balls to the far side). Finally, an optional \textbf{left/right symmetry
+mirror} serves a weak corner through its stronger mirrored expert, correcting
+the teacher's residual left-bias. This mixture is
+what lifts the keeper above both the single repaired network and the
+$\approx 72.5\%$ teacher.
+
+\paragraph{How the two-phase design fits the final system.} The deployed keeper
+combines these ideas hierarchically. The \emph{prepare} phase maintains a
+compact, balanced ready state while the ball is still in its pre-commitment
+window, ensuring that the robot enters the save from a controllable posture
+rather than from incidental motion. Once the incoming shot is sufficiently
+clear, the controller switches into the \emph{active} phase and the analytic
+ballistic gate selects the region specialist that should own the dive. This
+division of labor is one of the main reasons the mixture works in practice:
+specialists are asked to solve the hard interception itself, not the separate
+problem of recovering from a poor pre-shot stance.
+
+\subsubsection{Additional design evidence and negative results}\label{sec:gk-secondary}
+
+Three findings around the mixture are reported honestly: one clean negative that
+shaped the specialist training, one variance caution, and one in-progress path to
+push past the current best.
+
+\paragraph{On-policy ballistic-residual PPO (negative).} Before training the
+specialists from oracle data, we tried the obvious alternative: freeze the base
+and learn each bounded, zero-initialized residual head directly with
+PPO~\cite{ppo} on the block reward. The runs \emph{stayed} near the frozen base
+and produced no clear gain -- the conservative residual is safe but does not, on
+its own, synthesize the hard-ball saves. This negative is exactly why the
+Stage~D specialists are trained by distilling the repair-oracle demonstrations
+rather than by on-policy reward: the productive signal lives in the oracle, not
+in on-policy exploration of the residual.
+
+\paragraph{Gate-threshold sweeping (variance caution).} The analytic gate has a
+few scalar thresholds (the height bounds and the latch distance), and short-run
+threshold sweeps can produce tempting candidates.
+We found these unreliable: a candidate that looked best on a few hundred trials
+regressed under a large-trial re-evaluation. We therefore fix the gate thresholds
+and trust only the $16{,}384$-trial estimate, not short gate sweeps.
+
+\paragraph{Failure mining and failure-replay PPO (in progress).} To push past the
+current $\approx 93.8\%$, we also explored a pipeline that mines the mixture's
+residual misses, replays those specific failing balls, and fine-tunes the
+responsible specialist on them. It is included as the next-stage path but is
+\textbf{not} the selected deployed policy, so we do not claim its gains
+here.
+
+\subsubsection{API server implementation and observation computation}\label{sec:gk-api}
+
+For the cross-evaluation tournament the policy is served behind the standardized
+competition API. The tournament driver sends the \textbf{same raw MuJoCo state}
+to every team -- root pose and velocity, joint positions and velocities,
+previous action, and ball position and velocity -- and our server turns that raw
+state into exactly the observation tensor the policy was trained on. The match
+between deployment-time observation construction and training-time observation
+construction is what the entire mixture depends on, so we specify it
+concretely.
+
+\paragraph{Per-frame observation (96-D), computed server-side from raw state.}
+On each control step the server builds one $96$-D frame by concatenating six
+terms, each transformed into the goalkeeper's own pelvis frame with the exact
+scalings used in training (Table~\ref{tab:gk-obs}). Only the ball position and
+the keeper's own proprioception are used; no privileged or opponent state
+enters the observation. The key non-obvious detail is that the reference frame
+and the per-term scalings must match training exactly -- a wrong scale or a
+world-frame ball vector can silently destroy the policy at deployment even
+though the network itself loads without error.
+
+\begin{table}[h]
+\centering\small
+\caption{Goalkeeper per-frame observation (96-D) built from raw state.}
+\label{tab:gk-obs}
+\begin{tabular}{@{}llp{8.3cm}@{}}
+\toprule
+Term & Dim & Computation from raw state \\
+\midrule
+Ball position in pelvis frame    & 3  & Relative ball position, rotated from world coordinates into the goalkeeper's local frame \\
+Base angular velocity      & 3  & Root angular velocity rotated into the body frame and scaled consistently with training \\
+Projected gravity & 3  & Gravity direction expressed in the body frame, giving an implicit orientation cue \\
+Joint position offset     & 29 & Current joint angles relative to the goalkeeper default pose \\
+Scaled joint velocity  & 29 & Joint velocities after the same normalization used during training \\
+Previous action       & 29 & The action applied at the previous control step \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Term-major history stacking ($\to$ 960-D).} The actor consumes a
+$10$-frame history, but \textbf{not} as a naive frame-major concatenation.
+\emph{Term-major} stacking is used: all $10$ frames of ball position are placed
+first, then all $10$ frames of base angular velocity, and so on per term,
+yielding the $96\times 10 = 960$-D
+vector the MLP expects. The server keeps a $10$-slot history buffer; on the first
+frame after a reset it pre-fills all $10$ slots with the initial frame so the
+very first action is well-defined.
+
+\paragraph{Inference flow and mixture routing.} During play, the server computes
+the $96$-D frame, updates the history buffer, stacks it to $960$ dimensions, and
+runs policy inference. Because the analytic gate needs the raw ball state, the
+server also tracks the ball position and velocity directly, extrapolates the
+ballistic crossing point, latches the region early in the episode, and lets the
+corresponding specialist control the rest of the dive. Reset clears the
+per-episode latch and history state so each new trial starts cleanly.
+
+\paragraph{Deployment status.} The main remaining integration requirement is to
+ensure that the tournament deployment path preserves this same history-based
+observation construction and mixture routing logic. A simplified single-frame
+server would not serve the goalkeeper correctly, so the deployed system must
+retain the same observation layout and routing behavior described above.
+
+% ===========================================================================
+\begin{thebibliography}{9}
+% ===========================================================================
+\bibitem{kong} J.~Kong, X.~Liu, Y.~Lin, J.~Han, S.~Schwertfeger, C.~Bai, and
+X.~Li, ``Learning soccer skills for humanoid robots: A progressive
+perception-action framework,'' 2026. arXiv:2602.05310.
+
+\bibitem{ren} J.~Ren, J.~Long, T.~Huang, H.~Wang, Z.~Wang, F.~Jia, W.~Zhang,
+J.~Wang, P.~Luo, and J.~Pang, ``Humanoid goalkeeper: Learning from
+position-conditioned task-motion constraints,'' arXiv:2510.18002, 2025.
+
+\bibitem{ppo} J.~Schulman, F.~Wolski, P.~Dhariwal, A.~Radford, and O.~Klimov,
+``Proximal policy optimization algorithms,'' arXiv:1707.06347, 2017.
+
+\bibitem{dagger} S.~Ross, G.~J.~Gordon, and J.~A.~Bagnell, ``A reduction of
+imitation learning and structured prediction to no-regret online learning,'' in
+\emph{Proc. AISTATS}, 2011, pp.~627--635.
+
+\bibitem{icem} C.~Pinneri, S.~Sawant, S.~Blaes, J.~Achterhold, J.~Stueckler,
+M.~Rolinek, and G.~Martius, ``Sample-efficient cross-entropy method for real-time
+planning,'' in \emph{Proc. CoRL}, PMLR vol.~155, 2021, pp.~1049--1065.
+
+\bibitem{cem} R.~Y.~Rubinstein and D.~P.~Kroese, \emph{The Cross-Entropy Method}.
+New York: Springer, 2004.
+
+\bibitem{mujoco} E.~Todorov, T.~Erez, and Y.~Tassa, ``MuJoCo: A physics engine
+for model-based control,'' in \emph{Proc. IEEE/RSJ IROS}, 2012, pp.~5026--5033.
+
+\bibitem{rudin} N.~Rudin, D.~Hoeller, P.~Reist, and M.~Hutter, ``Learning to walk
+in minutes using massively parallel deep reinforcement learning,'' in
+\emph{Proc. CoRL}, PMLR vol.~164, 2022, pp.~91--100.
+\end{thebibliography}
+
+\end{document}

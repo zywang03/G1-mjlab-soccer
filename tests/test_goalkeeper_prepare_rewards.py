@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -14,6 +16,7 @@ from src.tasks.soccer.mdp.goalkeeper_rewards import (
   goalkeeper_active_condition_target_reach,
   goalkeeper_active_fall_penalty,
   goalkeeper_active_intercept_point,
+  goalkeeper_active_motion_prior_joint_pose,
   goalkeeper_active_upright,
   goalkeeper_idle_action_rate,
   goalkeeper_idle_alive,
@@ -108,6 +111,179 @@ def _make_env(
 
 
 class GoalkeeperPrepareRewardsTest(unittest.TestCase):
+  def test_active_motion_prior_joint_pose_tracks_prior_only_after_launch(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      motion_dir = Path(tmp)
+      prior_names = _GK_JOINT_NAMES[:3]
+      (motion_dir / "joint_id.txt").write_text(
+        "\n".join(f"{i} {name}" for i, name in enumerate(prior_names)),
+        encoding="utf-8",
+      )
+      torch.save(
+        {"joint_position": torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])},
+        motion_dir / "leftjump.pt",
+      )
+
+      joint_pos = torch.zeros(3, len(_GK_JOINT_NAMES))
+      joint_pos[1, :3] = torch.tensor([0.1, 0.2, 0.3])
+      joint_pos[2, :3] = torch.tensor([2.0, 2.0, 2.0])
+      env = _make_env(
+        root_z=[0.80, 0.80, 0.80],
+        joint_pos=joint_pos,
+        ball_velocities=[
+          [0.0, 0.0, 0.0],
+          [0.0, 0.0, 0.0],
+          [0.0, 0.0, 0.0],
+        ],
+        delayed_ball_launched=[False, True, True],
+      )
+      env.episode_length_buf = torch.zeros(3, dtype=torch.long)
+
+      reward = goalkeeper_active_motion_prior_joint_pose(
+        env,
+        motion_dir=str(motion_dir),
+        std=0.2,
+        launch_delay_s=0.0,
+        dt=1.0,
+      )
+
+      self.assertEqual(reward[0].item(), 0.0)
+      self.assertGreater(reward[1].item(), 0.95)
+      self.assertLess(reward[2].item(), 0.01)
+
+  def test_active_motion_prior_joint_pose_can_be_restricted_to_named_motions(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      motion_dir = Path(tmp)
+      prior_names = _GK_JOINT_NAMES[:3]
+      (motion_dir / "joint_id.txt").write_text(
+        "\n".join(f"{i} {name}" for i, name in enumerate(prior_names)),
+        encoding="utf-8",
+      )
+      torch.save(
+        {"joint_position": torch.tensor([[0.0, 0.0, 0.0]])},
+        motion_dir / "lefthand.pt",
+      )
+      torch.save(
+        {"joint_position": torch.tensor([[1.0, 1.0, 1.0]])},
+        motion_dir / "leftjump.pt",
+      )
+
+      joint_pos = torch.zeros(1, len(_GK_JOINT_NAMES))
+      env = _make_env(
+        root_z=[0.80],
+        joint_pos=joint_pos,
+        ball_velocities=[[0.0, 0.0, 0.0]],
+        delayed_ball_launched=[True],
+      )
+      env.episode_length_buf = torch.zeros(1, dtype=torch.long)
+
+      unrestricted = goalkeeper_active_motion_prior_joint_pose(
+        env,
+        motion_dir=str(motion_dir),
+        std=0.2,
+        launch_delay_s=0.0,
+        dt=1.0,
+      )
+      jump_only = goalkeeper_active_motion_prior_joint_pose(
+        env,
+        motion_dir=str(motion_dir),
+        motion_names=("leftjump.pt",),
+        std=0.2,
+        launch_delay_s=0.0,
+        dt=1.0,
+      )
+
+      self.assertGreater(unrestricted[0].item(), 0.95)
+      self.assertLess(jump_only[0].item(), 0.01)
+
+  def test_active_motion_prior_joint_pose_routes_by_goalkeeper_region(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      motion_dir = Path(tmp)
+      prior_names = _GK_JOINT_NAMES[:3]
+      (motion_dir / "joint_id.txt").write_text(
+        "\n".join(f"{i} {name}" for i, name in enumerate(prior_names)),
+        encoding="utf-8",
+      )
+      region_motions = (
+        "righthand.pt",
+        "lefthand.pt",
+        "rightjump.pt",
+        "leftjump.pt",
+        "rightstep.pt",
+        "leftstep.pt",
+      )
+      for idx, name in enumerate(region_motions):
+        torch.save(
+          {"joint_position": torch.tensor([[float(idx), 0.0, 0.0]])},
+          motion_dir / name,
+        )
+
+      joint_pos = torch.zeros(6, len(_GK_JOINT_NAMES))
+      joint_pos[:, 0] = torch.arange(6, dtype=torch.float32)
+      env = _make_env(
+        root_z=[0.80] * 6,
+        joint_pos=joint_pos,
+        ball_velocities=[[0.0, 0.0, 0.0] for _ in range(6)],
+        delayed_ball_launched=[True] * 6,
+      )
+      env.episode_length_buf = torch.zeros(6, dtype=torch.long)
+      env._gk_region = torch.arange(6, dtype=torch.long)
+
+      reward = goalkeeper_active_motion_prior_joint_pose(
+        env,
+        motion_dir=str(motion_dir),
+        route_mode="region",
+        std=0.2,
+        launch_delay_s=0.0,
+        dt=1.0,
+      )
+
+      self.assertTrue(torch.all(reward > 0.95))
+
+  def test_active_motion_prior_region_route_does_not_take_best_of_all_motions(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      motion_dir = Path(tmp)
+      prior_names = _GK_JOINT_NAMES[:3]
+      (motion_dir / "joint_id.txt").write_text(
+        "\n".join(f"{i} {name}" for i, name in enumerate(prior_names)),
+        encoding="utf-8",
+      )
+      region_motions = (
+        "righthand.pt",
+        "lefthand.pt",
+        "rightjump.pt",
+        "leftjump.pt",
+        "rightstep.pt",
+        "leftstep.pt",
+      )
+      for idx, name in enumerate(region_motions):
+        torch.save(
+          {"joint_position": torch.tensor([[float(idx), 0.0, 0.0]])},
+          motion_dir / name,
+        )
+
+      joint_pos = torch.zeros(2, len(_GK_JOINT_NAMES))
+      env = _make_env(
+        root_z=[0.80, 0.80],
+        joint_pos=joint_pos,
+        ball_velocities=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        delayed_ball_launched=[True, True],
+      )
+      env.episode_length_buf = torch.zeros(2, dtype=torch.long)
+      env._gk_region = torch.tensor([0, 1], dtype=torch.long)
+
+      reward = goalkeeper_active_motion_prior_joint_pose(
+        env,
+        motion_dir=str(motion_dir),
+        route_mode="region",
+        std=0.2,
+        launch_delay_s=0.0,
+        dt=1.0,
+      )
+
+      self.assertGreater(reward[0].item(), 0.95)
+      self.assertLess(reward[1].item(), 0.01)
+
   def test_low_base_height_penalizes_only_idle_waiting_above_target(self):
     joint_pos = torch.zeros(3, len(_GK_JOINT_NAMES))
     env = _make_env(

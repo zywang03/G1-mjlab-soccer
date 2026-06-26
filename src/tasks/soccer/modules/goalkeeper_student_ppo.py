@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+import copy
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from rsl_rl.algorithms.ppo import PPO
@@ -22,11 +24,22 @@ from rsl_rl.utils import (
   split_and_pad_trajectories,
   unpad_trajectories,
 )
+from src.tasks.soccer.modules.goalkeeper_prior_discriminator import (
+  GoalkeeperPriorDataset,
+  GoalkeeperPriorDiscriminator,
+  discriminator_loss,
+)
+from src.tasks.soccer.mdp.goalkeeper_student_obs import (
+  GOALKEEPER_PHASE_IDLE_INDEX,
+  GOALKEEPER_STUDENT_OBS_DIM,
+  GOALKEEPER_TEACHER_ACTOR_OBS_DIM,
+  build_goalkeeper_student_obs,
+)
 
 
 @dataclass
 class GoalkeeperStudentPpoAlgorithmCfg:
-  """PPO config extended with online teacher distillation knobs."""
+  """PPO config extended with optional online teacher distillation knobs."""
 
   num_learning_epochs: int = 5
   num_mini_batches: int = 4
@@ -46,55 +59,55 @@ class GoalkeeperStudentPpoAlgorithmCfg:
   rnd_cfg: dict | None = None
   symmetry_cfg: dict | None = None
   class_name: str = "src.tasks.soccer.modules.goalkeeper_student_ppo:GoalkeeperStudentPPO"
-  teacher_checkpoint_path: str | None = None
-  distill_coef: float = 1.0
-  distill_final_coef: float | None = None
-  distill_anneal_updates: int = 0
-  teacher_every_n_steps: int = 1
-  distill_loss_type: str = "mse"
-  offline_bc_dataset: str | None = None
-  offline_bc_coef: float = 0.0
-  offline_bc_final_coef: float | None = None
-  offline_bc_anneal_updates: int = 0
-  offline_idle_bc_coef: float = 0.0
-  offline_idle_bc_final_coef: float | None = None
-  offline_idle_bc_anneal_updates: int = 0
-  offline_bc_active_fraction: float = 0.5
-  offline_bc_batch_size: int = 64
-  offline_bc_seq_len: int = 24
-  offline_bc_every_n_updates: int = 1
-  offline_bc_cache_shards: int = 8
   condition_aux_coef: float = 0.05
   condition_aux_final_coef: float | None = None
   condition_aux_anneal_updates: int = 0
   condition_aux_active_only: bool = True
+  reference_kl_coef: float = 0.0
+  reference_kl_idle_coef: float | None = None
+  reference_kl_active_coef: float | None = None
+  reference_kl_std_floor: float = 0.1
+  teacher_kl_checkpoint: str | None = None
+  """Frozen MoE teacher checkpoint used for active-phase KL regularization."""
+  teacher_kl_coef: float = 0.0
+  """Weight on KL(student || teacher) computed only on active/post-launch samples."""
+  teacher_kl_std_floor: float = 0.05
+  """Std floor for teacher KL to avoid tiny-std blowups."""
+  prior_disc_dataset_dir: str | None = None
+  prior_disc_reward_coef: float = 0.0
+  prior_disc_updates: int = 1
+  prior_disc_batch_size: int = 256
+  prior_disc_learning_rate: float = 3.0e-4
+  prior_disc_reward_clip: float = 5.0
+  active_bc_dataset_dir: str | None = None
+  active_bc_coef: float = 0.0
+  active_bc_final_coef: float | None = None
+  active_bc_anneal_updates: int = 0
+  active_bc_batch_size: int = 256
   min_action_std: float = 1.0e-4
   max_action_std: float | None = None
   actor_mean_clip: float | None = None
   ppo_log_ratio_clip: float = 8.0
   idle_deterministic_actions: bool = True
   mask_idle_actor_loss: bool = False
+  idle_actor_loss_weight: float = 0.0
   critic_warmup_iterations: int = 0
   freeze_actor_obs_normalization: bool = False
 
 
 class GoalkeeperStudentRolloutStorage(RolloutStorage):
-  """RL rollout storage with per-transition teacher actions."""
+  """RL rollout storage with per-transition actor-loss masks."""
 
   def __init__(self, *args, **kwargs) -> None:
     super().__init__(*args, **kwargs)
-    self.privileged_actions = torch.zeros(
-      self.num_transitions_per_env,
-      self.num_envs,
-      *self.actions_shape,
-      device=self.device,
-    )
+    self.actor_loss_masks = torch.ones(self.num_transitions_per_env, self.num_envs, 1, device=self.device)
 
   def add_transition(self, transition: RolloutStorage.Transition) -> None:
-    teacher_actions = getattr(transition, "privileged_actions", None)
-    if teacher_actions is None:
-      raise ValueError("GoalkeeperStudentPPO requires teacher actions for every rollout transition.")
-    self.privileged_actions[self.step].copy_(teacher_actions)
+    actor_loss_mask = getattr(transition, "actor_loss_mask", None)
+    if actor_loss_mask is None:
+      self.actor_loss_masks[self.step].fill_(1.0)
+    else:
+      self.actor_loss_masks[self.step].copy_(actor_loss_mask.view(-1, 1).to(device=self.device, dtype=torch.float32))
     super().add_transition(transition)
 
   def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator[RolloutStorage.Batch, None, None]:
@@ -104,7 +117,7 @@ class GoalkeeperStudentRolloutStorage(RolloutStorage):
 
     observations = self.observations.flatten(0, 1)
     actions = self.actions.flatten(0, 1)
-    teacher_actions = self.privileged_actions.flatten(0, 1)
+    actor_loss_masks = self.actor_loss_masks.flatten(0, 1)
     values = self.values.flatten(0, 1)
     returns = self.returns.flatten(0, 1)
     old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -116,7 +129,7 @@ class GoalkeeperStudentRolloutStorage(RolloutStorage):
         start = i * mini_batch_size
         stop = (i + 1) * mini_batch_size
         batch_idx = indices[start:stop]
-        yield RolloutStorage.Batch(
+        batch = RolloutStorage.Batch(
           observations=observations[batch_idx],
           actions=actions[batch_idx],
           values=values[batch_idx],
@@ -124,8 +137,9 @@ class GoalkeeperStudentRolloutStorage(RolloutStorage):
           returns=returns[batch_idx],
           old_actions_log_prob=old_actions_log_prob[batch_idx],
           old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
-          privileged_actions=teacher_actions[batch_idx],
         )
+        batch.actor_loss_mask = actor_loss_masks[batch_idx]
+        yield batch
 
   def recurrent_mini_batch_generator(
     self,
@@ -133,7 +147,6 @@ class GoalkeeperStudentRolloutStorage(RolloutStorage):
     num_epochs: int = 8,
   ) -> Generator[RolloutStorage.Batch, None, None]:
     padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
-    padded_teacher_trajectories, _ = split_and_pad_trajectories(self.privileged_actions, self.dones)
     mini_batch_size = self.num_envs // num_mini_batches
 
     for _ in range(num_epochs):
@@ -170,7 +183,7 @@ class GoalkeeperStudentRolloutStorage(RolloutStorage):
           ]
           hidden_state_c_batch = hidden_state_c_batch[0] if len(hidden_state_c_batch) == 1 else hidden_state_c_batch
 
-        yield RolloutStorage.Batch(
+        batch = RolloutStorage.Batch(
           observations=padded_obs_trajectories[:, first_traj:last_traj],
           actions=self.actions[:, start:stop],
           values=self.values[:, start:stop],
@@ -180,8 +193,9 @@ class GoalkeeperStudentRolloutStorage(RolloutStorage):
           old_distribution_params=tuple(p[:, start:stop] for p in self.distribution_params),  # type: ignore[arg-type]
           hidden_states=(hidden_state_a_batch, hidden_state_c_batch),
           masks=trajectory_masks[:, first_traj:last_traj],
-          privileged_actions=padded_teacher_trajectories[:, first_traj:last_traj],
         )
+        batch.actor_loss_mask = self.actor_loss_masks[:, start:stop]
+        yield batch
         first_traj = last_traj
 
 
@@ -191,67 +205,99 @@ class GoalkeeperStudentPPO(PPO):
   def __init__(
     self,
     *args,
-    teacher_checkpoint_path: str | None = None,
-    distill_coef: float = 1.0,
-    distill_final_coef: float | None = None,
-    distill_anneal_updates: int = 0,
-    teacher_every_n_steps: int = 1,
-    distill_loss_type: str = "mse",
-    offline_bc_dataset: str | None = None,
-    offline_bc_coef: float = 0.0,
-    offline_bc_final_coef: float | None = None,
-    offline_bc_anneal_updates: int = 0,
-    offline_idle_bc_coef: float = 0.0,
-    offline_idle_bc_final_coef: float | None = None,
-    offline_idle_bc_anneal_updates: int = 0,
-    offline_bc_active_fraction: float = 0.5,
-    offline_bc_batch_size: int = 64,
-    offline_bc_seq_len: int = 24,
-    offline_bc_every_n_updates: int = 1,
-    offline_bc_cache_shards: int = 8,
     condition_aux_coef: float = 0.05,
     condition_aux_final_coef: float | None = None,
     condition_aux_anneal_updates: int = 0,
     condition_aux_active_only: bool = True,
+    reference_kl_coef: float = 0.0,
+    reference_kl_idle_coef: float | None = None,
+    reference_kl_active_coef: float | None = None,
+    reference_kl_std_floor: float = 0.1,
+    teacher_kl_checkpoint: str | None = None,
+    teacher_kl_coef: float = 0.0,
+    teacher_kl_std_floor: float = 0.05,
+    prior_disc_dataset_dir: str | None = None,
+    prior_disc_reward_coef: float = 0.0,
+    prior_disc_updates: int = 1,
+    prior_disc_batch_size: int = 256,
+    prior_disc_learning_rate: float = 3.0e-4,
+    prior_disc_reward_clip: float = 5.0,
+    active_bc_dataset_dir: str | None = None,
+    active_bc_coef: float = 0.0,
+    active_bc_final_coef: float | None = None,
+    active_bc_anneal_updates: int = 0,
+    active_bc_batch_size: int = 256,
     min_action_std: float = 1.0e-4,
     max_action_std: float | None = None,
     actor_mean_clip: float | None = None,
     ppo_log_ratio_clip: float = 8.0,
     idle_deterministic_actions: bool = True,
     mask_idle_actor_loss: bool = False,
+    idle_actor_loss_weight: float = 0.0,
     critic_warmup_iterations: int = 0,
     freeze_actor_obs_normalization: bool = False,
     env: VecEnv | None = None,
     **kwargs,
   ) -> None:
     super().__init__(*args, **kwargs)
-    self.distill_coef = float(distill_coef)
-    self.distill_final_coef = float(distill_coef if distill_final_coef is None else distill_final_coef)
-    self.distill_anneal_updates = max(0, int(distill_anneal_updates))
-    self.teacher_every_n_steps = max(1, int(teacher_every_n_steps))
-    self.teacher_checkpoint_path = teacher_checkpoint_path
-    self.teacher_policy = self._load_teacher_policy(teacher_checkpoint_path, env)
-    self.teacher_route_gate = self._load_teacher_route_gate(teacher_checkpoint_path)
-    self.loss_fn = nn.functional.smooth_l1_loss if distill_loss_type == "huber" else nn.functional.mse_loss
-    self.offline_bc_coef = float(offline_bc_coef)
-    self.offline_bc_final_coef = float(offline_bc_coef if offline_bc_final_coef is None else offline_bc_final_coef)
-    self.offline_bc_anneal_updates = max(0, int(offline_bc_anneal_updates))
-    self.offline_idle_bc_coef = float(offline_idle_bc_coef)
-    self.offline_idle_bc_final_coef = float(
-      offline_idle_bc_coef if offline_idle_bc_final_coef is None else offline_idle_bc_final_coef
-    )
-    self.offline_idle_bc_anneal_updates = max(0, int(offline_idle_bc_anneal_updates))
-    self.offline_bc_active_fraction = min(max(float(offline_bc_active_fraction), 0.0), 1.0)
-    self.offline_bc_batch_size = int(offline_bc_batch_size)
-    self.offline_bc_seq_len = int(offline_bc_seq_len)
-    self.offline_bc_every_n_updates = max(1, int(offline_bc_every_n_updates))
-    self.offline_bc_cache_shards = max(1, int(offline_bc_cache_shards))
     self.condition_aux_coef = float(condition_aux_coef)
     self.condition_aux_final_coef = float(
       condition_aux_coef if condition_aux_final_coef is None else condition_aux_final_coef
     )
     self.condition_aux_anneal_updates = max(0, int(condition_aux_anneal_updates))
     self.condition_aux_active_only = bool(condition_aux_active_only)
+    self.reference_kl_coef = float(reference_kl_coef)
+    self.reference_kl_idle_coef = float(reference_kl_coef if reference_kl_idle_coef is None else reference_kl_idle_coef)
+    self.reference_kl_active_coef = float(
+      reference_kl_coef if reference_kl_active_coef is None else reference_kl_active_coef
+    )
+    self.reference_kl_std_floor = max(float(reference_kl_std_floor), 1.0e-6)
+    self.reference_actor = None
+    self.teacher_kl_coef = float(teacher_kl_coef)
+    self.teacher_kl_std_floor = max(float(teacher_kl_std_floor), 1.0e-6)
+    self.teacher_kl_policy = self._load_teacher_kl_policy(teacher_kl_checkpoint, env)
+    self.prior_disc_dataset_dir = prior_disc_dataset_dir
+    self.prior_disc_reward_coef = float(prior_disc_reward_coef)
+    self.prior_disc_updates = max(0, int(prior_disc_updates))
+    self.prior_disc_batch_size = max(1, int(prior_disc_batch_size))
+    self.prior_disc_learning_rate = float(prior_disc_learning_rate)
+    self.prior_disc_reward_clip = float(prior_disc_reward_clip)
+    self.active_bc_dataset_dir = active_bc_dataset_dir
+    self.active_bc_coef = float(active_bc_coef)
+    self.active_bc_final_coef = float(active_bc_coef if active_bc_final_coef is None else active_bc_final_coef)
+    self.active_bc_anneal_updates = max(0, int(active_bc_anneal_updates))
+    self.active_bc_batch_size = max(1, int(active_bc_batch_size))
+    self.prior_dataset = None
+    self.prior_discriminator = None
+    self.prior_disc_optimizer = None
+    self.active_bc_dataset = None
+    self.active_bc_obs_dim = None
+    prior_source_dir = self.prior_disc_dataset_dir if self.prior_disc_reward_coef > 0.0 else None
+    active_bc_source_dir = self.active_bc_dataset_dir if self.active_bc_coef > 0.0 else None
+    shared_dataset = None
+    if prior_source_dir and active_bc_source_dir and prior_source_dir == active_bc_source_dir:
+      shared_dataset = GoalkeeperPriorDataset(prior_source_dir, device=self.device)
+    if prior_source_dir:
+      self.prior_dataset = shared_dataset or GoalkeeperPriorDataset(prior_source_dir, device=self.device)
+      self.prior_discriminator = GoalkeeperPriorDiscriminator(
+        self.prior_dataset.input_dim,
+        reward_clip=self.prior_disc_reward_clip,
+      ).to(self.device)
+      self.prior_disc_optimizer = torch.optim.Adam(
+        self.prior_discriminator.parameters(),
+        lr=self.prior_disc_learning_rate,
+      )
+      print(
+        f"[INFO] Loaded goalkeeper prior dataset from {self.prior_disc_dataset_dir} "
+        f"({self.prior_dataset.num_samples} samples)"
+      )
+    if active_bc_source_dir:
+      self.active_bc_dataset = shared_dataset or GoalkeeperPriorDataset(active_bc_source_dir, device=self.device)
+      self.active_bc_obs_dim = self.active_bc_dataset.input_dim - self.actor.num_actions
+      print(
+        f"[INFO] Loaded goalkeeper active BC dataset from {self.active_bc_dataset_dir} "
+        f"({self.active_bc_dataset.num_samples} samples)"
+      )
     self.min_action_std = float(min_action_std)
     self.max_action_std = None if max_action_std is None else float(max_action_std)
     if hasattr(self.actor, "min_sample_std"):
@@ -260,14 +306,24 @@ class GoalkeeperStudentPPO(PPO):
     self.ppo_log_ratio_clip = float(ppo_log_ratio_clip)
     self.idle_deterministic_actions = bool(idle_deterministic_actions)
     self.mask_idle_actor_loss = bool(mask_idle_actor_loss)
+    self.idle_actor_loss_weight = min(max(float(idle_actor_loss_weight), 0.0), 1.0)
     self.critic_warmup_iterations = max(0, int(critic_warmup_iterations))
     self.freeze_actor_obs_normalization = bool(freeze_actor_obs_normalization)
-    self._offline_bc_shards: list[Path] = []
-    self._offline_bc_active_shards: list[Path] = []
-    self._offline_bc_cache: dict[Path, dict[str, torch.Tensor]] = {}
-    self._init_offline_bc_dataset(offline_bc_dataset)
+    self.env = env
+    # Skip the dead condition_aux_head forward when no aux loss is computed.
+    if float(condition_aux_coef) <= 0.0 and float(
+      condition_aux_final_coef or 0.0
+    ) <= 0.0:
+      self.actor.condition_aux_enabled = False
     self._act_step = 0
     self._ppo_update_count = 0
+
+  def set_reference_actor_from_current(self) -> None:
+    """Freeze a copy of the current actor as the KL anchor policy."""
+    self.reference_actor = copy.deepcopy(self.actor)
+    self.reference_actor.eval()
+    for param in self.reference_actor.parameters():
+      param.requires_grad_(False)
 
   def process_env_step(
     self,
@@ -295,26 +351,31 @@ class GoalkeeperStudentPPO(PPO):
         self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device),
         1,
       )
+    self.transition.rewards += self._prior_discriminator_reward(obs, self.transition.actions)
 
     self.storage.add_transition(self.transition)
     self.transition.clear()
     self.actor.reset(dones)
     self.critic.reset(dones)
 
-  def _load_teacher_policy(self, checkpoint_path: str | None, env: VecEnv | None):
-    if not checkpoint_path or max(self.distill_coef, self.distill_final_coef) <= 0.0:
+  def _load_teacher_kl_policy(self, checkpoint_path: str | None, env: VecEnv | None):
+    if not checkpoint_path or self.teacher_kl_coef <= 0.0:
       return None
     if env is None:
-      raise ValueError("GoalkeeperStudentPPO needs env to build the online teacher policy.")
+      raise ValueError("GoalkeeperStudentPPO needs env to build the teacher KL policy.")
     path = Path(checkpoint_path).expanduser()
     if not path.exists():
-      raise FileNotFoundError(f"Teacher checkpoint not found: {path}")
+      raise FileNotFoundError(f"Teacher KL checkpoint not found: {path}")
     from src.tasks.soccer.modules.moe7_prepare_actor import MoE7PrepareGoalkeeperActor
 
     loaded = torch.load(path, map_location=self.device, weights_only=False)
-    bundle = loaded["actor_state_dict"] if isinstance(loaded, dict) and "actor_state_dict" in loaded and "sr" in loaded["actor_state_dict"] else loaded
+    bundle = (
+      loaded["actor_state_dict"]
+      if isinstance(loaded, dict) and "actor_state_dict" in loaded and "sr" in loaded["actor_state_dict"]
+      else loaded
+    )
     if not isinstance(bundle, dict) or "sr" not in bundle:
-      raise ValueError(f"Teacher checkpoint is not a MoE goalkeeper bundle: {path}")
+      raise ValueError(f"Teacher KL checkpoint is not a MoE goalkeeper bundle: {path}")
     obs = env.get_observations().to(self.device)
     teacher = MoE7PrepareGoalkeeperActor(
       obs,
@@ -337,47 +398,82 @@ class GoalkeeperStudentPPO(PPO):
     teacher.eval()
     for param in teacher.parameters():
       param.requires_grad_(False)
+    print(f"[INFO] Loaded teacher KL policy from: {path}")
     return teacher
 
-  def _load_teacher_route_gate(self, checkpoint_path: str | None):
-    if not checkpoint_path:
-      return None
-    path = Path(checkpoint_path).expanduser()
-    if not path.exists():
-      return None
-    loaded = torch.load(path, map_location=self.device, weights_only=False)
-    bundle = loaded["actor_state_dict"] if isinstance(loaded, dict) and "actor_state_dict" in loaded and "sr" in loaded["actor_state_dict"] else loaded
-    if not isinstance(bundle, dict):
-      return None
-    gate = bundle.get("gate")
-    if not isinstance(gate, dict) or not gate.get("state"):
-      return None
-    from src.tasks.soccer.modules.moe6_goalkeeper_policy import _make_gate_net
+  def _teacher_kl_loss(self, batch: RolloutStorage.Batch) -> torch.Tensor:
+    teacher = getattr(self, "teacher_kl_policy", None)
+    if teacher is None:
+      return torch.zeros((), device=self.device)
+    student_params = tuple(
+      p.reshape(-1, p.shape[-1]) if p.dim() > 2 else p
+      for p in self.actor.output_distribution_params
+    )
+    observations = batch.observations
+    if batch.masks is not None:
+      observations = unpad_trajectories(observations, batch.masks)
+    teacher_obs = self._teacher_kl_obs(observations)
+    with torch.no_grad():
+      teacher(teacher_obs)
+      teacher_params = self._teacher_kl_params(teacher.output_distribution_params)
+    n = min(student_params[0].shape[0], teacher_params[0].shape[0])
+    student_params = tuple(p[:n] for p in student_params)
+    teacher_params = tuple(p[:n] for p in teacher_params)
+    per_sample_kl = self.actor.get_kl_divergence(teacher_params, student_params)
+    per_sample_kl = torch.clamp(per_sample_kl, max=2.0)
+    active_mask = getattr(batch, "actor_loss_mask", None)
+    if active_mask is None:
+      return per_sample_kl.mean()
+    active_mask = active_mask.reshape(-1).to(device=per_sample_kl.device) > 0.5
+    if active_mask.shape[0] < n:
+      n = active_mask.shape[0]
+      per_sample_kl = per_sample_kl[:n]
+    elif active_mask.shape[0] > n:
+      active_mask = active_mask[:n]
+    if not torch.any(active_mask):
+      return torch.zeros((), device=self.device)
+    return per_sample_kl[active_mask].mean()
 
-    num_classes = int(gate.get("num_classes", gate["state"]["4.weight"].shape[0]))
-    net = _make_gate_net(num_classes, torch.device(self.device))
-    net.load_state_dict(gate["state"])
-    net.eval()
-    for param in net.parameters():
-      param.requires_grad_(False)
-    return {
-      "net": net,
-      "mean": gate["mean"].to(self.device),
-      "std": gate["std"].to(self.device).clamp_min(1.0e-6),
-    }
+  @staticmethod
+  def _teacher_kl_obs(observations: TensorDict) -> TensorDict:
+    """Strip the 4D student condition and flatten to 2D for the non-recurrent teacher."""
+    if not isinstance(observations, TensorDict):
+      return observations
+    for key in ("actor", "student"):
+      if key not in observations.keys():
+        continue
+      tensor = observations[key]
+      if tensor.shape[-1] in (GOALKEEPER_STUDENT_OBS_DIM, GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 4):
+        tensor = tensor[..., :960]
+      if tensor.dim() == 3:
+        tensor = tensor.reshape(-1, tensor.shape[-1])
+      return TensorDict({key: tensor}, batch_size=list(tensor.shape[:-1]))
+    return observations
+
+  def _teacher_kl_params(self, params: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    if len(params) != 2:
+      return params
+    mean, std = params
+    clip = getattr(self, "actor_mean_clip", None)
+    if clip is not None and clip > 0.0:
+      mean = torch.nan_to_num(mean, nan=0.0, posinf=clip, neginf=-clip).clamp(min=-clip, max=clip)
+    floor = max(float(getattr(self, "teacher_kl_std_floor", 0.0)), 0.0)
+    if floor <= 0.0:
+      return mean, std
+    return mean, std.clamp_min(floor)
 
   def train_mode(self) -> None:
     super().train_mode()
-    teacher_policy = getattr(self, "teacher_policy", None)
-    if teacher_policy is not None:
-      teacher_policy.eval()
+    teacher_kl_policy = getattr(self, "teacher_kl_policy", None)
+    if teacher_kl_policy is not None:
+      teacher_kl_policy.eval()
 
   def act(self, obs: TensorDict) -> torch.Tensor:
     self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
     self._clamp_actor_std()
     sampled_actions = self._clip_actor_actions(self.actor(obs, stochastic_output=True).detach())
     action_mean = self._clip_actor_actions(self.actor.output_mean.detach())
-    idle_mask = self._idle_condition_mask(obs).unsqueeze(-1)
+    idle_mask = self._idle_action_mask(obs).unsqueeze(-1)
     if getattr(self, "idle_deterministic_actions", True):
       actions = torch.where(idle_mask, action_mean, sampled_actions)
     else:
@@ -388,11 +484,7 @@ class GoalkeeperStudentPPO(PPO):
     self.transition.actions_log_prob = self.actor.get_output_log_prob(actions).detach()
     self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
     self.transition.observations = obs
-    if self.teacher_policy is not None and self._act_step % self.teacher_every_n_steps == 0:
-      teacher_actions = self.teacher_policy(obs).detach()
-    else:
-      teacher_actions = action_mean
-    self.transition.privileged_actions = teacher_actions
+    self.transition.actor_loss_mask = (~idle_mask).to(dtype=torch.float32)
     self._act_step += 1
     return actions
 
@@ -406,124 +498,154 @@ class GoalkeeperStudentPPO(PPO):
       raw = obs["actor"]
     else:
       raw = torch.cat([value for value in obs.values()], dim=-1)
+    if raw.shape[-1] >= GOALKEEPER_STUDENT_OBS_DIM:
+      return raw[..., GOALKEEPER_PHASE_IDLE_INDEX] > 0.5
     return raw[..., -1] > 0.5
+
+  def _idle_action_mask(self, obs: TensorDict) -> torch.Tensor:
+    env = getattr(self, "env", None)
+    source_env = getattr(env, "unwrapped", env)
+    launched = getattr(source_env, "_gk_delayed_ball_launched", None)
+    num_envs = getattr(source_env, "num_envs", getattr(env, "num_envs", None))
+    if launched is not None and num_envs is not None and launched.shape[0] == num_envs:
+      return ~launched.to(device=self.device, dtype=torch.bool)
+    return self._idle_condition_mask(obs)
 
   def update(self) -> dict[str, float]:
     mean_value_loss = 0.0
     mean_surrogate_loss = 0.0
     mean_entropy = 0.0
-    mean_distill_loss = 0.0
-    mean_offline_bc_loss = 0.0
-    mean_offline_idle_bc_loss = 0.0
     mean_condition_aux_loss = 0.0
+    mean_reference_kl_loss = 0.0
+    mean_teacher_kl_loss = 0.0
+    mean_active_bc_loss = 0.0
+    mean_prior_disc_loss = 0.0
+    mean_prior_disc_expert_acc = 0.0
+    mean_prior_disc_policy_acc = 0.0
 
     if self.actor.is_recurrent or self.critic.is_recurrent:
       generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
     else:
       generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-    self._prefetch_offline_bc_shards()
+    critic_warmup = self._ppo_update_count < self.critic_warmup_iterations
+    previous_actor_trainable = self.set_actor_trainable(False) if critic_warmup else None
     update_index = 0
-    for batch in generator:
-      self._clamp_actor_std()
-      original_batch_size = batch.observations.batch_size[0]
-
-      if self.normalize_advantage_per_mini_batch:
-        with torch.no_grad():
-          batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
-
-      self.actor(
-        batch.observations,
-        masks=batch.masks,
-        hidden_state=batch.hidden_states[0],
-        stochastic_output=True,
-      )
-      actions_log_prob = self.actor.get_output_log_prob(batch.actions)
-      values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
-      distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
-      entropy = self.actor.output_entropy[:original_batch_size]
-
-      if self.desired_kl is not None and self.schedule == "adaptive":
-        self._update_learning_rate(batch.old_distribution_params, distribution_params)
-
-      ratio = self._ppo_ratio(actions_log_prob, torch.squeeze(batch.old_actions_log_prob))
-      advantages = torch.squeeze(batch.advantages)
-      clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
-      surrogate_loss, entropy_loss = self._masked_actor_losses(
-        batch.observations,
-        advantages,
-        ratio,
-        entropy,
-        clipped_ratio=clipped_ratio,
-      )
-
-      if self.use_clipped_value_loss:
-        value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
-        value_losses = (values - batch.returns).pow(2)
-        value_losses_clipped = (value_clipped - batch.returns).pow(2)
-        value_loss = torch.max(value_losses, value_losses_clipped).mean()
-      else:
-        value_loss = (batch.returns - values).pow(2).mean()
-
-      distill_weight = self._scheduled_coef(
-        self.distill_coef,
-        self.distill_final_coef,
-        self.distill_anneal_updates,
-      )
-      offline_bc_weight = self._scheduled_coef(
-        self.offline_bc_coef,
-        self.offline_bc_final_coef,
-        self.offline_bc_anneal_updates,
-      )
-      offline_idle_bc_weight = self._scheduled_coef(
-        self.offline_idle_bc_coef,
-        self.offline_idle_bc_final_coef,
-        self.offline_idle_bc_anneal_updates,
-      )
-      condition_aux_weight = self._scheduled_coef(
-        self.condition_aux_coef,
-        self.condition_aux_final_coef,
-        self.condition_aux_anneal_updates,
-      )
-      distill_loss = self._distill_loss(batch) if distill_weight > 0.0 else torch.zeros((), device=self.device)
-      offline_bc_loss = self._scheduled_offline_bc_loss(update_index, offline_bc_weight)
-      offline_idle_bc_loss = (
-        self._offline_idle_bc_loss() if offline_idle_bc_weight > 0.0 else torch.zeros((), device=self.device)
-      )
-      condition_aux_loss = (
-        self._condition_aux_loss(batch) if condition_aux_weight > 0.0 else torch.zeros((), device=self.device)
-      )
-      loss = (
-        surrogate_loss
-        + self.value_loss_coef * value_loss
-        - self.entropy_coef * entropy_loss
-        + distill_weight * distill_loss
-        + offline_bc_weight * offline_bc_loss
-        + offline_idle_bc_weight * offline_idle_bc_loss
-        + condition_aux_weight * condition_aux_loss
-      )
-      if not torch.isfinite(loss):
+    try:
+      for batch in generator:
         self._clamp_actor_std()
+        original_batch_size = batch.observations.batch_size[0]
+
+        if self.normalize_advantage_per_mini_batch:
+          with torch.no_grad():
+            batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
+
+        self.actor(
+          batch.observations,
+          masks=batch.masks,
+          hidden_state=batch.hidden_states[0],
+          stochastic_output=True,
+        )
+        self._clip_actor_distribution_mean()
+        actions_log_prob = self.actor.get_output_log_prob(batch.actions)
+        values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+        distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+        entropy = self.actor.output_entropy[:original_batch_size]
+
+        if self.desired_kl is not None and self.schedule == "adaptive" and not critic_warmup:
+          self._update_learning_rate(batch.old_distribution_params, distribution_params)
+
+        ratio = self._ppo_ratio(actions_log_prob, torch.squeeze(batch.old_actions_log_prob))
+        advantages = torch.squeeze(batch.advantages)
+        clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+        surrogate_loss, entropy_loss = self._masked_actor_losses(
+          batch,
+          advantages,
+          ratio,
+          entropy,
+          clipped_ratio=clipped_ratio,
+        )
+
+        if self.use_clipped_value_loss:
+          value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
+          value_losses = (values - batch.returns).pow(2)
+          value_losses_clipped = (value_clipped - batch.returns).pow(2)
+          value_loss = torch.max(value_losses, value_losses_clipped).mean()
+        else:
+          value_loss = (batch.returns - values).pow(2).mean()
+
+        condition_aux_weight = self._scheduled_coef(
+          self.condition_aux_coef,
+          self.condition_aux_final_coef,
+          self.condition_aux_anneal_updates,
+        )
+        reference_kl_weight = 1.0 if self._uses_phase_reference_kl() else self.reference_kl_coef
+        teacher_kl_weight = self.teacher_kl_coef
+        active_bc_weight = self._active_bc_weight()
+        if critic_warmup:
+          zero = value_loss * 0.0
+          surrogate_loss = zero
+          entropy_loss = zero
+          condition_aux_weight = 0.0
+          reference_kl_weight = 0.0
+          teacher_kl_weight = 0.0
+          active_bc_weight = 0.0
+        condition_aux_loss = (
+          self._condition_aux_loss(batch) if condition_aux_weight > 0.0 else torch.zeros((), device=self.device)
+        )
+        reference_kl_loss = (
+          self._reference_kl_loss(batch, phase_weighted=self._uses_phase_reference_kl())
+          if reference_kl_weight > 0.0
+          else torch.zeros((), device=self.device)
+        )
+        teacher_kl_loss = (
+          self._teacher_kl_loss(batch)
+          if teacher_kl_weight > 0.0
+          else torch.zeros((), device=self.device)
+        )
+        active_bc_loss = (
+          self._active_bc_loss()
+          if active_bc_weight > 0.0
+          else torch.zeros((), device=self.device)
+        )
+        loss = (
+          surrogate_loss
+          + self.value_loss_coef * value_loss
+          - self.entropy_coef * entropy_loss
+          + condition_aux_weight * condition_aux_loss
+          + reference_kl_weight * reference_kl_loss
+          + teacher_kl_weight * teacher_kl_loss
+          + active_bc_weight * active_bc_loss
+        )
+        if not torch.isfinite(loss):
+          self._clamp_actor_std()
+          update_index += 1
+          continue
+
+        prior_metrics = self._update_prior_discriminator_from_batch(batch)
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.is_multi_gpu:
+          self.reduce_parameters()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+        self._clamp_actor_std()
+
+        mean_value_loss += value_loss.item()
+        mean_surrogate_loss += surrogate_loss.item()
+        mean_entropy += entropy_loss.item()
+        mean_condition_aux_loss += condition_aux_loss.item()
+        mean_reference_kl_loss += reference_kl_loss.item()
+        mean_teacher_kl_loss += teacher_kl_loss.item()
+        mean_active_bc_loss += active_bc_loss.item()
+        mean_prior_disc_loss += prior_metrics["prior_disc"]
+        mean_prior_disc_expert_acc += prior_metrics["prior_disc_expert_acc"]
+        mean_prior_disc_policy_acc += prior_metrics["prior_disc_policy_acc"]
         update_index += 1
-        continue
-
-      self.optimizer.zero_grad()
-      loss.backward()
-      if self.is_multi_gpu:
-        self.reduce_parameters()
-      nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-      nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-      self.optimizer.step()
-      self._clamp_actor_std()
-
-      mean_value_loss += value_loss.item()
-      mean_surrogate_loss += surrogate_loss.item()
-      mean_entropy += entropy_loss.item()
-      mean_distill_loss += distill_loss.item()
-      mean_offline_bc_loss += offline_bc_loss.item()
-      mean_offline_idle_bc_loss += offline_idle_bc_loss.item()
-      mean_condition_aux_loss += condition_aux_loss.item()
-      update_index += 1
+    finally:
+      if previous_actor_trainable is not None:
+        self.restore_actor_trainable(previous_actor_trainable)
 
     num_updates = self.num_learning_epochs * self.num_mini_batches
     self.storage.clear()
@@ -532,10 +654,123 @@ class GoalkeeperStudentPPO(PPO):
       "value": mean_value_loss / num_updates,
       "surrogate": mean_surrogate_loss / num_updates,
       "entropy": mean_entropy / num_updates,
-      "distill": mean_distill_loss / num_updates,
-      "offline_bc": mean_offline_bc_loss / num_updates,
-      "offline_idle_bc": mean_offline_idle_bc_loss / num_updates,
       "condition_aux": mean_condition_aux_loss / num_updates,
+      "reference_kl": mean_reference_kl_loss / num_updates,
+      "teacher_kl": mean_teacher_kl_loss / num_updates,
+      "active_bc": mean_active_bc_loss / num_updates,
+      "prior_disc": mean_prior_disc_loss / num_updates,
+      "prior_disc_expert_acc": mean_prior_disc_expert_acc / num_updates,
+      "prior_disc_policy_acc": mean_prior_disc_policy_acc / num_updates,
+    }
+
+  def _prior_discriminator_features(self, observations: TensorDict, actions: torch.Tensor, masks=None) -> torch.Tensor:
+    raw_student_obs = getattr(self.actor, "_raw_student_obs", None)
+    if callable(raw_student_obs):
+      raw = raw_student_obs(observations)
+    elif isinstance(observations, TensorDict) and "student" in observations.keys():
+      raw = observations["student"]
+    elif isinstance(observations, TensorDict) and "actor" in observations.keys():
+      raw = observations["actor"]
+    else:
+      raw = torch.cat([value for value in observations.values()], dim=-1)
+    if masks is not None:
+      raw = unpad_trajectories(raw, masks).reshape(-1, raw.shape[-1])
+      actions = actions.reshape(-1, actions.shape[-1])
+      if actions.shape[0] != raw.shape[0]:
+        actions = actions[: raw.shape[0]]
+    else:
+      raw = raw.reshape(-1, raw.shape[-1])
+      actions = actions.reshape(-1, actions.shape[-1])
+    return torch.cat([raw.to(device=self.device), actions.to(device=self.device)], dim=-1)
+
+  def _active_bc_loss(self) -> torch.Tensor:
+    dataset = getattr(self, "active_bc_dataset", None)
+    coef = float(getattr(self, "active_bc_coef", 0.0))
+    if dataset is None or coef <= 0.0:
+      return torch.zeros((), device=self.device)
+    batch = dataset.sample(int(self.active_bc_batch_size)).to(device=self.device)
+    obs_dim = getattr(self, "active_bc_obs_dim", None)
+    if obs_dim is None:
+      obs_dim = batch.shape[-1] - self.actor.num_actions
+    obs_dim = int(obs_dim)
+    obs_key = "student"
+    obs_groups = getattr(self.actor, "obs_groups", None)
+    if obs_groups:
+      obs_key = obs_groups[0]
+    obs_tensor = self._upgrade_student_obs(batch[:, :obs_dim])
+    obs = TensorDict({obs_key: obs_tensor}, batch_size=[batch.shape[0]], device=self.device)
+    expert_actions = batch[:, obs_dim:]
+    forward_bc_chunk = getattr(self.actor, "forward_bc_chunk", None)
+    if callable(forward_bc_chunk):
+      masks = torch.ones(1, batch.shape[0], dtype=torch.bool, device=self.device)
+      actor_mean, _ = forward_bc_chunk(obs_tensor.unsqueeze(0), masks, hidden_state=None)
+    else:
+      try:
+        self.actor(obs, masks=None, hidden_state=None, stochastic_output=False)
+      except TypeError:
+        self.actor(obs, stochastic_output=False)
+      actor_mean = self.actor.output_distribution_params[0]
+    if actor_mean.shape[-1] != expert_actions.shape[-1]:
+      n = min(actor_mean.shape[-1], expert_actions.shape[-1])
+      actor_mean = actor_mean[..., :n]
+      expert_actions = expert_actions[..., :n]
+    return F.smooth_l1_loss(actor_mean, expert_actions)
+
+  def _prior_discriminator_reward(self, obs: TensorDict, actions: torch.Tensor) -> torch.Tensor:
+    discriminator = getattr(self, "prior_discriminator", None)
+    coef = float(getattr(self, "prior_disc_reward_coef", 0.0))
+    if discriminator is None or coef <= 0.0:
+      return torch.zeros(actions.shape[0], device=self.device)
+    features = self._prior_discriminator_features(obs, actions)
+    rewards = discriminator.reward(features) * coef
+    active = getattr(self.transition, "actor_loss_mask", None)
+    if active is None:
+      active = (~self._idle_action_mask(obs)).to(dtype=torch.float32).unsqueeze(-1)
+    active = active.reshape(-1).to(device=rewards.device, dtype=rewards.dtype)
+    n = min(rewards.shape[0], active.shape[0])
+    return rewards[:n] * active[:n]
+
+  def _update_prior_discriminator_from_batch(self, batch: RolloutStorage.Batch) -> dict[str, float]:
+    discriminator = getattr(self, "prior_discriminator", None)
+    dataset = getattr(self, "prior_dataset", None)
+    if discriminator is None or dataset is None or self.prior_disc_updates <= 0:
+      return {"prior_disc": 0.0, "prior_disc_expert_acc": 0.0, "prior_disc_policy_acc": 0.0}
+    features = self._prior_discriminator_features(batch.observations, batch.actions, batch.masks).detach()
+    active_mask = getattr(batch, "actor_loss_mask", None)
+    if active_mask is not None:
+      active_mask = active_mask.reshape(-1).to(device=features.device) > 0.5
+      if active_mask.shape[0] != features.shape[0]:
+        active_mask = active_mask[: features.shape[0]]
+      if torch.any(active_mask):
+        features = features[active_mask]
+    return self._update_prior_discriminator(features)
+
+  def _update_prior_discriminator(self, policy_features: torch.Tensor) -> dict[str, float]:
+    discriminator = getattr(self, "prior_discriminator", None)
+    dataset = getattr(self, "prior_dataset", None)
+    optimizer = getattr(self, "prior_disc_optimizer", None)
+    if discriminator is None or dataset is None or optimizer is None or policy_features.numel() == 0:
+      return {"prior_disc": 0.0, "prior_disc_expert_acc": 0.0, "prior_disc_policy_acc": 0.0}
+    total_loss = 0.0
+    total_expert_acc = 0.0
+    total_policy_acc = 0.0
+    updates = max(1, int(self.prior_disc_updates))
+    for _ in range(updates):
+      batch_size = min(int(self.prior_disc_batch_size), int(policy_features.shape[0]))
+      policy_idx = torch.randint(policy_features.shape[0], (batch_size,), device=policy_features.device)
+      policy_batch = policy_features[policy_idx].detach()
+      expert_batch = dataset.sample(batch_size).to(device=policy_features.device, dtype=policy_features.dtype)
+      loss, metrics = discriminator_loss(discriminator, expert_batch, policy_batch)
+      optimizer.zero_grad(set_to_none=True)
+      loss.backward()
+      optimizer.step()
+      total_loss += float(loss.item())
+      total_expert_acc += metrics["expert_acc"]
+      total_policy_acc += metrics["policy_acc"]
+    return {
+      "prior_disc": total_loss / updates,
+      "prior_disc_expert_acc": total_expert_acc / updates,
+      "prior_disc_policy_acc": total_policy_acc / updates,
     }
 
   def _clamp_actor_std(self) -> None:
@@ -577,6 +812,18 @@ class GoalkeeperStudentPPO(PPO):
     actions = torch.nan_to_num(actions, nan=0.0, posinf=clip, neginf=-clip)
     return actions.clamp(min=-clip, max=clip)
 
+  def _clip_actor_distribution_mean(self) -> None:
+    clip = getattr(self, "actor_mean_clip", None)
+    if clip is None or clip <= 0.0:
+      return
+    distribution = getattr(self.actor, "distribution", None)
+    mean = getattr(distribution, "mean", None)
+    update = getattr(distribution, "update", None)
+    if mean is None or not callable(update):
+      return
+    clipped = torch.nan_to_num(mean, nan=0.0, posinf=clip, neginf=-clip).clamp(min=-clip, max=clip)
+    update(clipped)
+
   def _ppo_ratio(self, actions_log_prob: torch.Tensor, old_actions_log_prob: torch.Tensor) -> torch.Tensor:
     log_ratio = actions_log_prob - old_actions_log_prob
     clip = max(float(getattr(self, "ppo_log_ratio_clip", 8.0)), 1.0e-6)
@@ -585,7 +832,7 @@ class GoalkeeperStudentPPO(PPO):
 
   def _masked_actor_losses(
     self,
-    observations,
+    batch_or_observations,
     advantages: torch.Tensor,
     ratio: torch.Tensor,
     entropy: torch.Tensor,
@@ -599,52 +846,25 @@ class GoalkeeperStudentPPO(PPO):
     if not getattr(self, "mask_idle_actor_loss", False):
       return per_sample_surrogate.mean(), entropy.mean()
 
-    active_mask = ~self._idle_condition_mask(observations)
+    active_mask = getattr(batch_or_observations, "actor_loss_mask", None)
+    if active_mask is None:
+      active_mask = ~self._idle_condition_mask(batch_or_observations)
+    else:
+      active_mask = active_mask.to(device=per_sample_surrogate.device) > 0.5
     if active_mask.shape != per_sample_surrogate.shape:
       active_mask = active_mask.reshape(per_sample_surrogate.shape)
     active_mask = active_mask.to(device=per_sample_surrogate.device, dtype=torch.bool)
-    if not torch.any(active_mask):
+    idle_weight = min(max(float(getattr(self, "idle_actor_loss_weight", 0.0)), 0.0), 1.0)
+    if idle_weight <= 0.0 and not torch.any(active_mask):
       zero = per_sample_surrogate.sum() * 0.0
       return zero, zero
-    return per_sample_surrogate[active_mask].mean(), entropy[active_mask].mean()
-
-  def _init_offline_bc_dataset(self, dataset_dir: str | None) -> None:
-    self._offline_bc_shards = []
-    self._offline_bc_active_shards = []
-    self._offline_bc_cache = {}
-    offline_idle_bc_coef = getattr(self, "offline_idle_bc_coef", 0.0)
-    offline_bc_final_coef = getattr(self, "offline_bc_final_coef", self.offline_bc_coef)
-    offline_idle_bc_final_coef = getattr(self, "offline_idle_bc_final_coef", offline_idle_bc_coef)
-    if not dataset_dir or (
-      max(self.offline_bc_coef, offline_bc_final_coef) <= 0.0
-      and max(offline_idle_bc_coef, offline_idle_bc_final_coef) <= 0.0
-    ):
-      return
-    root = Path(dataset_dir).expanduser().resolve()
-    shard_dir = root / "shards" if (root / "shards").is_dir() else root
-    shards = sorted(shard_dir.glob("shard_*.pt"))
-    if not shards:
-      raise FileNotFoundError(f"No offline BC shard_*.pt files under {shard_dir}")
-    self._offline_bc_shards = shards
-    self._offline_bc_active_shards = shards[: min(len(shards), self.offline_bc_cache_shards)]
-
-  def _prefetch_offline_bc_shards(self) -> None:
-    offline_idle_bc_coef = getattr(self, "offline_idle_bc_coef", 0.0)
-    offline_bc_final_coef = getattr(self, "offline_bc_final_coef", self.offline_bc_coef)
-    offline_idle_bc_final_coef = getattr(self, "offline_idle_bc_final_coef", offline_idle_bc_coef)
-    if (
-      max(self.offline_bc_coef, offline_bc_final_coef) <= 0.0
-      and max(offline_idle_bc_coef, offline_idle_bc_final_coef) <= 0.0
-    ) or not self._offline_bc_shards:
-      self._offline_bc_active_shards = []
-      self._offline_bc_cache = {}
-      return
-    count = min(self.offline_bc_cache_shards, len(self._offline_bc_shards))
-    perm = torch.randperm(len(self._offline_bc_shards), device="cpu")[:count].tolist()
-    self._offline_bc_active_shards = [self._offline_bc_shards[i] for i in perm]
-    self._offline_bc_cache = {}
-    for shard in self._offline_bc_active_shards:
-      self._load_offline_bc_shard(shard)
+    weights = torch.where(
+      active_mask,
+      torch.ones_like(per_sample_surrogate),
+      torch.full_like(per_sample_surrogate, idle_weight),
+    )
+    denom = weights.sum().clamp_min(1.0e-6)
+    return (per_sample_surrogate * weights).sum() / denom, (entropy * weights).sum() / denom
 
   def _scheduled_coef(self, start: float, final: float | None, anneal_updates: int) -> float:
     final_value = start if final is None else final
@@ -653,140 +873,68 @@ class GoalkeeperStudentPPO(PPO):
     progress = min(max(float(getattr(self, "_ppo_update_count", 0)) / float(anneal_updates), 0.0), 1.0)
     return float(start + (final_value - start) * progress)
 
-  def _scheduled_offline_bc_loss(self, update_index: int, coef: float | None = None) -> torch.Tensor:
-    effective_coef = self.offline_bc_coef if coef is None else coef
-    if (
-      effective_coef <= 0.0
-      or not self._offline_bc_shards
-      or update_index % self.offline_bc_every_n_updates != 0
-    ):
+  def _active_bc_weight(self) -> float:
+    return self._scheduled_coef(
+      self.active_bc_coef,
+      self.active_bc_final_coef,
+      self.active_bc_anneal_updates,
+    )
+
+  def _uses_phase_reference_kl(self) -> bool:
+    return (
+      abs(float(getattr(self, "reference_kl_idle_coef", self.reference_kl_coef)) - self.reference_kl_coef) > 1.0e-12
+      or abs(float(getattr(self, "reference_kl_active_coef", self.reference_kl_coef)) - self.reference_kl_coef)
+      > 1.0e-12
+    )
+
+  def _reference_kl_loss(self, batch: RolloutStorage.Batch, *, phase_weighted: bool = False) -> torch.Tensor:
+    reference_actor = getattr(self, "reference_actor", None)
+    if reference_actor is None:
       return torch.zeros((), device=self.device)
-    return self._offline_bc_loss()
-
-  def _load_offline_bc_shard(self, shard: Path) -> dict[str, torch.Tensor]:
-    cached = self._offline_bc_cache.get(shard)
-    if cached is not None:
-      return cached
-    payload = torch.load(shard, map_location="cpu", weights_only=False)
-    data = {
-      "student_obs": payload["student_obs"].float(),
-      "teacher_action": payload["teacher_action"].float(),
-      "valid_mask": payload["valid_mask"].bool(),
-    }
-    self._offline_bc_cache[shard] = data
-    return data
-
-  def _sample_offline_bc_batch(self, idle_only: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if not self._offline_bc_shards:
-      raise RuntimeError("Offline BC dataset is not initialized.")
-    sample_shards = self._offline_bc_active_shards or self._offline_bc_shards
-    obs_chunks: list[torch.Tensor] = []
-    action_chunks: list[torch.Tensor] = []
-    mask_chunks: list[torch.Tensor] = []
-    attempts = 0
-    while len(obs_chunks) < self.offline_bc_batch_size:
-      attempts += 1
-      if attempts > self.offline_bc_batch_size * 20:
-        raise RuntimeError("Unable to sample enough valid offline BC sequences.")
-      shard = sample_shards[
-        torch.randint(len(sample_shards), (1,), device="cpu").item()
-      ]
-      data = self._load_offline_bc_shard(shard)
-      num_eps, max_t = data["student_obs"].shape[:2]
-      if num_eps == 0 or max_t == 0:
-        continue
-      ep_idx = torch.randint(num_eps, (1,), device="cpu").item()
-      valid = data["valid_mask"][ep_idx]
-      active_fraction = getattr(self, "offline_bc_active_fraction", 0.0)
-      active_only = (
-        (not idle_only)
-        and active_fraction > 0.0
-        and torch.rand((), device="cpu").item() < active_fraction
+    current_params = self._reference_kl_params(self.actor.output_distribution_params)
+    with torch.no_grad():
+      reference_actor(
+        batch.observations,
+        masks=batch.masks,
+        hidden_state=batch.hidden_states[0],
+        stochastic_output=True,
       )
-      if idle_only or active_only:
-        idle = data["student_obs"][ep_idx, :, -1] > 0.5
-        valid_indices_all = torch.nonzero(valid, as_tuple=False).flatten()
-        if valid_indices_all.numel() <= 0:
-          continue
-        flags = idle[valid_indices_all]
-        if idle_only:
-          inactive = torch.nonzero(~flags, as_tuple=False).flatten()
-          prefix_len = int(inactive[0].item()) if inactive.numel() > 0 else int(flags.numel())
-          if prefix_len <= 0:
-            continue
-          valid_indices = valid_indices_all[:prefix_len]
-        else:
-          valid_indices = valid_indices_all[~flags]
-        if valid_indices.numel() <= 0:
-          continue
-        seq_len = min(self.offline_bc_seq_len, int(valid_indices.numel()))
-        start_high = max(int(valid_indices.numel()) - seq_len + 1, 1)
-        start = torch.randint(start_high, (1,), device="cpu").item()
-        indices = valid_indices[start : start + seq_len]
-        obs = torch.zeros(self.offline_bc_seq_len, data["student_obs"].shape[-1])
-        actions = torch.zeros(self.offline_bc_seq_len, data["teacher_action"].shape[-1])
-        masks = torch.zeros(self.offline_bc_seq_len, dtype=torch.bool)
-        obs[:seq_len] = data["student_obs"][ep_idx, indices]
-        actions[:seq_len] = data["teacher_action"][ep_idx, indices]
-        masks[:seq_len] = True
-        obs_chunks.append(obs)
-        action_chunks.append(actions)
-        mask_chunks.append(masks)
-        continue
-      valid_len = int(valid.sum().item())
-      if valid_len <= 0:
-        continue
-      seq_len = min(self.offline_bc_seq_len, valid_len)
-      start_high = max(valid_len - seq_len + 1, 1)
-      start = torch.randint(start_high, (1,), device="cpu").item()
-      end = start + seq_len
-      obs = torch.zeros(self.offline_bc_seq_len, data["student_obs"].shape[-1])
-      actions = torch.zeros(self.offline_bc_seq_len, data["teacher_action"].shape[-1])
-      masks = torch.zeros(self.offline_bc_seq_len, dtype=torch.bool)
-      obs[:seq_len] = data["student_obs"][ep_idx, start:end]
-      actions[:seq_len] = data["teacher_action"][ep_idx, start:end]
-      masks[:seq_len] = True
-      obs_chunks.append(obs)
-      action_chunks.append(actions)
-      mask_chunks.append(masks)
-    obs_batch = torch.stack(obs_chunks, dim=1).to(self.device)
-    action_batch = torch.stack(action_chunks, dim=1).to(self.device)
-    mask_batch = torch.stack(mask_chunks, dim=1).to(self.device)
-    return obs_batch, action_batch, mask_batch
+      reference_params = self._reference_kl_params(
+        tuple(param.detach() for param in reference_actor.output_distribution_params)
+      )
+    per_sample_kl = self.actor.get_kl_divergence(reference_params, current_params)
+    if not phase_weighted:
+      return per_sample_kl.mean()
+    weights = self._reference_kl_phase_weights(batch, per_sample_kl)
+    return (per_sample_kl * weights).mean()
 
-  def _offline_bc_loss(self) -> torch.Tensor:
-    if not self._offline_bc_shards:
-      return torch.zeros((), device=self.device)
-    obs, teacher_actions, masks = self._sample_offline_bc_batch()
-    return self._bc_loss_for_batch(obs, teacher_actions, masks)
-
-  def _offline_idle_bc_loss(self) -> torch.Tensor:
-    if not self._offline_bc_shards:
-      return torch.zeros((), device=self.device)
-    obs, teacher_actions, masks = self._sample_offline_bc_batch(idle_only=True)
-    return self._bc_loss_for_batch(obs, teacher_actions, masks)
-
-  def _bc_loss_for_batch(
-    self,
-    obs: torch.Tensor,
-    teacher_actions: torch.Tensor,
-    masks: torch.Tensor,
-  ) -> torch.Tensor:
-    if hasattr(self.actor, "forward_bc_chunk"):
-      pred, _ = self.actor.forward_bc_chunk(obs, masks, None)
+  def _reference_kl_phase_weights(self, batch: RolloutStorage.Batch, like: torch.Tensor) -> torch.Tensor:
+    active_mask = getattr(batch, "actor_loss_mask", None)
+    if active_mask is None:
+      active_mask = torch.ones_like(like, dtype=torch.bool)
     else:
-      pred = self.actor(TensorDict({"student": obs}, batch_size=list(obs.shape[:-1])), masks=masks)
-    target = teacher_actions[masks]
-    return self.loss_fn(pred, target.detach())
+      active_mask = active_mask.to(device=like.device) > 0.5
+      if active_mask.shape != like.shape:
+        active_mask = active_mask.reshape(like.shape)
+    idle_coef = float(getattr(self, "reference_kl_idle_coef", self.reference_kl_coef))
+    active_coef = float(getattr(self, "reference_kl_active_coef", self.reference_kl_coef))
+    return torch.where(
+      active_mask,
+      torch.full_like(like, active_coef),
+      torch.full_like(like, idle_coef),
+    )
 
-  def _distill_loss(self, batch: RolloutStorage.Batch) -> torch.Tensor:
-    if batch.privileged_actions is None:
-      return torch.zeros((), device=self.device)
-    pred_mean = self._actor_output_mean()
-    teacher_actions = batch.privileged_actions
-    if batch.masks is not None:
-      teacher_actions = unpad_trajectories(teacher_actions, batch.masks)
-    return self.loss_fn(pred_mean, teacher_actions.detach())
+  def _reference_kl_params(self, params: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    if len(params) != 2:
+      return params
+    mean, std = params
+    clip = getattr(self, "actor_mean_clip", None)
+    if clip is not None and clip > 0.0:
+      mean = torch.nan_to_num(mean, nan=0.0, posinf=clip, neginf=-clip).clamp(min=-clip, max=clip)
+    floor = max(float(getattr(self, "reference_kl_std_floor", 0.0)), 0.0)
+    if floor <= 0.0:
+      return mean, std
+    return mean, std.clamp_min(floor)
 
   def _condition_aux_loss(self, batch: RolloutStorage.Batch) -> torch.Tensor:
     aux = getattr(self.actor, "condition_aux_output", None)
@@ -817,14 +965,6 @@ class GoalkeeperStudentPPO(PPO):
     return nn.functional.cross_entropy(region_logits, route_targets.detach())
 
   def _route_targets(self, student_obs: torch.Tensor) -> torch.Tensor:
-    gate = getattr(self, "teacher_route_gate", None)
-    if isinstance(gate, dict):
-      return self._route_targets_from_student_obs(
-        student_obs,
-        gate=gate["net"],
-        gate_mean=gate["mean"],
-        gate_std=gate["std"],
-      )
     return self._route_targets_from_student_obs(student_obs)
 
   @staticmethod
@@ -866,10 +1006,24 @@ class GoalkeeperStudentPPO(PPO):
       route = torch.where(vel[..., 2] - gravity * t < vz_low, torch.full_like(route, 4), route)
       route = route + (cy < 0.0).long()
     speed = torch.linalg.vector_norm(vel, dim=-1)
-    condition_idle = student_obs[..., -1] > 0.5
+    if student_obs.shape[-1] >= GOALKEEPER_STUDENT_OBS_DIM:
+      condition_idle = student_obs[..., GOALKEEPER_PHASE_IDLE_INDEX] > 0.5
+    else:
+      condition_idle = student_obs[..., -1] > 0.5
     kinematic_idle = (speed < idle_speed_threshold) | (vx >= idle_incoming_vx_threshold)
     idle = condition_idle | kinematic_idle
     return torch.where(idle, torch.full_like(route, 6), route)
+
+  @staticmethod
+  def _upgrade_student_obs(obs: torch.Tensor) -> torch.Tensor:
+    if obs.shape[-1] == GOALKEEPER_STUDENT_OBS_DIM:
+      return obs
+    if obs.shape[-1] == GOALKEEPER_TEACHER_ACTOR_OBS_DIM + 4:
+      return build_goalkeeper_student_obs(
+        obs[..., :GOALKEEPER_TEACHER_ACTOR_OBS_DIM],
+        obs[..., GOALKEEPER_TEACHER_ACTOR_OBS_DIM:],
+      )
+    return obs
 
   def _update_learning_rate(self, old_distribution_params, distribution_params) -> None:
     with torch.inference_mode():
@@ -901,6 +1055,7 @@ class GoalkeeperStudentPPO(PPO):
     cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
     actor: MLPModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+    actor.num_actions = env.num_actions
     print(f"Actor Model: {actor}")
     if cfg["algorithm"].pop("share_cnn_encoders", None):
       cfg["critic"]["cnns"] = actor.cnns  # type: ignore[attr-defined]
